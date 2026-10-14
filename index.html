@@ -58,9 +58,78 @@
     #db-status-banner.db-hidden { transform: translateY(-100%); opacity: 0; pointer-events: none; }
     .db-spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.45); border-top-color: #fff; border-radius: 9999px; animation: dbSpin 0.8s linear infinite; }
     @keyframes dbSpin { to { transform: rotate(360deg); } }
+    /* ===== BOOT LOADER — layar pemuatan awal s.d. database benar-benar terhubung & data terbaca ===== */
+    #boot-loader { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #064e3b 0%, #065f46 45%, #0e7490 100%); transition: opacity 0.55s ease; }
+    #boot-loader.boot-hide { opacity: 0; pointer-events: none; }
+    .boot-card { width: min(92vw, 430px); text-align: center; color: #fff; padding: 24px 16px; }
+    .boot-logo { width: 78px; height: 78px; margin: 0 auto 14px; border-radius: 20px; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.28); display: flex; align-items: center; justify-content: center; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+    .boot-title { font-size: 20px; font-weight: 800; letter-spacing: 0.2px; }
+    .boot-sub { font-size: 12.5px; color: rgba(255,255,255,0.75); margin-top: 2px; }
+    .boot-spinner { width: 34px; height: 34px; margin: 18px auto 10px; border: 3px solid rgba(255,255,255,0.25); border-top-color: #6ee7b7; border-radius: 9999px; animation: bootSpin 0.8s linear infinite; }
+    @keyframes bootSpin { to { transform: rotate(360deg); } }
+    #boot-status-title { font-size: 14px; font-weight: 600; color: #a7f3d0; min-height: 20px; }
+    #boot-status-detail { font-size: 12px; color: rgba(255,255,255,0.7); margin-top: 3px; min-height: 16px; }
+    .boot-steps { margin: 16px auto 0; text-align: left; display: inline-block; }
+    .boot-step { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: rgba(255,255,255,0.55); padding: 3px 0; transition: color 0.3s ease; }
+    .boot-step .boot-dot { width: 16px; height: 16px; border-radius: 9999px; border: 2px solid rgba(255,255,255,0.35); flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; line-height: 1; transition: all 0.3s ease; }
+    .boot-step.active { color: #ffffff; }
+    .boot-step.active .boot-dot { border-color: #6ee7b7; background: rgba(110,231,183,0.25); animation: bootPulse 1s ease infinite; }
+    .boot-step.ok { color: #a7f3d0; }
+    .boot-step.ok .boot-dot { border-color: #34d399; background: #34d399; color: #064e3b; }
+    .boot-step.ok .boot-dot::after { content: '\2713'; }
+    .boot-step.fail { color: #fecaca; }
+    .boot-step.fail .boot-dot { border-color: #f87171; background: #f87171; color: #7f1d1d; }
+    .boot-step.fail .boot-dot::after { content: '!'; }
+    .boot-step.skip { color: rgba(255,255,255,0.75); }
+    .boot-step.skip .boot-dot { border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.3); color: #064e3b; }
+    .boot-step.skip .boot-dot::after { content: '\2013'; }
+    @keyframes bootPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(110,231,183,0.45); } 50% { box-shadow: 0 0 0 6px rgba(110,231,183,0); } }
+    .boot-bar { height: 4px; border-radius: 9999px; background: rgba(255,255,255,0.18); margin-top: 18px; overflow: hidden; }
+    .boot-bar-inner { height: 100%; width: 6%; border-radius: 9999px; background: linear-gradient(90deg, #6ee7b7, #22d3ee); transition: width 0.45s ease; }
+    .boot-skip { margin-top: 14px; font-size: 12px; color: rgba(255,255,255,0.6); background: transparent; border: none; cursor: pointer; text-decoration: underline; display: none; }
+    .boot-skip:hover { color: #ffffff; }
+    .boot-foot { margin-top: 16px; font-size: 11px; color: rgba(255,255,255,0.45); }
+    body.booting { overflow: hidden; }
   </style>
 </head>
-<body class="antialiased text-gray-900">
+<body class="antialiased text-gray-900 booting">
+
+<!-- ============ BOOT LOADER — tampil sampai database benar-benar terhubung & data terbaca ============ -->
+<div id="boot-loader" role="status" aria-live="polite" aria-label="Memuat sistem">
+  <div class="boot-card">
+    <div class="boot-logo">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#6ee7b7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>
+    </div>
+    <div class="boot-title">SMA Negeri Jayaloka</div>
+    <div class="boot-sub">Sistem Informasi Sekolah</div>
+    <div class="boot-spinner" id="boot-spinner"></div>
+    <div id="boot-status-title">Menyiapkan aplikasi...</div>
+    <div id="boot-status-detail">Memuat sistem</div>
+    <div class="boot-steps">
+      <div class="boot-step" id="boot-step-1"><span class="boot-dot"></span><span>Membaca database</span></div>
+      <div class="boot-step" id="boot-step-2"><span class="boot-dot"></span><span>Menghubungkan Database Cloud</span></div>
+      <div class="boot-step" id="boot-step-3"><span class="boot-dot"></span><span>Memverifikasi data sekolah</span></div>
+      <div class="boot-step" id="boot-step-4"><span class="boot-dot"></span><span>Menyiapkan tampilan</span></div>
+    </div>
+    <div class="boot-bar"><div class="boot-bar-inner" id="boot-bar"></div></div>
+    <button type="button" class="boot-skip" id="boot-skip-btn" onclick="bootSkipNow()">Lanjutkan tanpa menunggu &rarr;</button>
+    <div class="boot-foot">Halaman akan terbuka otomatis setelah database terhubung dan data terbaca</div>
+  </div>
+</div>
+<script>
+/* Failsafe mandiri: apa pun yang terjadi (script gagal, CDN mati, error tak terduga),
+   layar pemuatan TIDAK BOLEH mengunci halaman selamanya — buka paksa setelah 22 detik */
+(function() {
+  setTimeout(function() {
+    var el = document.getElementById('boot-loader');
+    document.body && document.body.classList.remove('booting');
+    if (el && el.parentNode) {
+      el.classList.add('boot-hide');
+      setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 700);
+    }
+  }, 22000);
+})();
+</script>
 
 <!-- ============ INDIKATOR STATUS DATABASE (tampil saat database terputus/offline) ============ -->
 <div id="db-status-banner" class="db-hidden fixed top-0 left-0 right-0 z-[70] shadow-md">
@@ -431,6 +500,7 @@ function loadDB() {
   }
   if (!db) {
     db = seedDatabase();
+    _dbFreshSeed = true; // data masih bawaan pabrik (browser baru/localStorage bersih) — JANGAN kirim ke cloud sebelum yakin cloud memang kosong, agar data asli sekolah tidak tertimpa
     saveDB();
   }
   // Migrasi ringan: pastikan field baru tersedia untuk database lama
@@ -447,6 +517,7 @@ function loadDB() {
 function saveDB() {
   try {
     const json = JSON.stringify(db);
+    _dbLocalDirtyAt = Date.now(); // catat: data lokal baru saja berubah (anti-revert cloud)
     // Cadangan lokal: simpan salinan maksimal sekali per 60 detik agar hemat kuota & tetap cepat
     const t = Date.now();
     if (t - lastBakAt > 60000) {
@@ -481,13 +552,42 @@ var _rsUiTimer = null;       // debounce penyegaran tampilan
 var _rsPendingUI = false;    // penyegaran tertunda (tab tidak aktif / ruang live terbuka)
 var _rsTickStarted = false;  // guard agar mesin sinkron hanya berjalan sekali
 var _rsToastSyncAt = 0;      // throttle toast info sinkron antar tab
+var _rsRetryTimer = null;    // timer percobaan-ulang refresh saat UI sedang dipakai user
+var _dbLocalDirtyAt = 0;     // ms terakhir kali data lokal berubah (penanda anti-revert cloud)
+var _dbFreshSeed = false;    // data lokal masih seed bawaan browser baru — push ke cloud ditahan sampai yakin cloud kosong
+var _lastCloudMetaMs = 0;    // waktu meta cloud terbaru yang pernah dilihat tab ini (anti snapshot basi)
+var _lastRtdbMetaMs = 0;     // waktu meta backup RTDB terbaru yang pernah dilihat tab ini
+var _cloudPushInFlight = false; // push batch ke Firestore sedang berjalan (belum dikonfirmasi server)
 
 function rsReadStorage() { try { return localStorage.getItem(DB_KEY); } catch (e) { return null; } }
 function rsNoteLocalWrite() { _rsLastSeenJson = rsReadStorage(); }
 
+// UI sedang dipakai user? (modal/confirm terbuka, atau sedang mengetik/memilih di input) —
+// selama ini JANGAN me-render ulang agar form tidak ter-reset dan klik menu tidak hilang
+function rsUiBusy() {
+  try {
+    const modalRoot = document.getElementById('modal-root');
+    if (modalRoot && modalRoot.children.length > 0) return true; // modal terbuka
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT') && !ae.disabled && ae.type !== 'file') return true; // sedang mengisi form
+    if (ae && ae.isContentEditable) return true;
+  } catch (e) { /* abaikan */ }
+  return false;
+}
+
+// Coba lagi nanti: refresh tertunda diterapkan begitu UI tidak lagi dipakai user
+function rsRetryLater() {
+  if (_rsRetryTimer) return;
+  _rsRetryTimer = setTimeout(function() {
+    _rsRetryTimer = null;
+    if (_rsPendingUI && !document.hidden) rsApplyUI();
+  }, 1200);
+}
+
 // Minta penyegaran tampilan (debounce) — aman dipanggil berkali-kali beruntun
 function rsScheduleUI(delay) {
-  if (document.hidden || document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; }
+  if (document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; }
+  if (document.hidden || rsUiBusy()) { _rsPendingUI = true; rsRetryLater(); return; } // jangan ganggu user yang sedang berinteraksi
   if (_rsUiTimer) clearTimeout(_rsUiTimer);
   _rsUiTimer = setTimeout(function() { _rsUiTimer = null; rsApplyUI(); }, delay || 180);
 }
@@ -496,6 +596,7 @@ function rsScheduleUI(delay) {
 function rsApplyUI() {
   try {
     if (document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; } // jangan ganggu sesi Live Class
+    if (document.hidden || rsUiBusy()) { _rsPendingUI = true; rsRetryLater(); return; } // tunda bila modal terbuka / user sedang mengetik
     _rsPendingUI = false; // refresh berhasil — reset penanda tertunda
     if (!session) { renderLanding(); lucide.createIcons(); return; }
     if (!getCurrentUser()) { renderApp(); lucide.createIcons(); return; }
@@ -515,6 +616,7 @@ function rsReloadFromStorage() {
   const parsed = parseDbJson(raw);
   if (!parsed) return false;                   // rusak — biarkan watchdog yang memulihkan
   db = parsed;
+  _dbFreshSeed = false; // data dari tab/proses lain adalah data nyata — bukan lagi seed bawaan
   if (session) {
     const t = Date.now();
     if (t - _rsToastSyncAt > 15000) {
@@ -573,7 +675,12 @@ function rsStartRealtimeSync() {
   });
 
   // 3) Detak rutin 4 detik: autosave jaring pengaman + tangkap perubahan yang terlewat
-  setInterval(function() { rsAutosaveCheck(); }, 4000);
+  //    + proses-ulang snapshot cloud/RTDB yang ditunda karena ada tulisan lokal yang sedang berjalan
+  setInterval(function() {
+    rsAutosaveCheck();
+    if (cloudSnapshotBuffer) { try { handleCloudSnapshot(); } catch (e) { /* abaikan */ } }
+    if (rtdbSnapshotBuffer) { try { processRtdbSnapshot(); } catch (e) { /* abaikan */ } }
+  }, 4000);
 }
 
 function loadSession() {
@@ -688,6 +795,7 @@ function stableStringify(value) {
 // tersimpan di cloud) agar halaman tidak menemui undefined
 function adoptCloudData(data) {
   if (!data || typeof data !== 'object') return false;
+  _dbFreshSeed = false; // data nyata (cloud/backup) telah diterima — bukan lagi seed bawaan
   Object.keys(db).forEach(function(k) {
     if (Array.isArray(db[k]) && (data[k] === undefined || data[k] === null)) data[k] = [];
   });
@@ -730,7 +838,13 @@ function handleCloudSnapshot() {
   const docs = cloudSnapshotBuffer;
   cloudSnapshotBuffer = null;
   const meta = docs['meta'];
-  if (!meta || !meta.updatedAt || !meta.total) return; // cloud masih kosong
+  if (!meta || !meta.updatedAt || !meta.total) {
+    // Cloud benar-benar kosong (dikonfirmasi listener server) — bila data lokal masih seed bawaan,
+    // kirim sebagai data awal; ini satu-satunya kondisi seed boleh menulis ke cloud
+    if (_dbFreshSeed && cloudServerConfirmed) { _dbFreshSeed = false; saveToCloud(true); }
+    return;
+  }
+  const metaMs = Date.parse(meta.updatedAt) || 0;
   let json = '';
   for (let i = 0; i < meta.total; i++) {
     const c = docs['chunk_' + i];
@@ -742,12 +856,27 @@ function handleCloudSnapshot() {
     console.warn('[Firebase] Data cloud tidak dapat dibaca:', e.message);
     return;
   }
+  // ===== ANTI-REVERT: jangan biarkan snapshot cloud yang LAMA menimpa perubahan lokal yang lebih baru =====
+  // 1) Snapshot lebih tua dari yang sudah pernah diterima → buang (echo tulisan lama)
+  if (metaMs && metaMs < _lastCloudMetaMs) {
+    console.log('[Firebase] Snapshot cloud lebih lama dari yang diterima — diabaikan (anti-revert)');
+    return;
+  }
+  // 2) Ada perubahan lokal yang belum selesai dikirim (antrean/debounce/sedang berjalan/baru saja berubah) →
+  //    tunda adopsi agar data baru lokal tidak terganti data lama; snapshot disimpan & diproses ulang tick 4 dtk
+  if (cloudPushTimer || cloudPendingPush || _cloudPushInFlight || (Date.now() - _dbLocalDirtyAt < 2500)) {
+    console.log('[Firebase] Ada perubahan lokal belum terkirim — adopsi snapshot cloud ditunda agar data baru tidak tertimpa');
+    cloudSnapshotBuffer = docs;
+    return;
+  }
   Object.keys(db).forEach(function(k) {
     if (Array.isArray(db[k]) && (data[k] === undefined || data[k] === null)) data[k] = [];
   });
   if (!Array.isArray(data.presentations)) data.presentations = [];
-  if (stableStringify(data) === stableStringify(db)) return; // tulisan sendiri / tidak ada perubahan
+  if (stableStringify(data) === stableStringify(db)) { _lastCloudMetaMs = metaMs; return; } // tulisan sendiri / tidak ada perubahan
+  _dbFreshSeed = false;      // cloud ternyata berisi data asli — adopsi, seed bawaan ditinggalkan
   adoptCloudData(data);
+  _lastCloudMetaMs = metaMs; // catat meta cloud yang sudah diterima
   if (session) {
     rsScheduleUI(100); // seluruh tampilan (topbar, sidebar, halaman aktif) mengikuti data cloud terbaru
     showToast('Data disinkronkan dari cloud', 'Perubahan terbaru dari perangkat lain telah diterapkan', 'info');
@@ -813,6 +942,7 @@ function startCloudSync(config) {
     firebaseFS.collection(CLOUD_FS_COL).get().then(function(snap) {
       if (snap.empty) {
         console.log('[Firebase] Cloud kosong — mengirim data lokal ke cloud');
+        _dbFreshSeed = false; // cloud terbukti kosong — data lokal (termasuk seed) sah dikirim
         saveToCloud(true);
       }
       if (cloudAnnounce) {
@@ -908,6 +1038,9 @@ function updateCloudStatusUI() {
 // Debounce 900ms agar beberapa perubahan cepat digabung jadi satu tulisan.
 // Bila cloud terputus, perubahan ditandai "menunggu" dan otomatis dikirim saat tersambung ulang.
 function saveToCloud(immediate) {
+  // PROTEKSI DATA SEKOLAH: data masih seed bawaan browser baru → JANGAN kirim ke cloud
+  // sampai terbukti cloud kosong (perangkat pertama) atau data asli sudah teradopsi
+  if (_dbFreshSeed) return;
   if (!cloudConnected || !firebaseFS || !cloudServerConfirmed) {
     if (!isCloudDisabled()) cloudPendingPush = true; // antre: kirim begitu koneksi pulih
     return;
@@ -918,8 +1051,10 @@ function saveToCloud(immediate) {
     return;
   }
   cloudPushTimer = null;
+  _cloudPushInFlight = true;
   try {
     const json = JSON.stringify(db);
+    const sentMs = Date.now(); // updatedAt meta = waktu kirim ini (dipakai anti-revert)
     const total = Math.max(1, Math.ceil(json.length / CLOUD_FS_CHUNK));
     const col = firebaseFS.collection(CLOUD_FS_COL);
     const batch = firebaseFS.batch();
@@ -929,14 +1064,17 @@ function saveToCloud(immediate) {
     batch.set(col.doc('meta'), {
       total: total,
       size: json.length,
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(sentMs).toISOString(),
       device: deviceLabel()
     });
     batch.commit().then(function() {
       cloudPendingPush = false;
+      _cloudPushInFlight = false;
+      _lastCloudMetaMs = sentMs; // server kini berisi tulisan kita — snapshot echo dengan waktu ini tidak dianggap lebih baru
       console.log('[Firebase] Data terkirim ke cloud (' + Math.round(json.length / 1024) + ' KB)');
-    }).catch(function(err) { handleCloudError(err, false); });
+    }).catch(function(err) { _cloudPushInFlight = false; handleCloudError(err, false); });
   } catch (e) {
+    _cloudPushInFlight = false;
     handleCloudError(e, false);
   }
 }
@@ -979,6 +1117,38 @@ function loadFromCloud(callback) {
   } catch (e) {
     callback(false);
   }
+}
+
+// ===== Tarik / kirim manual database cloud (tombol di halaman Database & Cloud) =====
+// Tarik: membaca database terbaru dari Cloud Firestore dan langsung menampilkannya
+function pullFromCloudNow() {
+  if (!cloudConnected || !firebaseFS) {
+    showToast('Cloud belum tersambung', cloudConnectError || 'Tunggu ikon cloud berubah hijau, lalu coba lagi', 'warning');
+    return;
+  }
+  showToast('Mengambil data...', 'Membaca database terbaru dari Cloud Firestore', 'info');
+  loadFromCloud(function(ok) {
+    if (ok) {
+      if (session) { renderApp(); }
+      lucide.createIcons();
+      showToast('Data terbaru dimuat', 'Tampilan kini mengikuti database cloud terbaru', 'success');
+    } else {
+      showToast('Cloud masih kosong', 'Belum ada data di cloud yang dapat ditarik', 'warning');
+    }
+  });
+}
+
+// Kirim: menulis seluruh database lokal ke Cloud Firestore (niat eksplisit pengguna)
+function pushToCloudNow() {
+  if (!isCloudConnected()) {
+    showToast('Cloud belum tersambung', cloudConnectError || 'Tunggu ikon cloud berubah hijau, lalu coba lagi', 'warning');
+    return;
+  }
+  confirmDialog('Kirim Data ke Cloud', 'Seluruh data di browser ini akan ditulis ke Cloud Firestore dan otomatis tersinkron ke semua browser/perangkat lain. Melanjutkan?', function() {
+    _dbFreshSeed = false; // niat eksplisit pengguna — data lokal sah dikirim
+    saveToCloud(true);
+    showToast('Mengirim ke cloud...', 'Database lokal sedang ditulis ke Cloud Firestore', 'info');
+  }, 'Ya, Kirim', 'emerald');
 }
 
 function isCloudConnected() {
@@ -1144,13 +1314,23 @@ function processRtdbSnapshot() {
   const parsed = parseRtdbBackup(val);
   if (parsed.ok) rtdbLastMeta = parsed.meta;
   updateRtdbStatusUI();
-  if (!parsed.ok) return; // backup masih kosong / belum lengkap
-  if (stableStringify(parsed.data) === stableStringify(db)) return; // sama dengan lokal — tidak ada yang perlu dipulihkan
+  if (!parsed.ok) {
+    // Backup RTDB masih kosong — bila data lokal masih seed bawaan, seed sah dikirim sebagai backup awal
+    if (parsed.reason === 'empty' && _dbFreshSeed && isRtdbConnected()) { _dbFreshSeed = false; saveToRTDB(true); }
+    return; // backup masih kosong / belum lengkap
+  }
+  const metaMs = Date.parse(parsed.meta.updatedAt) || 0;
+  // ===== ANTI-REVERT BACKUP: backup lama tidak boleh menimpa perubahan lokal yang lebih baru =====
+  if (metaMs && metaMs < _lastRtdbMetaMs) return; // snapshot backup lebih tua dari yang pernah dilihat
+  if (rtdbPushTimer || rtdbPendingPush || (Date.now() - _dbLocalDirtyAt < 2500)) return; // ada tulisan lokal berjalan — tunggu
+  if (stableStringify(parsed.data) === stableStringify(db)) { _lastRtdbMetaMs = metaMs; return; } // sama dengan lokal — tidak ada yang perlu dipulihkan
   // RTDB = jalur BACKUP: adopsi otomatis hanya saat Cloud Firestore benar-benar terputus
   // (sudah lebih dari 8 detik, bukan sekadar jeda awal saat aplikasi baru dibuka)
   const cloudDownLong = !isCloudConnected() && cloudDownSince !== null && (Date.now() - cloudDownSince > 8000);
   if (cloudDownLong) {
+    _dbFreshSeed = false;
     adoptCloudData(parsed.data);
+    _lastRtdbMetaMs = metaMs;
     if (session) {
       rsScheduleUI(100);
       showToast('Data dipulihkan dari Backup RTDB', 'Terakhir diperbarui: ' + formatDateTime(parsed.meta.updatedAt) + ' oleh ' + (parsed.meta.device || '-'), 'info');
@@ -1162,6 +1342,7 @@ function processRtdbSnapshot() {
 // Debounce 1400ms — dikirim sedikit lebih lambat dari Firestore agar jadi lapisan kedua.
 // Bila RTDB belum aktif, perubahan ditandai "menunggu" dan dikirim saat backup tersambung.
 function saveToRTDB(immediate) {
+  if (_dbFreshSeed) return; // seed bawaan browser baru — jangan timpa backup asli sebelum yakin node kosong
   if (!isRtdbActive() || !firebaseRTDB) {
     if (!isCloudDisabled()) rtdbPendingPush = true; // antre: kirim begitu RTDB tersambung
     return;
@@ -1190,6 +1371,7 @@ function saveToRTDB(immediate) {
       rtdbPendingPush = false;
       rtdbLastPushAt = new Date().toISOString();
       console.log('[RTDB] Backup terkirim (' + Math.round(json.length / 1024) + ' KB) → node "' + RTDB_PATH + '"');
+      writeRtdbHistory(false); // simpan versi ke riwayat backup (maks 1 versi per 5 menit)
       updateRtdbStatusUI();
     }).catch(function(err) { handleRtdbError(err); });
   } catch (e) {
@@ -1197,14 +1379,16 @@ function saveToRTDB(immediate) {
   }
 }
 
-// Backup sekarang (tombol manual)
+// Backup sekarang (tombol manual) — selalu boleh mengirim walau data masih seed (niat eksplisit pengguna)
 function backupNowRTDB() {
   if (!isRtdbActive()) {
     showToast('RTDB belum tersambung', rtdbError || 'Sambungkan Realtime Database terlebih dahulu', 'warning');
     return;
   }
   showToast('Mengirim backup...', 'Menulis database ke Realtime Database', 'info');
+  _dbFreshSeed = false;
   saveToRTDB(true);
+  writeRtdbHistory(true); // simpan juga sebagai versi riwayat yang dapat dipulihkan
 }
 
 // Pulihkan paksa data dari backup RTDB (tombol manual)
@@ -1225,6 +1409,102 @@ function restoreFromRTDB() {
       if (session) { renderApp(); }
       lucide.createIcons();
       showToast('Pemulihan Berhasil', 'Data dipulihkan dari backup RTDB (' + formatDateTime(parsed.meta.updatedAt) + ')', 'success');
+    }).catch(function(err) { handleRtdbError(err); });
+  }, 'Ya, Pulihkan', 'emerald');
+}
+
+/* ============================================================
+   RIWAYAT VERSI BACKUP (RTDB History)
+   Setiap backup penting disimpan sebagai VERSI TERPISAH di node
+   "sija_backup_hist/<waktu>" (maks. 8 versi terakhir). Dengan ini
+   data lama selalu bisa dikembalikan — data tidak akan hilang
+   kecuali dihapus lewat perintah hapus yang eksplisit.
+   ============================================================ */
+const RTDB_HIST_PATH = 'sija_backup_hist';
+const RTDB_HIST_MAX = 8;
+const RTDB_HIST_MIN_MS = 5 * 60 * 1000; // jeda minimal antar versi otomatis (5 menit)
+let rtdbHistLastAt = 0;      // waktu versi otomatis terakhir ditulis
+let rtdbHistVersions = [];   // cache daftar versi untuk UI
+let rtdbHistListJson = '';   // deteksi perubahan daftar (anti render berulang)
+let _rtdbHistFetchAt = 0;    // throttle pemuatan daftar versi
+
+// Tulis satu versi cadangan ke node riwayat (force = lewati jeda, dipakai tombol manual)
+function writeRtdbHistory(force) {
+  if (!isRtdbActive() || !firebaseRTDB) return;
+  const now = Date.now();
+  if (!force && now - rtdbHistLastAt < RTDB_HIST_MIN_MS) return;
+  rtdbHistLastAt = now;
+  try {
+    const json = JSON.stringify(db);
+    const total = Math.max(1, Math.ceil(json.length / RTDB_CHUNK));
+    const payload = { meta: { total: total, size: json.length, updatedAt: new Date(now).toISOString(), device: deviceLabel() } };
+    for (let i = 0; i < total; i++) payload['chunk_' + i] = json.substring(i * RTDB_CHUNK, (i + 1) * RTDB_CHUNK);
+    firebaseRTDB.ref(RTDB_HIST_PATH + '/' + now).set(payload).then(function() {
+      console.log('[RTDB] Versi cadangan disimpan → "' + RTDB_HIST_PATH + '/' + now + '"');
+      pruneRtdbHistory();
+    }).catch(function(err) { console.warn('[RTDB] Gagal menulis versi cadangan:', err && (err.message || err.code)); });
+  } catch (e) { /* abaikan */ }
+}
+
+// Batasi isi riwayat maksimal RTDB_HIST_MAX versi terbaru — sisanya dibersihkan
+function pruneRtdbHistory() {
+  if (!firebaseRTDB) return;
+  const ref = firebaseRTDB.ref(RTDB_HIST_PATH);
+  ref.once('value').then(function(snap) {
+    const val = snap.val();
+    if (!val) { refreshRtdbHistList(null); return; }
+    const keys = Object.keys(val).sort();
+    const excess = keys.slice(0, Math.max(0, keys.length - RTDB_HIST_MAX));
+    if (!excess.length) { refreshRtdbHistList(val); return; }
+    const upd = {};
+    excess.forEach(function(k) { upd[k] = null; });
+    ref.update(upd).then(function() { return ref.once('value'); })
+      .then(function(s2) { refreshRtdbHistList(s2 && s2.val()); })
+      .catch(function() { /* abaikan */ });
+  }).catch(function() { /* abaikan */ });
+}
+
+// Ambil daftar versi untuk halaman Database & Cloud (throttle 10 detik)
+function loadRtdbHistOnce(force) {
+  if (!firebaseRTDB) return;
+  const now = Date.now();
+  if (!force && now - _rtdbHistFetchAt < 10000) return;
+  _rtdbHistFetchAt = now;
+  firebaseRTDB.ref(RTDB_HIST_PATH).once('value').then(function(s) { refreshRtdbHistList(s && s.val()); }).catch(function() { /* abaikan */ });
+}
+
+function refreshRtdbHistList(val) {
+  const list = val ? Object.keys(val).sort().reverse().map(function(k) {
+    const v = val[k] || {};
+    const m = v.meta || {};
+    return { key: k, updatedAt: m.updatedAt || '', size: m.size || 0, device: m.device || '-' };
+  }) : [];
+  rtdbHistVersions = list;
+  const j = JSON.stringify(list);
+  if (j === rtdbHistListJson) return; // daftar tidak berubah — jangan render ulang
+  rtdbHistListJson = j;
+  if (session && uiState.currentPage === 'database-cloud') { try { refreshMainContent(); } catch (e) { /* abaikan */ } }
+}
+
+// Pulihkan satu versi dari riwayat backup online
+function restoreRtdbHist(key) {
+  if (!firebaseRTDB) {
+    showToast('RTDB tidak tersedia', rtdbError || 'Realtime Database belum tersambung', 'error');
+    return;
+  }
+  confirmDialog('Pulihkan Versi Backup', 'Semua data saat ini akan DIGANTI dengan isi versi cadangan dari riwayat backup online. Kondisi data saat ini disimpan dulu sebagai versi baru sehingga tetap bisa dikembalikan. Melanjutkan?', function() {
+    firebaseRTDB.ref(RTDB_HIST_PATH + '/' + key).once('value').then(function(snap) {
+      const parsed = parseRtdbBackup(snap.val());
+      if (!parsed.ok) {
+        showToast('Versi tidak valid', 'Isi versi cadangan tidak dapat dibaca', 'warning');
+        return;
+      }
+      writeRtdbHistory(true); // simpan kondisi saat ini agar selalu bisa dikembalikan
+      adoptCloudData(parsed.data);
+      saveDB();
+      if (session) { renderApp(); }
+      lucide.createIcons();
+      showToast('Pemulihan Berhasil', 'Data dipulihkan dari versi cadangan (' + formatDateTime(parsed.meta.updatedAt) + ')', 'success');
     }).catch(function(err) { handleRtdbError(err); });
   }, 'Ya, Pulihkan', 'emerald');
 }
@@ -1332,7 +1612,11 @@ function markCloudConnected() {
   // Kirim perubahan yang tertahan selama offline
   if (cloudPendingPush) {
     cloudPendingPush = false;
-    try { saveToCloud(true); } catch (e) { /* dicoba lagi oleh watchdog */ }
+    if (_dbFreshSeed) {
+      console.log('[Firebase] Antrean berisi data seed bawaan — tidak dikirim agar data asli cloud tidak tertimpa');
+    } else {
+      try { saveToCloud(true); } catch (e) { /* dicoba lagi oleh watchdog */ }
+    }
   }
   if (wasDown) {
     showToast('Database tersambung kembali', 'Sinkronisasi cloud berjalan normal. Perubahan tertahan sedang dikirim.', 'success');
@@ -1433,8 +1717,9 @@ function updateDbIndicator() {
   const cloudDisabled = isCloudDisabled();
   const connected = isCloudConnected();
   const noInternet = !navigator.onLine;
+  const freshSeed = !!_dbFreshSeed; // browser baru masih menampilkan data contoh (database asli di cloud belum terjangkau)
   const show = !cloudDisabled && !connected;
-  const key = show ? [noInternet ? 'net' : 'db', cloudReconnecting ? 'rc' : 'id', cloudConnectError || ''].join('|') : 'hide';
+  const key = show ? [noInternet ? 'net' : 'db', cloudReconnecting ? 'rc' : 'id', freshSeed ? 'seed' : 'real', cloudConnectError || ''].join('|') : 'hide';
   if (key === lastBannerKey) return; // tidak berubah — jangan render ulang
   lastBannerKey = key;
 
@@ -1466,13 +1751,23 @@ function updateDbIndicator() {
   } else if (noInternet) {
     if (inner) inner.className = 'bg-red-600 text-white text-xs sm:text-sm';
     if (iconEl) { iconEl.setAttribute('data-lucide', 'wifi-off'); iconEl.className = 'flex-shrink-0'; }
-    msg = 'Tidak ada koneksi internet — Database OFFLINE. Data tetap tersimpan aman di perangkat ini.';
-    detail = 'Perubahan akan otomatis disinkronkan saat internet tersambung kembali';
+    if (freshSeed) {
+      msg = 'Tidak ada koneksi internet — menampilkan DATA CONTOH. Database asli sekolah tersimpan aman di cloud.';
+      detail = 'Begitu perangkat terhubung internet, database sekolah akan dimuat otomatis dari cloud';
+    } else {
+      msg = 'Tidak ada koneksi internet — Database OFFLINE. Data tetap tersimpan aman di perangkat ini.';
+      detail = 'Perubahan akan otomatis disinkronkan saat internet tersambung kembali';
+    }
   } else {
     if (inner) inner.className = 'bg-red-600 text-white text-xs sm:text-sm';
     if (iconEl) { iconEl.setAttribute('data-lucide', 'cloud-off'); iconEl.className = 'flex-shrink-0'; }
-    msg = 'Database Cloud TERPUTUS — data tetap tersimpan aman di perangkat ini.';
-    detail = cloudConnectError || 'Aplikasi akan menyambung ulang otomatis. Perubahan tidak akan hilang.';
+    if (freshSeed) {
+      msg = 'Database cloud belum terjangkau — menampilkan DATA CONTOH. Database asli sekolah tersimpan aman di cloud.';
+      detail = 'Aplikasi akan memuat database sekolah otomatis begitu cloud tersambung';
+    } else {
+      msg = 'Database Cloud TERPUTUS — data tetap tersimpan aman di perangkat ini.';
+      detail = cloudConnectError || 'Aplikasi akan menyambung ulang otomatis. Perubahan tidak akan hilang.';
+    }
   }
   if (textEl) textEl.textContent = msg;
   if (retryBtn) retryBtn.classList.toggle('hidden', cloudReconnecting);
@@ -1591,6 +1886,7 @@ function importDatabase(file) {
         return;
       }
       db = data;
+      _dbFreshSeed = false; // data hasil impor adalah data nyata — wajib terkirim ke cloud/backup
       saveDB(); // tulis localStorage + cloud + RTDB + segarkan tampilan otomatis
       showToast('Database diimpor', 'Data berhasil dipulihkan dari file', 'success');
       if (session) { renderApp(); } else { renderLanding(); }
@@ -2460,10 +2756,21 @@ function renderMainContent() {
   if (!user) return;
   const page = uiState.currentPage;
   let html = '';
-  if (user.role === 'SUPER_ADMIN') html = renderAdminPage(page);
-  else if (user.role === 'GURU') html = renderGuruPage(page);
-  else if (user.role === 'TENDIK') html = renderTendikPage(page);
-  else if (user.role === 'SISWA') html = renderSiswaPage(page);
+  const renderFns = { SUPER_ADMIN: renderAdminPage, GURU: renderGuruPage, TENDIK: renderTendikPage, SISWA: renderSiswaPage };
+  const fn = renderFns[user.role];
+  if (fn) {
+    try {
+      html = fn(page);
+    } catch (e) {
+      // Halaman error JANGAN membuat menu mati — tampilkan pesan rapi + jalan keluar ke dashboard
+      console.warn('[UI] Gagal merender halaman "' + page + '":', e && e.message);
+      html = '<div class="p-8"><div class="bg-white rounded-2xl shadow p-8 max-w-md mx-auto text-center">' +
+        '<i data-lucide="alert-triangle" class="text-amber-500 mx-auto mb-3" style="font-size:40px;"></i>' +
+        '<h2 class="text-lg font-bold mb-1">Halaman tidak dapat ditampilkan</h2>' +
+        '<p class="text-sm text-gray-500 mb-4">Terjadi kendala saat menampilkan halaman ini. Data Anda tetap aman tersimpan di database.</p>' +
+        '<button onclick="navigateTo(\'dashboard\')" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-md text-sm">Kembali ke Dashboard</button></div></div>';
+    }
+  }
   document.getElementById('main-content').innerHTML = html;
   lucide.createIcons();
 }
@@ -2636,6 +2943,155 @@ function renderSiswaPage(page) { return window.SISWA_PAGES ? (window.SISWA_PAGES
   startDbWatchdog(); // penjaga koneksi: sambung-ulang otomatis + pemulihan data tanpa refresh
   rsStartRealtimeSync(); // sinkronisasi realtime: database ↔ tampilan (lokal, tab lain, cloud, autosave)
 })();
+
+/* ============================================================
+   BOOT LOADER CONTROLLER — halaman awal BARU TERBUKA setelah
+   database benar-benar terhubung DAN data berhasil dibaca.
+   Alur: baca database → hubungkan cloud → tunggu data server
+   terbaca → verifikasi → siapkan tampilan → buka halaman.
+   Pengaman: batas waktu tiap tahap + tombol lanjut manual +
+   failsafe mandiri 22 dtk (di atas) — halaman tidak pernah
+   terkunci selamanya.
+   ============================================================ */
+var _bootDone = false;
+var _bootT0 = Date.now();
+var _bootS2 = null;        // status langkah 2: 'ok' | 'skip' | null (belum selesai)
+var _bootConnectedAt = null; // waktu server cloud pertama kali mengonfirmasi koneksi
+var _bootSnapshotWaitT0 = null; // mulai menunggu data server terbaca
+
+function _bootEl(id) { return document.getElementById(id); }
+function _bootStep(n, state) {
+  var el = _bootEl('boot-step-' + n);
+  if (!el) return;
+  el.classList.remove('active', 'ok', 'fail', 'skip');
+  if (state) el.classList.add(state);
+}
+function _bootStatus(title, detail) {
+  var t = _bootEl('boot-status-title'), d = _bootEl('boot-status-detail');
+  if (t && title) t.textContent = title;
+  if (d && detail !== undefined && detail !== null) d.textContent = detail;
+}
+function _bootBar(pct) { var b = _bootEl('boot-bar'); if (b) b.style.width = pct + '%'; }
+function _bootCounts() {
+  try {
+    return (db.users ? db.users.length : 0) + ' pengguna • ' +
+      (db.teachers ? db.teachers.length : 0) + ' guru • ' +
+      (db.students ? db.students.length : 0) + ' siswa • ' +
+      (db.classes ? db.classes.length : 0) + ' kelas terbaca';
+  } catch (e) { return ''; }
+}
+
+// Buka halaman (status "siap" terlihat sekejap, lalu layar pemuatan memudar)
+function _bootFinish(reason) {
+  if (_bootDone) return;
+  _bootDone = true;
+  _bootStep(4, 'ok');
+  _bootBar(100);
+  _bootStatus('Database terhubung — data siap', reason || _bootCounts());
+  var loader = _bootEl('boot-loader');
+  setTimeout(function() {
+    try { renderApp(); } catch (e) { console.warn('[BOOT] Render akhir:', e); }
+    try { lucide.createIcons(); } catch (e) { /* abaikan */ }
+    document.body.classList.remove('booting');
+    if (loader) {
+      loader.classList.add('boot-hide');
+      setTimeout(function() { if (loader.parentNode) loader.parentNode.removeChild(loader); }, 650);
+    }
+  }, 600);
+}
+
+// Tombol "Lanjutkan tanpa menunggu" (muncul setelah 10 detik)
+function bootSkipNow() {
+  if (_bootDone) return;
+  console.log('[BOOT] Dilanjutkan manual oleh pengguna');
+  _bootFinish('Dibuka oleh pengguna — sinkronisasi database tetap berjalan');
+}
+window.bootSkipNow = bootSkipNow;
+
+(function bootSequence() {
+  _bootStep(1, 'active');
+  _bootStatus('Membaca database...', 'Memeriksa penyimpanan database');
+  _bootBar(12);
+
+  // Tombol lanjut manual tampil bila koneksi lebih dari 10 detik
+  setTimeout(function() {
+    var s = _bootEl('boot-skip-btn');
+    if (s && !_bootDone) s.style.display = 'inline-block';
+  }, 10000);
+
+  var tick = function() {
+    if (_bootDone) return;
+    var now = Date.now();
+
+    // LANGKAH 1 — database terbaca (localStorage / pulihan backup / adopsi cloud)
+    if (db && isValidDatabase(db)) _bootStep(1, 'ok');
+    else _bootStep(1, db ? 'active' : 'fail');
+
+    // LANGKAH 2 — koneksi Database Cloud (server dikonfirmasi langsung, bukan cache)
+    if (_bootS2 === null) {
+      var cloudDisabled = false;
+      try { cloudDisabled = isCloudDisabled(); } catch (e) { /* abaikan */ }
+      if (cloudDisabled) {
+        _bootS2 = 'skip'; // cloud dimatikan sengaja — database lokal dipakai
+      } else if (!navigator.onLine) {
+        _bootS2 = 'skip'; // offline — database lokal dipakai, sinkron nanti
+        _bootStatus('Mode offline — database lokal siap', 'Data akan tersinkron otomatis saat internet tersambung');
+      } else if (typeof isCloudConnected === 'function' && isCloudConnected()) {
+        // Server cloud benar-benar merespons — tunggu data sekolah terbaca dari server
+        if (_bootConnectedAt === null) {
+          _bootConnectedAt = now;
+          _bootStatus('Terhubung ke Database Cloud', 'Membaca data sekolah dari server...');
+        }
+        var snapshotIdle = !cloudSnapshotBuffer && !cloudSnapshotTimer && !_cloudPushInFlight;
+        if (_bootSnapshotWaitT0 === null) _bootSnapshotWaitT0 = now;
+        var dataRead = snapshotIdle && (now - _bootConnectedAt) >= 1400;
+        var dataWaitCap = (now - _bootSnapshotWaitT0) > 3500; // jangan menunggu data terlalu lama
+        if (dataRead || dataWaitCap) {
+          _bootS2 = 'ok';
+        } else {
+          _bootStatus('Terhubung ke Database Cloud', 'Membaca data sekolah dari server...');
+        }
+      } else if (cloudConnectError && !cloudConnected && !cloudListening && !cloudReconnecting) {
+        // Server dipastikan tidak dapat dihubungi (error definitif) — lanjut dengan database lokal
+        _bootS2 = 'skip';
+        _bootStatus('Server cloud belum dapat dihubungi', 'Membuka dengan database lokal — tersinkron otomatis nanti');
+      } else if (now - _bootT0 > 9000) {
+        // Batas tunggu koneksi 9 detik — jangan biarkan halaman menunggu selamanya
+        _bootS2 = 'skip';
+        _bootStatus('Koneksi server lambat', 'Membuka dengan database lokal — tersinkron otomatis nanti');
+      } else {
+        _bootStatus('Menghubungkan ke Database...', 'Menghubungi server database sekolah');
+      }
+      if (_bootS2 !== null) _bootStep(2, _bootS2);
+    }
+
+    // LANGKAH 3 — verifikasi data sekolah terbaca dari database
+    var step2Done = _bootS2 !== null;
+    var dataValid = !!(db && isValidDatabase(db));
+    if (step2Done && dataValid) {
+      if (!_bootEl('boot-step-3').classList.contains('ok')) {
+        _bootStep(3, 'ok');
+        _bootBar(80);
+        _bootStatus('Data sekolah terbaca dari database', _bootCounts());
+      }
+    } else if (step2Done) {
+      _bootStep(3, 'fail');
+    }
+
+    // LANGKAH 4 — tampilan disiapkan, lalu halaman dibuka
+    if (step2Done && dataValid) {
+      _bootStep(4, 'active');
+      _bootBar(92);
+      if (now - _bootT0 >= 1800) { _bootFinish(); return; } // tampil minimal 1,8 dtk agar status terbaca
+    }
+
+    // Pengaman mutlak: 18 detik — halaman selalu terbuka dengan data yang tersedia
+    if (now - _bootT0 > 18000) { _bootFinish('Dibuka dengan data yang tersedia — sinkronisasi tetap berjalan'); return; }
+
+    setTimeout(tick, 120);
+  };
+  setTimeout(tick, 250);
+})();
 </script>
 
 <!-- ============ DASHBOARD PAGES SCRIPT ============ -->
@@ -2665,6 +3121,8 @@ function showModal(title, bodyHTML, footerHTML = '', sizeClass = 'max-w-2xl') {
 function closeModal(e) {
   if (e && e.target !== e.currentTarget) return;
   document.getElementById('modal-root').innerHTML = '';
+  // Modal baru ditutup — segera terapkan refresh yang tertunda selama modal terbuka
+  if (typeof _rsPendingUI !== 'undefined' && _rsPendingUI) { _rsPendingUI = false; rsScheduleUI(60); }
 }
 function confirmDialog(title, message, onConfirm, confirmLabel, confirmColor) {
   const id = 'cf_' + Date.now();
@@ -4448,6 +4906,7 @@ window.ADMIN_PAGES = {
   },
 
   'database-cloud'() {
+    loadRtdbHistOnce(); // ambil daftar riwayat versi backup online (throttle 10 detik)
     const cloudConfig = loadCloudConfig() || activeCloudConfig || EMBEDDED_FIREBASE_CONFIG;
     const connected = isCloudConnected();
     const dbSize = new Blob([JSON.stringify(db)]).size;
@@ -4574,6 +5033,12 @@ service cloud.firestore {
           </div>
         ` : ''}
 
+        <div class="flex flex-wrap gap-2 mb-4">
+          <button type="button" onclick="pullFromCloudNow()" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="cloud-download" style="font-size: 14px;"></i> Tarik Data dari Cloud</button>
+          <button type="button" onclick="pushToCloudNow()" class="px-4 py-2 border border-emerald-300 text-emerald-700 hover:bg-emerald-50 rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="cloud-upload" style="font-size: 14px;"></i> Kirim Data ke Cloud</button>
+        </div>
+        <p class="text-xs text-gray-500 -mt-2 mb-4">Sinkronisasi berjalan otomatis — dua tombol di atas hanya untuk memaksa muat-ulang data dari cloud atau mengirim data saat ini ke cloud secara manual.</p>
+
         <details class="mt-1">
           <summary class="cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900 flex items-center gap-1"><i data-lucide="settings-2" style="font-size: 16px;"></i> Lanjutan — pakai project/config Firebase lain</summary>
           <div class="mt-3">
@@ -4629,6 +5094,26 @@ service cloud.firestore {
           <button type="button" onclick="backupNowRTDB()" class="px-4 py-2 bg-teal-500 hover:bg-teal-600 text-white rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="cloud-upload" style="font-size: 14px;"></i> Backup Sekarang</button>
           <button type="button" onclick="restoreFromRTDB()" class="px-4 py-2 border border-teal-300 text-teal-700 hover:bg-teal-50 rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="history" style="font-size: 14px;"></i> Pulihkan dari Backup</button>
           ${rtdbError ? '<button type="button" onclick="retryRtdb()" class="px-4 py-2 border border-gray-300 hover:bg-gray-50 rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="refresh-cw" style="font-size: 14px;"></i> Coba Sambungkan Ulang</button>' : ''}
+        </div>
+
+        <div class="p-4 rounded-lg bg-white border border-gray-200 mb-4">
+          <div class="flex items-center justify-between gap-2 mb-2 flex-wrap">
+            <p class="text-sm font-medium text-gray-800 flex items-center gap-1"><i data-lucide="history" style="font-size: 15px;"></i> Riwayat Backup Online (${rtdbHistVersions.length}/${RTDB_HIST_MAX} versi terakhir)</p>
+            <button type="button" onclick="loadRtdbHistOnce(true)" class="text-xs px-2 py-1 border border-gray-300 hover:bg-gray-50 rounded-md text-gray-600 flex items-center gap-1"><i data-lucide="refresh-cw" style="font-size: 12px;"></i> Muat Ulang</button>
+          </div>
+          <p class="text-xs text-gray-500 mb-2">Setiap perubahan tersinkron otomatis disimpan juga sebagai versi cadangan terpisah (maksimal ${RTDB_HIST_MAX} versi, satu versi per 5 menit). Jika suatu saat data berubah tidak sesuai keinginan, versi lama dapat dikembalikan dari daftar di bawah — data tidak akan hilang kecuali dihapus melalui perintah hapus yang tersedia di menu masing-masing.</p>
+          ${rtdbHistVersions.length ? `
+            <div class="space-y-1 max-h-60 overflow-y-auto pr-1">
+              ${rtdbHistVersions.map(function(v) { return `
+                <div class="flex items-center justify-between gap-2 p-2 rounded-md bg-gray-50 border border-gray-100">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-gray-700">${v.updatedAt ? formatDateTime(v.updatedAt) : 'Versi ' + v.key}</p>
+                    <p class="text-[11px] text-gray-400">${Math.round((v.size || 0) / 1024)} KB • perangkat ${v.device || '-'}</p>
+                  </div>
+                  <button type="button" onclick="restoreRtdbHist('${v.key}')" class="text-xs px-2 py-1 border border-teal-300 text-teal-700 hover:bg-teal-50 rounded-md flex-shrink-0">Pulihkan</button>
+                </div>`; }).join('')}
+            </div>
+          ` : '<p class="text-xs text-gray-500">Belum ada riwayat versi. Versi otomatis terbentuk saat perubahan data tersinkron (maksimal satu versi per 5 menit), atau klik <strong>Backup Sekarang</strong> untuk membuat versi sekarang juga.</p>'}
         </div>
 
         <div class="p-4 rounded-lg bg-gray-50 border border-gray-200 mb-4">
