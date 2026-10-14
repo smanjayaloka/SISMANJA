@@ -53,6 +53,18 @@
     .hero-dot:hover { background: rgba(255,255,255,0.85); }
     /* ===== SUPERADMIN ONLY — ikon status Cloud/Database hanya tampil untuk Superadmin ===== */
     body:not(.is-superadmin) .superadmin-only { display: none !important; }
+    /* ===== TOMBOL SINKRON — tampil untuk Superadmin/Guru/Tendik; menampilkan data terbaru saat diminta (tanpa render otomatis) ===== */
+    body:not(.is-staff) .staff-only { display: none !important; }
+    #btn-sync-db { display: none; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px; background: #ecfdf5; border: 1px solid #a7f3d0; color: #047857; font-size: 12px; font-weight: 600; position: relative; cursor: pointer; transition: background .15s ease; flex-shrink: 0; }
+    #btn-sync-db:hover { background: #d1fae5; }
+    body.is-staff #btn-sync-db { display: inline-flex; }
+    #btn-sync-db .sync-ico { width: 15px; height: 15px; flex-shrink: 0; }
+    #btn-sync-db.sync-spin .sync-ico { animation: syncSpin 0.9s linear infinite; }
+    @keyframes syncSpin { to { transform: rotate(360deg); } }
+    @media (max-width: 640px) { #btn-sync-db .sync-label { display: none; } }
+    #sync-avail-dot { position: absolute; top: -4px; right: -4px; width: 11px; height: 11px; border-radius: 9999px; background: #f59e0b; border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.2); display: none; }
+    #sync-avail-dot.on { display: block; animation: syncDotPulse 1.2s ease-in-out infinite; }
+    @keyframes syncDotPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
     /* ===== INDIKATOR STATUS DATABASE — banner peringatan saat terputus/offline ===== */
     #db-status-banner { transition: transform 0.25s ease, opacity 0.25s ease; }
     #db-status-banner.db-hidden { transform: translateY(-100%); opacity: 0; pointer-events: none; }
@@ -381,6 +393,12 @@
         </span>
         <span class="text-xs font-semibold">Offline</span>
       </button>
+      <!-- Tombol Sinkron Database — tampil untuk akun Superadmin, Guru, dan Tendik -->
+      <button id="btn-sync-db" class="staff-only" title="Sinkronkan tampilan dengan database terbaru" onclick="syncDatabaseNow()">
+        <i data-lucide="refresh-cw" class="sync-ico"></i>
+        <span class="sync-label">Sinkron</span>
+        <span id="sync-avail-dot" title="Data terbaru tersedia — klik Sinkron"></span>
+      </button>
       <!-- Ikon status Cloud & Database — HANYA tampil untuk akun Superadmin -->
       <div class="superadmin-only relative hidden md:block">
         <button onclick="toggleCloudStatus(event)" id="cloud-status-btn" class="p-2 hover:bg-gray-100 rounded-md relative" title="Status Cloud Database">
@@ -535,17 +553,23 @@ function saveDB() {
   saveToCloud(); // sync ke cloud jika terhubung (atau antre bila terputus)
   saveToRTDB();  // backup ke Realtime Database — salinan cadangan online kedua
   rsNoteLocalWrite(); // tandai isi database terakhir yang diketahui tab ini (realtime sync)
-  rsScheduleUI();     // tampilan otomatis diperbarui mengikuti data terbaru
+  // CATATAN: tampilan TIDAK di-refresh otomatis lagi. Setiap aksi pengguna (tambah/edit/hapus)
+  // memperbarui halamannya masing-masing lewat refresh eksplisit di handler-nya, dan perubahan
+  // dari luar ditampilkan lewat tombol "Sinkron" di bilah atas — agar halaman tidak ter-reset
+  // dan isian form tidak hilang saat pengguna sedang bekerja.
 }
 
 /* ============================================================
-   REALTIME SYNC ENGINE — tampilan selalu otomatis mengikuti database
-   - Setiap perubahan lokal (saveDB)  → tampilan langsung disegarkan
-   - Perubahan dari tab lain          → terdeteksi via event 'storage'
-   - Perubahan dari perangkat lain    → Cloud Firestore / RTDB snapshot
-   - Tab kembali aktif / fokus        → database dibaca ulang otomatis
+   REALTIME SYNC ENGINE — data selalu sinkron otomatis, TANPA
+   me-render ulang tampilan secara paksa (anti reset halaman)
+   - Perubahan lokal (saveDB)         → tersimpan & dikirim ke cloud/backup
+   - Perubahan dari tab lain          → diadopsi senyap via event 'storage'
+   - Perubahan dari perangkat lain    → Cloud Firestore / RTDB diadopsi senyap
+   - Tab kembali aktif / fokus        → database dibaca ulang (senyap)
    - Jaring pengaman autosave 4 detik → tak ada perubahan yang tertinggal
-     di memori tanpa tersimpan ke database
+   - Tampilan diperbarui saat pengguna berpindah halaman, menyelesaikan
+     aksinya sendiri, atau menekan tombol "Sinkron" di bilah atas —
+     sehingga isian form tidak pernah hilang & halaman tidak melompat.
    ============================================================ */
 var _rsLastSeenJson = null;  // isi database terakhir yang diketahui tab ini
 var _rsUiTimer = null;       // debounce penyegaran tampilan
@@ -558,6 +582,27 @@ var _dbFreshSeed = false;    // data lokal masih seed bawaan browser baru — pu
 var _lastCloudMetaMs = 0;    // waktu meta cloud terbaru yang pernah dilihat tab ini (anti snapshot basi)
 var _lastRtdbMetaMs = 0;     // waktu meta backup RTDB terbaru yang pernah dilihat tab ini
 var _cloudPushInFlight = false; // push batch ke Firestore sedang berjalan (belum dikonfirmasi server)
+var _rsNewDataAvail = false;    // data terbaru sudah diterima di latar belakang — menunggu tombol Sinkron
+var _rsNotifyAt = 0;            // throttle info "data baru tersedia" (anti spam toast)
+
+// Titik oranye pada tombol Sinkron — menandakan ada data baru yang siap ditampilkan
+function updateSyncIndicator() {
+  try {
+    const dot = document.getElementById('sync-avail-dot');
+    if (dot) dot.classList.toggle('on', _rsNewDataAvail);
+  } catch (e) { /* abaikan */ }
+}
+
+// Info senyap: data baru diterima dari latar belakang (TANPA render ulang — aman untuk form)
+function rsNotifyNewData(source) {
+  _rsNewDataAvail = true;
+  updateSyncIndicator();
+  if (!session) return;
+  const t = Date.now();
+  if (t - _rsNotifyAt < 20000) return; // maksimal satu info per 20 detik
+  _rsNotifyAt = t;
+  showToast('Data terbaru tersedia', 'Perubahan dari ' + source + ' sudah diterima. Klik tombol "Sinkron" di bagian atas untuk menampilkannya — isian yang sedang Anda kerjakan tidak hilang.', 'info');
+}
 
 function rsReadStorage() { try { return localStorage.getItem(DB_KEY); } catch (e) { return null; } }
 function rsNoteLocalWrite() { _rsLastSeenJson = rsReadStorage(); }
@@ -599,7 +644,13 @@ function rsApplyUI() {
     if (document.hidden || rsUiBusy()) { _rsPendingUI = true; rsRetryLater(); return; } // tunda bila modal terbuka / user sedang mengetik
     _rsPendingUI = false; // refresh berhasil — reset penanda tertunda
     if (!session) { renderLanding(); lucide.createIcons(); return; }
-    if (!getCurrentUser()) { renderApp(); lucide.createIcons(); return; }
+    // Pengaman sesi: akun hilang dari data terbaru → logout bersih (bukan shell kosong)
+    if (!getCurrentUser()) {
+      session = null; saveSession();
+      renderLanding(); lucide.createIcons();
+      showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
+      return;
+    }
     renderTopBar();
     renderSidebar();
     renderMainContent();
@@ -608,7 +659,8 @@ function rsApplyUI() {
   } catch (e) { console.warn('[SYNC] Penyegaran tampilan gagal:', e && e.message); }
 }
 
-// Baca ulang database dari localStorage (perubahan tab lain / proses luar) lalu segarkan tampilan
+// Baca ulang database dari localStorage (perubahan tab lain / proses luar) —
+// diadopsi SENYAP tanpa render ulang; tampilan diperbarui lewat tombol "Sinkron"
 function rsReloadFromStorage() {
   const raw = rsReadStorage();
   if (raw === _rsLastSeenJson) return false;   // tidak ada perubahan baru
@@ -617,14 +669,7 @@ function rsReloadFromStorage() {
   if (!parsed) return false;                   // rusak — biarkan watchdog yang memulihkan
   db = parsed;
   _dbFreshSeed = false; // data dari tab/proses lain adalah data nyata — bukan lagi seed bawaan
-  if (session) {
-    const t = Date.now();
-    if (t - _rsToastSyncAt > 15000) {
-      _rsToastSyncAt = t;
-      showToast('Data terbaru dimuat', 'Tampilan otomatis diperbarui mengikuti database terbaru', 'info');
-    }
-  }
-  rsScheduleUI(120);
+  rsNotifyNewData('tab lain');
   return true;
 }
 
@@ -662,17 +707,14 @@ function rsStartRealtimeSync() {
     else if (e.key === null) { rsReloadFromStorage(); rsReloadSessionFromStorage(); }
   });
 
-  // 2) Tab kembali terlihat / fokus → pastikan data & tampilan paling baru
+  // 2) Tab kembali terlihat / fokus → pastikan DATA paling baru (adopsi senyap,
+  //    tanpa render ulang — tampilan mengikuti lewat tombol "Sinkron" / pindah halaman)
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) return;
     rsReloadFromStorage();
-    if (_rsPendingUI) { _rsPendingUI = false; rsScheduleUI(80); }
   });
   window.addEventListener('focus', function() { rsReloadFromStorage(); });
-  window.addEventListener('pageshow', function() {
-    rsReloadFromStorage();
-    if (_rsPendingUI) { _rsPendingUI = false; rsScheduleUI(80); }
-  });
+  window.addEventListener('pageshow', function() { rsReloadFromStorage(); });
 
   // 3) Detak rutin 4 detik: autosave jaring pengaman + tangkap perubahan yang terlewat
   //    + proses-ulang snapshot cloud/RTDB yang ditunda karena ada tulisan lokal yang sedang berjalan
@@ -681,6 +723,55 @@ function rsStartRealtimeSync() {
     if (cloudSnapshotBuffer) { try { handleCloudSnapshot(); } catch (e) { /* abaikan */ } }
     if (rtdbSnapshotBuffer) { try { processRtdbSnapshot(); } catch (e) { /* abaikan */ } }
   }, 4000);
+}
+
+/* ============================================================
+   TOMBOL "SINKRON" — bilah atas (Superadmin / Guru / Tendik)
+   Menampilkan data terbaru dari database (lokal + Cloud + Backup
+   RTDB) SAAT DIMINTA pengguna, tanpa mengubah halaman aktif.
+   Sinkronisasi data ke cloud/backup tetap berjalan realtime di
+   latar belakang; yang dihilangkan hanyalah render ulang otomatis
+   agar halaman tidak ter-reset dan isian form tidak hilang.
+   ============================================================ */
+var _syncBusy = false;
+function syncDatabaseNow() {
+  if (_syncBusy) return;
+  if (!session || !getCurrentUser()) return;
+  _syncBusy = true;
+  const btn = document.getElementById('btn-sync-db');
+  if (btn) btn.classList.add('sync-spin');
+  setTimeout(function() { // jeda singkat agar ikon berputar sempat terlihat
+    let ok = true, errMsg = '';
+    try {
+      try { rsAutosaveCheck(); } catch (e) {}                                             // 1) simpan perubahan memori yang belum tersimpan
+      try { if (cloudSnapshotBuffer) handleCloudSnapshot(); } catch (e) {}                // 2) tarik snapshot Cloud (berlaku anti-revert)
+      try { if (rtdbSnapshotBuffer) processRtdbSnapshot(); } catch (e) {}                 // 3) tarik backup RTDB bila Cloud terputus
+      try { rsReloadFromStorage(); } catch (e) {}                                         // 4) baca ulang data dari tab lain
+      try { if (isCloudConnected() && cloudPendingPush) saveToCloud(true); } catch (e) {} // 5) kirim sisa antrean lokal yang belum terkirim
+      try { if (isRtdbActive() && rtdbPendingPush) saveToRTDB(true); } catch (e) {}
+      _rsNewDataAvail = false;
+      if (document.getElementById('live-room-overlay')) {
+        _rsPendingUI = true; // jangan render di tengah sesi Live Class — diterapkan saat keluar ruangan
+      } else {
+        rsApplyUI();                                                                      // 6) tampilkan data terbaru, halaman aktif dipertahankan
+      }
+    } catch (e) {
+      ok = false; errMsg = (e && e.message) || String(e);
+      console.warn('[SINKRON] Gagal:', errMsg);
+    } finally {
+      _syncBusy = false;
+      const b = document.getElementById('btn-sync-db');
+      if (b) b.classList.remove('sync-spin');
+      updateSyncIndicator();
+      if (ok) {
+        if (_rsPendingUI) showToast('Sinkronisasi selesai', 'Tampilan akan diperbarui otomatis setelah Anda selesai mengisi form', 'info');
+        else showToast('Sinkronisasi selesai', 'Data terbaru dari database telah ditampilkan', 'success');
+      } else {
+        showToast('Sinkronisasi gagal', errMsg || 'Coba lagi', 'error');
+      }
+      if (window.lucide) lucide.createIcons();
+    }
+  }, 120);
 }
 
 function loadSession() {
@@ -877,10 +968,7 @@ function handleCloudSnapshot() {
   _dbFreshSeed = false;      // cloud ternyata berisi data asli — adopsi, seed bawaan ditinggalkan
   adoptCloudData(data);
   _lastCloudMetaMs = metaMs; // catat meta cloud yang sudah diterima
-  if (session) {
-    rsScheduleUI(100); // seluruh tampilan (topbar, sidebar, halaman aktif) mengikuti data cloud terbaru
-    showToast('Data disinkronkan dari cloud', 'Perubahan terbaru dari perangkat lain telah diterapkan', 'info');
-  }
+  if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
 }
 
 function ensureFirebaseApp(config) {
@@ -1331,10 +1419,7 @@ function processRtdbSnapshot() {
     _dbFreshSeed = false;
     adoptCloudData(parsed.data);
     _lastRtdbMetaMs = metaMs;
-    if (session) {
-      rsScheduleUI(100);
-      showToast('Data dipulihkan dari Backup RTDB', 'Terakhir diperbarui: ' + formatDateTime(parsed.meta.updatedAt) + ' oleh ' + (parsed.meta.device || '-'), 'info');
-    }
+    if (session) rsNotifyNewData('Backup RTDB'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
   }
 }
 
@@ -1483,7 +1568,40 @@ function refreshRtdbHistList(val) {
   const j = JSON.stringify(list);
   if (j === rtdbHistListJson) return; // daftar tidak berubah — jangan render ulang
   rtdbHistListJson = j;
-  if (session && uiState.currentPage === 'database-cloud') { try { refreshMainContent(); } catch (e) { /* abaikan */ } }
+  // Pembaruan TERGETER: hanya panel riwayat yang diganti — halaman TIDAK di-render ulang
+  // agar isian form di halaman Database & Cloud tidak hilang (anti reset otomatis)
+  try {
+    const panel = document.getElementById('rtdb-hist-panel');
+    if (panel && session && uiState.currentPage === 'database-cloud') {
+      panel.innerHTML = rtdbHistPanelHTML();
+      if (window.lucide) lucide.createIcons();
+    }
+  } catch (e) { /* abaikan */ }
+}
+
+// HTML panel "Riwayat Backup Online" — dipakai render halaman Database & Cloud
+// dan pembaruan tertarget tanpa render ulang seluruh halaman
+function rtdbHistPanelHTML() {
+  return `
+        <div id="rtdb-hist-panel" class="p-4 rounded-lg bg-white border border-gray-200 mb-4">
+          <div class="flex items-center justify-between gap-2 mb-2 flex-wrap">
+            <p class="text-sm font-medium text-gray-800 flex items-center gap-1"><i data-lucide="history" style="font-size: 15px;"></i> Riwayat Backup Online (${rtdbHistVersions.length}/${RTDB_HIST_MAX} versi terakhir)</p>
+            <button type="button" onclick="loadRtdbHistOnce(true)" class="text-xs px-2 py-1 border border-gray-300 hover:bg-gray-50 rounded-md text-gray-600 flex items-center gap-1"><i data-lucide="refresh-cw" style="font-size: 12px;"></i> Muat Ulang</button>
+          </div>
+          <p class="text-xs text-gray-500 mb-2">Setiap perubahan tersinkron otomatis disimpan juga sebagai versi cadangan terpisah (maksimal ${RTDB_HIST_MAX} versi, satu versi per 5 menit). Jika suatu saat data berubah tidak sesuai keinginan, versi lama dapat dikembalikan dari daftar di bawah — data tidak akan hilang kecuali dihapus melalui perintah hapus yang tersedia di menu masing-masing.</p>
+          ${rtdbHistVersions.length ? `
+            <div class="space-y-1 max-h-60 overflow-y-auto pr-1">
+              ${rtdbHistVersions.map(function(v) { return `
+                <div class="flex items-center justify-between gap-2 p-2 rounded-md bg-gray-50 border border-gray-100">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-gray-700">${v.updatedAt ? formatDateTime(v.updatedAt) : 'Versi ' + v.key}</p>
+                    <p class="text-[11px] text-gray-400">${Math.round((v.size || 0) / 1024)} KB • perangkat ${v.device || '-'}</p>
+                  </div>
+                  <button type="button" onclick="restoreRtdbHist('${v.key}')" class="text-xs px-2 py-1 border border-teal-300 text-teal-700 hover:bg-teal-50 rounded-md flex-shrink-0">Pulihkan</button>
+                </div>`; }).join('')}
+            </div>
+          ` : '<p class="text-xs text-gray-500">Belum ada riwayat versi. Versi otomatis terbentuk saat perubahan data tersinkron (maksimal satu versi per 5 menit), atau klik <strong>Backup Sekarang</strong> untuk membuat versi sekarang juga.</p>'}
+        </div>`;
 }
 
 // Pulihkan satu versi dari riwayat backup online
@@ -1789,6 +1907,9 @@ function applyRoleVisibility() {
   const user = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
   const isSuper = !!(user && user.role === 'SUPER_ADMIN');
   document.body.classList.toggle('is-superadmin', isSuper);
+  // Tombol "Sinkron" tampil untuk Superadmin, Guru, dan Tendik (bukan Siswa)
+  const isStaff = !!(user && (user.role === 'SUPER_ADMIN' || user.role === 'GURU' || user.role === 'TENDIK'));
+  document.body.classList.toggle('is-staff', isStaff);
 }
 
 // Watchdog: menjaga database tetap sehat tanpa perlu muat ulang halaman
@@ -1887,7 +2008,7 @@ function importDatabase(file) {
       }
       db = data;
       _dbFreshSeed = false; // data hasil impor adalah data nyata — wajib terkirim ke cloud/backup
-      saveDB(); // tulis localStorage + cloud + RTDB + segarkan tampilan otomatis
+      saveDB(); // tulis localStorage + cloud + RTDB (tampilan disegarkan di baris berikutnya)
       showToast('Database diimpor', 'Data berhasil dipulihkan dari file', 'success');
       if (session) { renderApp(); } else { renderLanding(); }
       lucide.createIcons();
@@ -2548,6 +2669,12 @@ function scrollToSection(id) {
    ============================================================ */
 function renderApp() {
   loadDB(); loadSession(); loadUIState();
+  // Pengaman sesi: akun pada sesi tidak ditemukan di data terbaru (mis. data terganti
+  // oleh perangkat lain) → logout bersih & kembali ke halaman depan, BUKAN shell kosong
+  if (session && !getCurrentUser()) {
+    session = null; saveSession();
+    showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
+  }
   applyRoleVisibility(); // ikon Cloud/Database hanya untuk Superadmin
   if (!session) {
     renderLanding();
@@ -2612,6 +2739,7 @@ function renderTopBar() {
   }
   // Update cloud status indicator
   updateCloudStatusUI();
+  updateSyncIndicator(); // status titik "data baru tersedia" pada tombol Sinkron
 }
 
 function toggleCloudStatus(e) {
@@ -5096,25 +5224,7 @@ service cloud.firestore {
           ${rtdbError ? '<button type="button" onclick="retryRtdb()" class="px-4 py-2 border border-gray-300 hover:bg-gray-50 rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="refresh-cw" style="font-size: 14px;"></i> Coba Sambungkan Ulang</button>' : ''}
         </div>
 
-        <div class="p-4 rounded-lg bg-white border border-gray-200 mb-4">
-          <div class="flex items-center justify-between gap-2 mb-2 flex-wrap">
-            <p class="text-sm font-medium text-gray-800 flex items-center gap-1"><i data-lucide="history" style="font-size: 15px;"></i> Riwayat Backup Online (${rtdbHistVersions.length}/${RTDB_HIST_MAX} versi terakhir)</p>
-            <button type="button" onclick="loadRtdbHistOnce(true)" class="text-xs px-2 py-1 border border-gray-300 hover:bg-gray-50 rounded-md text-gray-600 flex items-center gap-1"><i data-lucide="refresh-cw" style="font-size: 12px;"></i> Muat Ulang</button>
-          </div>
-          <p class="text-xs text-gray-500 mb-2">Setiap perubahan tersinkron otomatis disimpan juga sebagai versi cadangan terpisah (maksimal ${RTDB_HIST_MAX} versi, satu versi per 5 menit). Jika suatu saat data berubah tidak sesuai keinginan, versi lama dapat dikembalikan dari daftar di bawah — data tidak akan hilang kecuali dihapus melalui perintah hapus yang tersedia di menu masing-masing.</p>
-          ${rtdbHistVersions.length ? `
-            <div class="space-y-1 max-h-60 overflow-y-auto pr-1">
-              ${rtdbHistVersions.map(function(v) { return `
-                <div class="flex items-center justify-between gap-2 p-2 rounded-md bg-gray-50 border border-gray-100">
-                  <div class="min-w-0">
-                    <p class="text-xs font-medium text-gray-700">${v.updatedAt ? formatDateTime(v.updatedAt) : 'Versi ' + v.key}</p>
-                    <p class="text-[11px] text-gray-400">${Math.round((v.size || 0) / 1024)} KB • perangkat ${v.device || '-'}</p>
-                  </div>
-                  <button type="button" onclick="restoreRtdbHist('${v.key}')" class="text-xs px-2 py-1 border border-teal-300 text-teal-700 hover:bg-teal-50 rounded-md flex-shrink-0">Pulihkan</button>
-                </div>`; }).join('')}
-            </div>
-          ` : '<p class="text-xs text-gray-500">Belum ada riwayat versi. Versi otomatis terbentuk saat perubahan data tersinkron (maksimal satu versi per 5 menit), atau klik <strong>Backup Sekarang</strong> untuk membuat versi sekarang juga.</p>'}
-        </div>
+        ${rtdbHistPanelHTML()}
 
         <div class="p-4 rounded-lg bg-gray-50 border border-gray-200 mb-4">
           <p class="text-sm font-medium text-gray-800 mb-2">Rules Realtime Database (mode test — aktif s.d. 12 November 2026):</p>
