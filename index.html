@@ -51,9 +51,29 @@
     .hero-dot { width: 8px; height: 8px; border-radius: 9999px; background: rgba(255,255,255,0.5); transition: all 0.3s ease; cursor: pointer; border: none; padding: 0; }
     .hero-dot.active { width: 24px; background: #ffffff; }
     .hero-dot:hover { background: rgba(255,255,255,0.85); }
+    /* ===== SUPERADMIN ONLY — ikon status Cloud/Database hanya tampil untuk Superadmin ===== */
+    body:not(.is-superadmin) .superadmin-only { display: none !important; }
+    /* ===== INDIKATOR STATUS DATABASE — banner peringatan saat terputus/offline ===== */
+    #db-status-banner { transition: transform 0.25s ease, opacity 0.25s ease; }
+    #db-status-banner.db-hidden { transform: translateY(-100%); opacity: 0; pointer-events: none; }
+    .db-spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.45); border-top-color: #fff; border-radius: 9999px; animation: dbSpin 0.8s linear infinite; }
+    @keyframes dbSpin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body class="antialiased text-gray-900">
+
+<!-- ============ INDIKATOR STATUS DATABASE (tampil saat database terputus/offline) ============ -->
+<div id="db-status-banner" class="db-hidden fixed top-0 left-0 right-0 z-[70] shadow-md">
+  <div id="db-status-banner-inner" class="bg-red-600 text-white text-xs sm:text-sm">
+    <div class="max-w-7xl mx-auto px-3 sm:px-4 py-2 flex items-center justify-center gap-2 flex-wrap text-center leading-snug">
+      <i id="db-status-icon-banner" data-lucide="cloud-off" style="font-size: 16px;" class="flex-shrink-0"></i>
+      <span id="db-status-text" class="font-medium">Database tidak terhubung — data tersimpan aman di perangkat ini.</span>
+      <button id="db-status-retry-btn" onclick="reconnectDatabaseNow()" class="ml-1 px-2.5 py-1 rounded-md bg-white/20 hover:bg-white/30 border border-white/40 text-xs font-semibold flex items-center gap-1.5 flex-shrink-0">
+        <i data-lucide="refresh-cw" style="font-size: 12px;"></i> Sambungkan Ulang
+      </button>
+    </div>
+  </div>
+</div>
 
 <!-- ============ LANDING PAGE (PUBLIC) ============ -->
 <div id="landing-page" class="min-h-screen flex flex-col bg-gradient-to-b from-emerald-50 via-white to-white">
@@ -284,12 +304,21 @@
         <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" style="font-size: 16px;"></i>
         <input id="global-search" placeholder="Cari..." class="pl-9 pr-3 py-1.5 border rounded-md w-48 lg:w-64 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
       </div>
-      <div class="relative hidden md:block">
+      <!-- Indikator offline mini — tampil untuk SEMUA pengguna hanya saat database terputus -->
+      <button id="db-mini-status" class="hidden items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-red-600 hover:bg-red-100" title="Database terputus" onclick="reconnectDatabaseNow()">
+        <span class="relative flex h-2 w-2 flex-shrink-0">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
+        </span>
+        <span class="text-xs font-semibold">Offline</span>
+      </button>
+      <!-- Ikon status Cloud & Database — HANYA tampil untuk akun Superadmin -->
+      <div class="superadmin-only relative hidden md:block">
         <button onclick="toggleCloudStatus(event)" id="cloud-status-btn" class="p-2 hover:bg-gray-100 rounded-md relative" title="Status Cloud Database">
           <i data-lucide="cloud-off" id="cloud-status-icon" style="font-size: 20px;" class="text-gray-400"></i>
         </button>
       </div>
-      <div class="relative hidden md:block">
+      <div class="superadmin-only relative hidden md:block">
         <button onclick="toggleRtdbStatus(event)" id="rtdb-status-btn" class="p-2 hover:bg-gray-100 rounded-md relative" title="Status Backup Realtime Database">
           <i data-lucide="database-backup" id="rtdb-status-icon" style="font-size: 20px;" class="text-gray-400"></i>
         </button>
@@ -361,21 +390,44 @@
    STATE MANAGEMENT & DATABASE (localStorage)
    ============================================================ */
 const DB_KEY = 'sija_db_v1';
+const DB_BAK_KEY = 'sija_db_bak_v1';  // salinan cadangan lokal — pemulihan bila database utama rusak/hilang
 const SESSION_KEY = 'sija_session_v1';
 const UI_KEY = 'sija_ui_v1';
 
 let db = null;
 let session = null;
 let uiState = { currentPage: 'dashboard', sidebarOpen: false };
+let lastBakAt = 0;          // waktu terakhir menulis cadangan lokal
+let lastSaveErrToastAt = 0; // debounce toast error penyimpanan
 
 const ROLE_LABELS = { SUPER_ADMIN: 'Super Admin', GURU: 'Guru', TENDIK: 'Tenaga Kependidikan', SISWA: 'Siswa' };
 const ROLE_COLORS = { SUPER_ADMIN: 'from-red-500 to-rose-600', GURU: 'from-emerald-500 to-teal-600', TENDIK: 'from-amber-500 to-orange-600', SISWA: 'from-indigo-500 to-blue-600' };
 const ROLE_AVATAR_COLORS = { SUPER_ADMIN: 'bg-red-500', GURU: 'bg-emerald-500', TENDIK: 'bg-amber-500', SISWA: 'bg-indigo-500' };
 
+// Validasi struktur database agar data rusak/tidak lengkap tidak dipakai
+function isValidDatabase(obj) {
+  return !!(obj && typeof obj === 'object' &&
+    Array.isArray(obj.users) && obj.users.length > 0 &&
+    obj.schoolProfile && typeof obj.schoolProfile === 'object');
+}
+function parseDbJson(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  try { const d = JSON.parse(raw); return isValidDatabase(d) ? d : null; } catch (e) { return null; }
+}
+
 function loadDB() {
-  const raw = localStorage.getItem(DB_KEY);
-  if (raw) {
-    try { db = JSON.parse(raw); } catch (e) { db = null; }
+  let recovered = false;
+  const main = parseDbJson(localStorage.getItem(DB_KEY));
+  if (main) {
+    db = main;
+  } else {
+    // Database utama rusak / tidak terbaca — pulihkan dari cadangan lokal
+    const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
+    if (bak) {
+      db = bak;
+      recovered = true;
+      try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
+    }
   }
   if (!db) {
     db = seedDatabase();
@@ -383,14 +435,147 @@ function loadDB() {
   }
   // Migrasi ringan: pastikan field baru tersedia untuk database lama
   if (db && !Array.isArray(db.presentations)) db.presentations = [];
+  if (recovered) {
+    console.warn('[DB] Database utama tidak terbaca — data dipulihkan dari backup lokal');
+    setTimeout(function() {
+      showToast('Database dipulihkan', 'Data utama rusak/tidak terbaca — berhasil dipulihkan dari backup lokal.', 'warning');
+    }, 1200);
+  }
   // Init cloud sync jika ada config
   initFirebase();
 }
 function saveDB() {
-  localStorage.setItem(DB_KEY, JSON.stringify(db));
-  saveToCloud(); // sync ke cloud jika terhubung
+  try {
+    const json = JSON.stringify(db);
+    // Cadangan lokal: simpan salinan maksimal sekali per 60 detik agar hemat kuota & tetap cepat
+    const t = Date.now();
+    if (t - lastBakAt > 60000) {
+      try { localStorage.setItem(DB_BAK_KEY, json); lastBakAt = t; } catch (e) { /* abaikan */ }
+    }
+    localStorage.setItem(DB_KEY, json);
+  } catch (e) {
+    console.error('[DB] Gagal menyimpan ke localStorage:', e);
+    const t = Date.now();
+    if (t - lastSaveErrToastAt > 30000) {
+      lastSaveErrToastAt = t;
+      showToast('Penyimpanan Browser Bermasalah', 'Perubahan tidak dapat disimpan (kuota penuh / penyimpanan dibatasi). Export database sebagai cadangan.', 'error');
+    }
+  }
+  saveToCloud(); // sync ke cloud jika terhubung (atau antre bila terputus)
   saveToRTDB();  // backup ke Realtime Database — salinan cadangan online kedua
+  rsNoteLocalWrite(); // tandai isi database terakhir yang diketahui tab ini (realtime sync)
+  rsScheduleUI();     // tampilan otomatis diperbarui mengikuti data terbaru
 }
+
+/* ============================================================
+   REALTIME SYNC ENGINE — tampilan selalu otomatis mengikuti database
+   - Setiap perubahan lokal (saveDB)  → tampilan langsung disegarkan
+   - Perubahan dari tab lain          → terdeteksi via event 'storage'
+   - Perubahan dari perangkat lain    → Cloud Firestore / RTDB snapshot
+   - Tab kembali aktif / fokus        → database dibaca ulang otomatis
+   - Jaring pengaman autosave 4 detik → tak ada perubahan yang tertinggal
+     di memori tanpa tersimpan ke database
+   ============================================================ */
+var _rsLastSeenJson = null;  // isi database terakhir yang diketahui tab ini
+var _rsUiTimer = null;       // debounce penyegaran tampilan
+var _rsPendingUI = false;    // penyegaran tertunda (tab tidak aktif / ruang live terbuka)
+var _rsTickStarted = false;  // guard agar mesin sinkron hanya berjalan sekali
+var _rsToastSyncAt = 0;      // throttle toast info sinkron antar tab
+
+function rsReadStorage() { try { return localStorage.getItem(DB_KEY); } catch (e) { return null; } }
+function rsNoteLocalWrite() { _rsLastSeenJson = rsReadStorage(); }
+
+// Minta penyegaran tampilan (debounce) — aman dipanggil berkali-kali beruntun
+function rsScheduleUI(delay) {
+  if (document.hidden || document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; }
+  if (_rsUiTimer) clearTimeout(_rsUiTimer);
+  _rsUiTimer = setTimeout(function() { _rsUiTimer = null; rsApplyUI(); }, delay || 180);
+}
+
+// Terapkan data db terkini ke seluruh tampilan yang sedang terlihat
+function rsApplyUI() {
+  try {
+    if (document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; } // jangan ganggu sesi Live Class
+    _rsPendingUI = false; // refresh berhasil — reset penanda tertunda
+    if (!session) { renderLanding(); lucide.createIcons(); return; }
+    if (!getCurrentUser()) { renderApp(); lucide.createIcons(); return; }
+    renderTopBar();
+    renderSidebar();
+    renderMainContent();
+    applyRoleVisibility();
+    lucide.createIcons();
+  } catch (e) { console.warn('[SYNC] Penyegaran tampilan gagal:', e && e.message); }
+}
+
+// Baca ulang database dari localStorage (perubahan tab lain / proses luar) lalu segarkan tampilan
+function rsReloadFromStorage() {
+  const raw = rsReadStorage();
+  if (raw === _rsLastSeenJson) return false;   // tidak ada perubahan baru
+  _rsLastSeenJson = raw;
+  const parsed = parseDbJson(raw);
+  if (!parsed) return false;                   // rusak — biarkan watchdog yang memulihkan
+  db = parsed;
+  if (session) {
+    const t = Date.now();
+    if (t - _rsToastSyncAt > 15000) {
+      _rsToastSyncAt = t;
+      showToast('Data terbaru dimuat', 'Tampilan otomatis diperbarui mengikuti database terbaru', 'info');
+    }
+  }
+  rsScheduleUI(120);
+  return true;
+}
+
+// Jaring pengaman: perubahan db di memori yang belum tersimpan → simpan otomatis
+function rsAutosaveCheck() {
+  if (!db) return;
+  let json;
+  try { json = JSON.stringify(db); } catch (e) { return; }
+  const raw = rsReadStorage();
+  if (json === raw) return;                 // memori & storage sinkron
+  if (raw === _rsLastSeenJson) saveDB();    // memori berubah, storage belum → simpan sekarang
+  else rsReloadFromStorage();               // storage berubah dari luar → ikuti data terbaru
+}
+
+// Sinkronkan sesi bila tab lain login/logout
+function rsReloadSessionFromStorage() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    const s = raw ? JSON.parse(raw) : null;
+    const changed = JSON.stringify(s) !== JSON.stringify(session);
+    session = s;
+    if (changed) { renderApp(); lucide.createIcons(); }
+  } catch (e) { /* abaikan */ }
+}
+
+function rsStartRealtimeSync() {
+  if (_rsTickStarted) return;
+  _rsTickStarted = true;
+  rsNoteLocalWrite();
+
+  // 1) Tab lain mengubah database / sesi → baca ulang & tampilkan seketika
+  window.addEventListener('storage', function(e) {
+    if (e.key === DB_KEY) rsReloadFromStorage();
+    else if (e.key === SESSION_KEY) rsReloadSessionFromStorage();
+    else if (e.key === null) { rsReloadFromStorage(); rsReloadSessionFromStorage(); }
+  });
+
+  // 2) Tab kembali terlihat / fokus → pastikan data & tampilan paling baru
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) return;
+    rsReloadFromStorage();
+    if (_rsPendingUI) { _rsPendingUI = false; rsScheduleUI(80); }
+  });
+  window.addEventListener('focus', function() { rsReloadFromStorage(); });
+  window.addEventListener('pageshow', function() {
+    rsReloadFromStorage();
+    if (_rsPendingUI) { _rsPendingUI = false; rsScheduleUI(80); }
+  });
+
+  // 3) Detak rutin 4 detik: autosave jaring pengaman + tangkap perubahan yang terlewat
+  setInterval(function() { rsAutosaveCheck(); }, 4000);
+}
+
 function loadSession() {
   const raw = localStorage.getItem(SESSION_KEY);
   if (raw) { try { session = JSON.parse(raw); } catch (e) { session = null; } }
@@ -432,8 +617,9 @@ const EMBEDDED_FIREBASE_CONFIG = {
 let firebaseApp = null;
 let firebaseFS = null;        // instance Cloud Firestore
 let cloudUnsub = null;        // fungsi unsubscribe listener snapshot
-let cloudConnected = false;
-let cloudListening = false;
+let cloudConnected = false;   // instance Firestore siap & listener terpasang
+let cloudListening = false;   // listener snapshot aktif
+let cloudServerConfirmed = false; // terhubung NYATA ke server (snapshot bukan dari cache)
 let cloudConnectError = null;
 let cloudAnnounce = false;
 let activeCloudConfig = null;
@@ -441,6 +627,15 @@ let firebaseAnalytics = null;
 let cloudPushTimer = null;
 let cloudSnapshotTimer = null;
 let cloudSnapshotBuffer = null;
+// ===== Kesehatan koneksi & sambung-ulang otomatis =====
+let cloudPendingPush = false;      // ada perubahan lokal yang menunggu dikirim saat online
+let cloudDownSince = null;         // sejak kapan cloud terputus (null = terhubung)
+let cloudReconnecting = false;     // sedang mencoba menyambung ulang
+let cloudRetryCount = 0;
+let cloudLastServerConfirmAt = 0;  // terakhir kali server mengonfirmasi koneksi
+let cloudSdkLoading = false;       // guard pemuatan ulang SDK dinamis
+let lastCloudUiState = null;       // anti-render berulang ikon status cloud
+let lastBannerKey = null;          // anti-render berulang banner status
 
 // Nama unik perangkat untuk info sinkronisasi
 function deviceLabel() {
@@ -499,14 +694,24 @@ function adoptCloudData(data) {
   if (!Array.isArray(data.presentations)) data.presentations = [];
   db = data;
   localStorage.setItem(DB_KEY, JSON.stringify(db));
+  rsNoteLocalWrite(); // sinkron dengan penanda realtime sync
   return true;
 }
 
 function initFirebase() {
   if (typeof firebase === 'undefined') {
-    cloudConnectError = 'SDK Firebase tidak termuat (perangkat offline?) — data tersimpan lokal.';
+    cloudConnected = false;
+    cloudServerConfirmed = false;
+    cloudConnectError = 'SDK Firebase belum termuat — mencoba memuat ulang otomatis...';
     console.warn('[Firebase]', cloudConnectError);
     updateCloudStatusUI();
+    // Halaman mungkin dibuka saat offline — muat ulang SDK secara dinamis saat online
+    ensureFirebaseSdk(function(ok) {
+      if (ok && !isCloudDisabled()) {
+        cloudConnectError = null;
+        initFirebase();
+      }
+    });
     return false;
   }
   const config = resolveCloudConfig();
@@ -544,8 +749,7 @@ function handleCloudSnapshot() {
   if (stableStringify(data) === stableStringify(db)) return; // tulisan sendiri / tidak ada perubahan
   adoptCloudData(data);
   if (session) {
-    renderMainContent();
-    lucide.createIcons();
+    rsScheduleUI(100); // seluruh tampilan (topbar, sidebar, halaman aktif) mengikuti data cloud terbaru
     showToast('Data disinkronkan dari cloud', 'Perubahan terbaru dari perangkat lain telah diterapkan', 'info');
   }
 }
@@ -571,7 +775,7 @@ function ensureFirebaseApp(config) {
 }
 
 function startCloudSync(config) {
-  if (cloudConnected && firebaseFS) { updateCloudStatusUI(); return; }
+  if (cloudConnected && firebaseFS && cloudListening) { updateCloudStatusUI(); return; }
   try {
     if (!ensureFirebaseApp(config)) return;
     firebaseFS = firebaseApp.firestore();
@@ -579,9 +783,22 @@ function startCloudSync(config) {
     cloudConnectError = null;
     console.log('[Firebase] Cloud sync aktif (Cloud Firestore): project ' + config.projectId + ', collection ' + CLOUD_FS_COL);
     // Dengarkan perubahan real-time dari cloud (perangkat lain)
+    // includeMetadataChanges → snapshot.metadata.fromCache memberi tahu status koneksi
+    // server yang SEBENARNYA (bukan sekadar instance SDK) agar indikator akurat
     if (!cloudListening) {
       cloudListening = true;
-      cloudUnsub = firebaseFS.collection(CLOUD_FS_COL).onSnapshot(function(snap) {
+      cloudUnsub = firebaseFS.collection(CLOUD_FS_COL).onSnapshot({ includeMetadataChanges: true }, function(snap) {
+        const fromCache = !!(snap && snap.metadata && snap.metadata.fromCache);
+        if (fromCache) {
+          // Data masih dari cache lokal = koneksi ke server cloud TERPUTUS
+          cloudServerConfirmed = false;
+          markCloudDisconnected(null);
+        } else {
+          // Server merespons — koneksi benar-benar sehat
+          cloudServerConfirmed = true;
+          cloudLastServerConfirmAt = Date.now();
+          markCloudConnected();
+        }
         // Kumpulkan dokumen; tulisan kita sendiri memicu beberapa snapshot berurutan
         cloudSnapshotBuffer = {};
         snap.forEach(function(doc) { cloudSnapshotBuffer[doc.id] = doc.data(); });
@@ -590,7 +807,7 @@ function startCloudSync(config) {
           cloudSnapshotTimer = null;
           handleCloudSnapshot();
         }, 700);
-      }, function(err) { handleCloudError(err); });
+      }, function(err) { handleCloudError(err, true); });
     }
     // Jika cloud masih kosong (perangkat pertama) — kirim data lokal ke cloud
     firebaseFS.collection(CLOUD_FS_COL).get().then(function(snap) {
@@ -603,37 +820,45 @@ function startCloudSync(config) {
         showToast('Cloud Database terhubung!', 'Data LMS otomatis tersinkron real-time antar browser & perangkat', 'success');
       }
       updateCloudStatusUI();
-    }).catch(function(err) { handleCloudError(err); });
+    }).catch(function(err) { handleCloudError(err, false); });
     updateCloudStatusUI();
   } catch (e) {
     console.error('[Firebase] init error:', e);
     cloudConnected = false;
+    cloudServerConfirmed = false;
     cloudConnectError = (e && e.message) || 'Gagal inisialisasi Firebase';
     if (cloudAnnounce) { cloudAnnounce = false; showToast('Gagal koneksi Firebase', cloudConnectError, 'error'); }
     updateCloudStatusUI();
   }
 }
 
-function handleCloudError(err) {
-  cloudConnected = false;
+function handleCloudError(err, killedListener) {
+  // killedListener = true berarti listener snapshot dimatikan SDK (harus dipasang ulang)
+  if (killedListener) {
+    cloudConnected = false;
+    cloudListening = false;
+    if (cloudUnsub) { try { cloudUnsub(); } catch (e) { /* abaikan */ } cloudUnsub = null; }
+  }
+  cloudServerConfirmed = false;
   const code = (err && (err.code || '')) || '';
   if (code.indexOf('permission') >= 0) {
     cloudConnectError = 'Rules Cloud Firestore menolak akses. Buka Firebase Console → Firestore Database → Rules, pastikan rules izinkan read/write (rules mode test berlaku s.d. 12 November 2026), lalu Publish.';
   } else if (code.indexOf('failed-precondition') >= 0 || code.indexOf('not-found') >= 0) {
     cloudConnectError = 'Cloud Firestore belum aktif. Buka Firebase Console → Build → Firestore Database → Create Database, lalu muat ulang halaman.';
-  } else if (code.indexOf('unavailable') >= 0 || code.indexOf('network') >= 0 || code.indexOf('timeout') >= 0) {
+  } else if (code.indexOf('unavailable') >= 0 || code.indexOf('network') >= 0 || code.indexOf('timeout') >= 0 || code.indexOf('cancelled') >= 0) {
     cloudConnectError = 'Server cloud tidak dapat dihubungi (periksa koneksi internet). Data tetap aman di browser ini.';
   } else {
     cloudConnectError = (err && (err.message || err.code)) || 'Koneksi ke cloud database gagal';
   }
   console.warn('[Firebase]', cloudConnectError);
-  updateCloudStatusUI();
+  markCloudDisconnected(cloudConnectError);
   if (cloudAnnounce) { cloudAnnounce = false; showToast('Cloud belum terhubung', cloudConnectError, 'warning'); }
 }
 
-function resetCloudState() {
-  resetRtdbState(); // matikan juga jalur backup RTDB
+// Reset HANYA jalur Cloud Firestore (RTDB tidak ikut dimatikan — dipakai saat sambung ulang)
+function resetFirestoreState() {
   cloudConnected = false;
+  cloudServerConfirmed = false;
   cloudConnectError = null;
   if (cloudUnsub) { try { cloudUnsub(); } catch (e) { /* abaikan */ } cloudUnsub = null; }
   if (cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
@@ -641,31 +866,52 @@ function resetCloudState() {
   cloudSnapshotBuffer = null;
   firebaseFS = null;
   cloudListening = false;
+  lastCloudUiState = null;
+}
+
+function resetCloudState() {
+  resetRtdbState(); // matikan juga jalur backup RTDB
+  resetFirestoreState();
+  cloudConnectError = null;
+  updateCloudStatusUI(); // segarkan banner & ikon (mis. setelah putus/aktifkan cloud)
 }
 
 function updateCloudStatusUI() {
   const old = document.getElementById('cloud-status-icon');
-  if (!old) return;
-  const state = isCloudConnected() ? 'ok' : (cloudConnectError ? 'warn' : 'off');
-  const cfg = {
-    ok: ['cloud', 'text-emerald-500'],
-    warn: ['alert-triangle', 'text-amber-500'],
-    off: ['cloud-off', 'text-gray-400']
-  }[state];
-  // Ganti elemen baru (bukan mengubah svg hasil lucide) agar class tidak bercampur
-  const el = document.createElement('i');
-  el.id = 'cloud-status-icon';
-  el.setAttribute('data-lucide', cfg[0]);
-  el.className = cfg[1];
-  el.style.fontSize = '20px';
-  if (old.parentElement) old.parentElement.replaceChild(el, old); else old.replaceWith(el);
-  if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
+  let state;
+  if (isCloudConnected()) state = 'ok';
+  else if (cloudConnected && firebaseFS && cloudListening) state = 'wait';       // menyambung ke server...
+  else if (cloudReconnecting) state = 'wait';
+  else if (cloudConnectError) state = 'warn';
+  else state = 'off';
+  if (old && state !== lastCloudUiState) {
+    lastCloudUiState = state;
+    const cfg = {
+      ok: ['cloud', 'text-emerald-500'],                                          // terhubung
+      wait: ['cloud', 'text-amber-500 animate-pulse'],                            // menyambungkan...
+      warn: ['alert-triangle', 'text-amber-500'],                                 // butuh perhatian
+      off: ['cloud-off', 'text-gray-400']                                         // offline
+    }[state];
+    // Ganti elemen baru (bukan mengubah svg hasil lucide) agar class tidak bercampur
+    const el = document.createElement('i');
+    el.id = 'cloud-status-icon';
+    el.setAttribute('data-lucide', cfg[0]);
+    el.className = cfg[1];
+    el.style.fontSize = '20px';
+    if (old.parentElement) old.parentElement.replaceChild(el, old); else old.replaceWith(el);
+    if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
+  }
+  updateDbIndicator();
 }
 
 // Kirim seluruh database lokal ke Cloud Firestore (meta + chunk 700KB).
 // Debounce 900ms agar beberapa perubahan cepat digabung jadi satu tulisan.
+// Bila cloud terputus, perubahan ditandai "menunggu" dan otomatis dikirim saat tersambung ulang.
 function saveToCloud(immediate) {
-  if (!cloudConnected || !firebaseFS) return;
+  if (!cloudConnected || !firebaseFS || !cloudServerConfirmed) {
+    if (!isCloudDisabled()) cloudPendingPush = true; // antre: kirim begitu koneksi pulih
+    return;
+  }
   if (cloudPushTimer) clearTimeout(cloudPushTimer);
   if (!immediate) {
     cloudPushTimer = setTimeout(function() { saveToCloud(true); }, 900);
@@ -687,10 +933,11 @@ function saveToCloud(immediate) {
       device: deviceLabel()
     });
     batch.commit().then(function() {
+      cloudPendingPush = false;
       console.log('[Firebase] Data terkirim ke cloud (' + Math.round(json.length / 1024) + ' KB)');
-    }).catch(function(err) { handleCloudError(err); });
+    }).catch(function(err) { handleCloudError(err, false); });
   } catch (e) {
-    handleCloudError(e);
+    handleCloudError(e, false);
   }
 }
 
@@ -735,7 +982,9 @@ function loadFromCloud(callback) {
 }
 
 function isCloudConnected() {
-  return cloudConnected && firebaseFS !== null;
+  // "Terhubung" berarti instance Firestore siap DAN server pernah/sedang mengonfirmasi
+  // (snapshot bukan dari cache) — bukan sekadar SDK terpasang
+  return cloudConnected && cloudServerConfirmed && firebaseFS !== null;
 }
 
 /* ============================================================
@@ -767,6 +1016,8 @@ let rtdbInitStarted = false;    // guard agar probe/init tidak dobel saat initFi
 let rtdbLastTotal = 0;           // jumlah chunk terakhir yang dikirim (untuk bersih-bersih chunk usang)
 let rtdbLastPushAt = null;       // waktu backup terakhir dari perangkat ini
 let rtdbLastMeta = null;         // meta backup terakhir yang terlihat di server
+let rtdbPendingPush = false;     // ada perubahan lokal yang menunggu dikirim ke backup
+let lastRtdbUiState = null;      // anti-render berulang ikon status RTDB
 
 function isRtdbActive() { return !!(firebaseRTDB && rtdbUrlInUse && rtdbListening); }
 function isRtdbConnected() { return isRtdbActive() && rtdbSocketConnected && !rtdbError; }
@@ -854,6 +1105,11 @@ function startRtdbSync(url) {
       }, 700);
     }, function(err) { handleRtdbError(err); });
     console.log('[RTDB] Backup sync aktif: ' + url + ' → node "' + RTDB_PATH + '"');
+    // Kirim perubahan yang sempat tertahan saat koneksi sebelumnya terputus
+    if (rtdbPendingPush) {
+      rtdbPendingPush = false;
+      saveToRTDB(true);
+    }
     updateRtdbStatusUI();
   } catch (e) {
     handleRtdbError(e);
@@ -890,13 +1146,13 @@ function processRtdbSnapshot() {
   updateRtdbStatusUI();
   if (!parsed.ok) return; // backup masih kosong / belum lengkap
   if (stableStringify(parsed.data) === stableStringify(db)) return; // sama dengan lokal — tidak ada yang perlu dipulihkan
-  // RTDB = jalur BACKUP: adopsi otomatis hanya saat Cloud Firestore tidak terhubung.
-  // Saat Firestore aktif, sinkron utama ditangani Firestore (hindari balapan data lama).
-  if (!isCloudConnected()) {
+  // RTDB = jalur BACKUP: adopsi otomatis hanya saat Cloud Firestore benar-benar terputus
+  // (sudah lebih dari 8 detik, bukan sekadar jeda awal saat aplikasi baru dibuka)
+  const cloudDownLong = !isCloudConnected() && cloudDownSince !== null && (Date.now() - cloudDownSince > 8000);
+  if (cloudDownLong) {
     adoptCloudData(parsed.data);
     if (session) {
-      renderMainContent();
-      lucide.createIcons();
+      rsScheduleUI(100);
       showToast('Data dipulihkan dari Backup RTDB', 'Terakhir diperbarui: ' + formatDateTime(parsed.meta.updatedAt) + ' oleh ' + (parsed.meta.device || '-'), 'info');
     }
   }
@@ -904,8 +1160,12 @@ function processRtdbSnapshot() {
 
 // Kirim seluruh database lokal ke node backup RTDB (meta + chunk string).
 // Debounce 1400ms — dikirim sedikit lebih lambat dari Firestore agar jadi lapisan kedua.
+// Bila RTDB belum aktif, perubahan ditandai "menunggu" dan dikirim saat backup tersambung.
 function saveToRTDB(immediate) {
-  if (!isRtdbActive() || !firebaseRTDB) return;
+  if (!isRtdbActive() || !firebaseRTDB) {
+    if (!isCloudDisabled()) rtdbPendingPush = true; // antre: kirim begitu RTDB tersambung
+    return;
+  }
   if (rtdbPushTimer) clearTimeout(rtdbPushTimer);
   if (!immediate) {
     rtdbPushTimer = setTimeout(function() { saveToRTDB(true); }, 1400);
@@ -927,6 +1187,7 @@ function saveToRTDB(immediate) {
     }
     rtdbLastTotal = total;
     firebaseRTDB.ref(RTDB_PATH).update(payload).then(function() {
+      rtdbPendingPush = false;
       rtdbLastPushAt = new Date().toISOString();
       console.log('[RTDB] Backup terkirim (' + Math.round(json.length / 1024) + ' KB) → node "' + RTDB_PATH + '"');
       updateRtdbStatusUI();
@@ -1015,14 +1276,19 @@ function resetRtdbState() {
   firebaseRTDB = null;
   rtdbUrlInUse = null;
   rtdbError = null;
+  lastRtdbUiState = null;
+  updateRtdbStatusUI();
 }
 
 function updateRtdbStatusUI() {
   const old = document.getElementById('rtdb-status-icon');
   if (!old) return;
-  const state = isRtdbConnected() ? 'ok' : (rtdbError ? 'warn' : 'off');
+  const state = isRtdbConnected() ? 'ok' : (rtdbError ? 'warn' : (rtdbListening ? 'wait' : 'off'));
+  if (state === lastRtdbUiState) return; // tidak berubah — lewati render ulang
+  lastRtdbUiState = state;
   const cfg = {
     ok: ['database-backup', 'text-teal-500'],
+    wait: ['database-backup', 'text-amber-500 animate-pulse'],
     warn: ['alert-triangle', 'text-amber-500'],
     off: ['database-backup', 'text-gray-400']
   }[state];
@@ -1044,6 +1310,248 @@ function toggleRtdbStatus(e) {
   } else {
     showToast('Backup RTDB: Tidak aktif', 'Realtime Database belum tersambung — data tersimpan di browser & Cloud Firestore.', 'info');
   }
+}
+
+/* ============================================================
+   KESEHATAN KONEKSI DATABASE & SAMBUNG-ULANG OTOMATIS
+   - markCloudConnected/markCloudDisconnected: sumber tunggal status
+   - Banner peringatan global + pill "Offline" di header (semua role)
+   - Watchdog 20 detik: memulihkan localStorage yang hilang,
+     menyambung ulang cloud & RTDB yang putus tanpa perlu refresh
+   - Antrean push: perubahan saat offline dikirim otomatis saat online
+   ============================================================ */
+
+// Cloud terhubung ke server — bersihkan semua penanda gangguan
+function markCloudConnected() {
+  const wasDown = cloudDownSince !== null;
+  cloudDownSince = null;
+  cloudConnectError = null;
+  cloudReconnecting = false;
+  cloudRetryCount = 0;
+  if (cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
+  // Kirim perubahan yang tertahan selama offline
+  if (cloudPendingPush) {
+    cloudPendingPush = false;
+    try { saveToCloud(true); } catch (e) { /* dicoba lagi oleh watchdog */ }
+  }
+  if (wasDown) {
+    showToast('Database tersambung kembali', 'Sinkronisasi cloud berjalan normal. Perubahan tertahan sedang dikirim.', 'success');
+  }
+  updateCloudStatusUI();
+}
+
+// Cloud terputus dari server — catat & umumkan (toast sekali per kejadian)
+function markCloudDisconnected(errMsg) {
+  if (isCloudDisabled()) { updateCloudStatusUI(); return; }
+  if (cloudDownSince === null) {
+    cloudDownSince = Date.now();
+    // Beri waktu 4 detik: gangguan sesaat tidak perlu berisik
+    setTimeout(function() {
+      if (!isCloudConnected() && !isCloudDisabled() && cloudDownSince !== null) {
+        const noInternet = !navigator.onLine;
+        showToast(
+          noInternet ? 'Database Offline' : 'Database Cloud Terputus',
+          noInternet
+            ? 'Tidak ada koneksi internet. Data tetap tersimpan aman di perangkat ini dan akan disinkronkan saat online.'
+            : (cloudConnectError || 'Koneksi ke server cloud terputus. Data tetap tersimpan aman di perangkat ini.'),
+          'warning'
+        );
+      }
+    }, 4000);
+  }
+  if (errMsg) cloudConnectError = errMsg;
+  updateCloudStatusUI();
+}
+
+// Muat ulang SDK Firebase secara dinamis bila gagal termuat saat halaman dibuka offline
+const FIREBASE_SDK_URLS = [
+  'https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js',
+  'https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js',
+  'https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js',
+  'https://www.gstatic.com/firebasejs/9.23.0/firebase-analytics-compat.js'
+];
+function ensureFirebaseSdk(cb) {
+  if (typeof firebase !== 'undefined') { if (cb) cb(true); return; }
+  if (!navigator.onLine || cloudSdkLoading) { if (cb) cb(false); return; }
+  cloudSdkLoading = true;
+  let settled = 0;
+  const done = function() {
+    settled++;
+    if (settled >= FIREBASE_SDK_URLS.length) {
+      cloudSdkLoading = false;
+      if (cb) cb(typeof firebase !== 'undefined');
+    }
+  };
+  FIREBASE_SDK_URLS.forEach(function(u) {
+    try {
+      if (document.querySelector('script[src="' + u + '"]')) { done(); return; }
+      const s = document.createElement('script');
+      s.src = u;
+      s.async = true;
+      s.onload = done;
+      s.onerror = done;
+      document.head.appendChild(s);
+    } catch (e) { done(); }
+  });
+}
+
+// Sambung ulang Cloud Firestore + (bila perlu) RTDB tanpa memuat ulang halaman
+function reconnectCloud(silent) {
+  if (isCloudDisabled()) return;
+  if (typeof firebase === 'undefined') {
+    ensureFirebaseSdk(function(ok) { if (ok) reconnectCloud(silent); });
+    return;
+  }
+  cloudReconnecting = true;
+  cloudRetryCount++;
+  resetFirestoreState();     // RTDB yang masih sehat tidak ikut diputus
+  initFirebase();
+  if (isRtdbActive() && !isRtdbConnected()) { resetRtdbState(); initRTDB(activeCloudConfig || EMBEDDED_FIREBASE_CONFIG); }
+  if (!silent) showToast('Menyambungkan ulang...', 'Menghubungi Cloud Database sekolah', 'info');
+  updateCloudStatusUI();
+  // Lepas bendera "menyambung" bila dalam 15 detik belum berhasil juga
+  setTimeout(function() {
+    if (cloudReconnecting) { cloudReconnecting = false; updateCloudStatusUI(); }
+  }, 15000);
+}
+
+// Tombol "Sambungkan Ulang" pada banner / pill offline
+function reconnectDatabaseNow() {
+  if (!navigator.onLine) {
+    showToast('Tidak ada internet', 'Sambungkan perangkat ke internet terlebih dahulu, lalu coba lagi.', 'warning');
+    return;
+  }
+  reconnectCloud(false);
+  if (!isRtdbActive()) { resetRtdbState(); initRTDB(activeCloudConfig || EMBEDDED_FIREBASE_CONFIG); }
+}
+
+// Indikator status database: banner global + pill offline di header aplikasi
+function updateDbIndicator() {
+  const banner = document.getElementById('db-status-banner');
+  const mini = document.getElementById('db-mini-status');
+  if (!banner && !mini) return;
+  const cloudDisabled = isCloudDisabled();
+  const connected = isCloudConnected();
+  const noInternet = !navigator.onLine;
+  const show = !cloudDisabled && !connected;
+  const key = show ? [noInternet ? 'net' : 'db', cloudReconnecting ? 'rc' : 'id', cloudConnectError || ''].join('|') : 'hide';
+  if (key === lastBannerKey) return; // tidak berubah — jangan render ulang
+  lastBannerKey = key;
+
+  const applyLayout = function(visible) {
+    const h = visible && banner ? banner.offsetHeight : 0;
+    document.body.style.paddingTop = h > 0 ? h + 'px' : '';
+    document.querySelectorAll('header.sticky').forEach(function(el) {
+      el.style.top = h > 0 ? h + 'px' : '';
+    });
+  };
+
+  if (!show) {
+    if (banner) { banner.classList.add('db-hidden'); }
+    if (mini) { mini.classList.add('hidden'); mini.classList.remove('flex'); }
+    applyLayout(false);
+    return;
+  }
+
+  const textEl = document.getElementById('db-status-text');
+  const inner = document.getElementById('db-status-banner-inner');
+  const iconEl = document.getElementById('db-status-icon-banner');
+  const retryBtn = document.getElementById('db-status-retry-btn');
+  let msg, detail;
+  if (cloudReconnecting) {
+    if (inner) inner.className = 'bg-amber-500 text-white text-xs sm:text-sm';
+    if (iconEl) { iconEl.setAttribute('data-lucide', 'refresh-cw'); iconEl.className = 'db-spin flex-shrink-0'; }
+    msg = 'Menyambungkan ke Database Cloud...';
+    detail = 'Menghubungi server database sekolah';
+  } else if (noInternet) {
+    if (inner) inner.className = 'bg-red-600 text-white text-xs sm:text-sm';
+    if (iconEl) { iconEl.setAttribute('data-lucide', 'wifi-off'); iconEl.className = 'flex-shrink-0'; }
+    msg = 'Tidak ada koneksi internet — Database OFFLINE. Data tetap tersimpan aman di perangkat ini.';
+    detail = 'Perubahan akan otomatis disinkronkan saat internet tersambung kembali';
+  } else {
+    if (inner) inner.className = 'bg-red-600 text-white text-xs sm:text-sm';
+    if (iconEl) { iconEl.setAttribute('data-lucide', 'cloud-off'); iconEl.className = 'flex-shrink-0'; }
+    msg = 'Database Cloud TERPUTUS — data tetap tersimpan aman di perangkat ini.';
+    detail = cloudConnectError || 'Aplikasi akan menyambung ulang otomatis. Perubahan tidak akan hilang.';
+  }
+  if (textEl) textEl.textContent = msg;
+  if (retryBtn) retryBtn.classList.toggle('hidden', cloudReconnecting);
+  if (banner) {
+    banner.classList.remove('db-hidden');
+    if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
+  }
+  if (mini) {
+    mini.classList.remove('hidden');
+    mini.classList.add('flex');
+    mini.title = detail;
+  }
+  // Ukur tinggi banner SETELAH tampil, lalu geser header sticky agar tidak tertimpa
+  requestAnimationFrame(function() { applyLayout(true); });
+}
+
+// Menampilkan/menyembunyikan ikon Cloud & Database — hanya untuk Superadmin
+function applyRoleVisibility() {
+  const user = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+  const isSuper = !!(user && user.role === 'SUPER_ADMIN');
+  document.body.classList.toggle('is-superadmin', isSuper);
+}
+
+// Watchdog: menjaga database tetap sehat tanpa perlu muat ulang halaman
+let dbWatchdogStarted = false;
+function startDbWatchdog() {
+  if (dbWatchdogStarted) return;
+  dbWatchdogStarted = true;
+
+  // Saat koneksi internet kembali → sambung ulang semuanya segera
+  window.addEventListener('online', function() {
+    console.log('[DB] Internet kembali online — menyambung ulang database');
+    reconnectCloud(true);
+    if (!isRtdbActive() && typeof firebase !== 'undefined') {
+      resetRtdbState();
+      initRTDB(activeCloudConfig || EMBEDDED_FIREBASE_CONFIG);
+    }
+    updateCloudStatusUI();
+  });
+  // Saat internet hilang → tandai terputus (banner + ikon langsung muncul)
+  window.addEventListener('offline', function() {
+    console.warn('[DB] Internet offline — database tidak dapat dijangkau');
+    cloudServerConfirmed = false;
+    markCloudDisconnected('Perangkat tidak terhubung ke internet (mode offline).');
+  });
+
+  // Pemeriksaan rutin setiap 20 detik
+  setInterval(function() {
+    // 1) Pulihkan localStorage bila terhapus saat aplikasi berjalan (anti "database hilang")
+    try {
+      if (db && !localStorage.getItem(DB_KEY)) {
+        localStorage.setItem(DB_KEY, JSON.stringify(db));
+        console.warn('[DB] Penyimpanan lokal hilang — database ditulis ulang otomatis');
+      }
+    } catch (e) { /* kuota penuh dsb. */ }
+
+    if (isCloudDisabled() || !navigator.onLine) return;
+
+    // 2) SDK belum termuat → coba muat ulang
+    if (typeof firebase === 'undefined') {
+      ensureFirebaseSdk(function(ok) { if (ok) reconnectCloud(true); });
+      return;
+    }
+
+    // 3) Cloud terputus → sambung ulang
+    //    - listener mati → langsung coba
+    //    - listener hidup tapi server tak pernah konfirmasi > 30 detik → coba juga
+    if (!isCloudConnected()) {
+      const listenerDead = !cloudListening;
+      const noConfirmLong = (Date.now() - (cloudLastServerConfirmAt || 0) > 30000);
+      if (listenerDead || noConfirmLong) reconnectCloud(true);
+    }
+
+    // 4) Backup RTDB mati → hidupkan lagi secara senyap
+    if (!isRtdbActive()) {
+      resetRtdbState();
+      initRTDB(activeCloudConfig || EMBEDDED_FIREBASE_CONFIG);
+    }
+  }, 20000);
 }
 
 function enableDefaultCloud() {
@@ -1083,8 +1591,7 @@ function importDatabase(file) {
         return;
       }
       db = data;
-      localStorage.setItem(DB_KEY, JSON.stringify(db));
-      saveToCloud();
+      saveDB(); // tulis localStorage + cloud + RTDB + segarkan tampilan otomatis
       showToast('Database diimpor', 'Data berhasil dipulihkan dari file', 'success');
       if (session) { renderApp(); } else { renderLanding(); }
       lucide.createIcons();
@@ -1745,6 +2252,7 @@ function scrollToSection(id) {
    ============================================================ */
 function renderApp() {
   loadDB(); loadSession(); loadUIState();
+  applyRoleVisibility(); // ikon Cloud/Database hanya untuk Superadmin
   if (!session) {
     renderLanding();
     return;
@@ -1885,7 +2393,19 @@ const ROLE_NAV = {
 function renderSidebar() {
   const user = getCurrentUser();
   if (!user) return;
-  const items = ROLE_NAV[user.role] || [];
+  let items = (ROLE_NAV[user.role] || []).slice();
+  /* Menu khusus Wali Kelas: monitoring aktivitas LMS siswa kelas yang diampu */
+  if (user.role === 'GURU') {
+    try {
+      const tMe = db.teachers.find(x => x.userId === user.id);
+      const waliCount = tMe ? db.classes.filter(c => c.homeroomId === tMe.id).length : 0;
+      if (waliCount > 0 && !items.some(i => i.id === 'aktivitas-wali')) {
+        const anchorIdx = items.findIndex(i => i.id === 'siswa');
+        const item = { id: 'aktivitas-wali', label: 'Aktivitas Wali Kelas', icon: 'activity' };
+        if (anchorIdx >= 0) items.splice(anchorIdx + 1, 0, item); else items.push(item);
+      }
+    } catch (e) { /* abaikan */ }
+  }
   const roleLabel = ROLE_LABELS[user.role];
   const roleColor = ROLE_COLORS[user.role];
   const initials = user.name.split(' ').map(n => n[0]).slice(0, 2).join('').toUpperCase();
@@ -2113,6 +2633,8 @@ function renderSiswaPage(page) { return window.SISWA_PAGES ? (window.SISWA_PAGES
   loadDB(); loadSession(); loadUIState();
   document.getElementById('current-year').textContent = new Date().getFullYear();
   renderApp();
+  startDbWatchdog(); // penjaga koneksi: sambung-ulang otomatis + pemulihan data tanpa refresh
+  rsStartRealtimeSync(); // sinkronisasi realtime: database ↔ tampilan (lokal, tab lain, cloud, autosave)
 })();
 </script>
 
@@ -2899,6 +3421,335 @@ function printAktivitasPDF() {
   });
 }
 
+/* ============ CETAK PDF DATA GURU / TENDIK / SISWA (Super Admin) ============ */
+/* Fitur: cetak PDF daftar guru & tendik berdasarkan KATEGORI, daftar siswa berdasarkan KELAS */
+function _printGuardSuperadmin() {
+  const user = getCurrentUser();
+  if (!user || user.role !== 'SUPER_ADMIN') {
+    showToast('Akses ditolak', 'Fitur cetak PDF data hanya tersedia untuk akun Super Admin', 'error');
+    return false;
+  }
+  return true;
+}
+function _printStatusUser(u, extra) {
+  if (u && typeof u.isActive === 'boolean') return u.isActive ? 'AKTIF' : 'NONAKTIF';
+  if (extra && extra.status) return extra.status;
+  return 'AKTIF';
+}
+const _PRINT_TABLE_COMPACT = '<style>table { font-size: 9.5pt; } table th, table td { padding: 4px 6px; }</style>';
+
+/* ---- Picker: Cetak PDF Data Guru (kategori = mata pelajaran) ---- */
+function openPrintGuruPicker() {
+  if (!_printGuardSuperadmin()) return;
+  const totalGuru = db.users.filter(u => u.role === 'GURU').length;
+  if (totalGuru === 0) { showToast('Belum ada guru', 'Tambahkan data guru terlebih dahulu di menu Data Guru', 'warning'); return; }
+  const subjects = [...new Set(db.teachers.map(t => t.subject).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const body = `
+    <div class="space-y-4">
+      <div class="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-700 flex items-start gap-1">
+        <i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i>
+        <span>Cetak PDF daftar guru <b>berdasarkan kategori mata pelajaran</b> dan status keaktifan. Pilih "Semua Kategori" untuk mencetak seluruh guru.</span>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        ${field('Kategori (Mata Pelajaran)', `<select id="pg-subject" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Kategori</option>
+          ${subjects.map(s => '<option value="' + _printEsc(s) + '">' + _printEsc(s) + '</option>').join('')}
+        </select>`)}
+        ${field('Status', `<select id="pg-status" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Status</option>
+          <option value="AKTIF">Aktif</option>
+          <option value="NONAKTIF">Nonaktif</option>
+        </select>`)}
+      </div>
+      <p class="text-xs text-gray-500 flex items-center gap-1"><i data-lucide="printer" style="font-size:14px; flex-shrink:0;"></i> Total guru terdata: <b>&nbsp;${totalGuru}</b>&nbsp;orang. PDF memakai kop sekolah &amp; tanda tangan otomatis.</p>
+    </div>`;
+  showModal('Cetak PDF Data Guru', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Cetak PDF', 'printGuruPDF()', { icon: 'printer' })
+  , 'max-w-lg');
+}
+
+function printGuruPDF() {
+  const subSel = document.getElementById('pg-subject');
+  const statSel = document.getElementById('pg-status');
+  const subjectFilter = subSel ? subSel.value : 'ALL';
+  const statusFilter = statSel ? statSel.value : 'ALL';
+  closeModal();
+  let rows = db.users.filter(u => u.role === 'GURU').map(u => {
+    const t = db.teachers.find(x => x.userId === u.id);
+    return { u, t, subject: (t?.subject || '-'), status: _printStatusUser(u, t) };
+  });
+  if (subjectFilter !== 'ALL') rows = rows.filter(r => r.subject === subjectFilter);
+  if (statusFilter !== 'ALL') rows = rows.filter(r => r.status === statusFilter);
+  if (rows.length === 0) { showToast('Tidak ada data', 'Tidak ada guru sesuai kategori/filter yang dipilih', 'warning'); return; }
+  rows.sort((a, b) => a.subject.localeCompare(b.subject) || a.u.name.localeCompare(b.u.name));
+  const tableRows = rows.map((r, i) =>
+    '<tr>' +
+    '<td class="center">' + (i + 1) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.nip || r.t?.nip || '-') + '</td>' +
+    '<td>' + _printEsc(r.u.name) + '</td>' +
+    '<td>' + _printEsc(r.subject) + '</td>' +
+    '<td>' + _printEsc(r.t?.qualification || '-') + '</td>' +
+    '<td class="center">' + _printEsc(r.u.gender === 'P' ? 'P' : (r.u.gender === 'L' ? 'L' : '-')) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.phone || '-') + '</td>' +
+    '<td class="center">' + (r.status === 'AKTIF' ? 'Aktif' : 'Nonaktif') + '</td>' +
+    '</tr>'
+  ).join('');
+  const mapelDist = {};
+  rows.forEach(r => { mapelDist[r.subject] = (mapelDist[r.subject] || 0) + 1; });
+  const aktifN = rows.filter(r => r.status === 'AKTIF').length;
+  const statusLabel = statusFilter === 'ALL' ? 'Semua' : (statusFilter === 'AKTIF' ? 'Aktif' : 'Nonaktif');
+  const body = `
+    ${_PRINT_TABLE_COMPACT}
+    <div class="report-extra">
+      <strong>Kategori:</strong> ${subjectFilter === 'ALL' ? 'Semua Mata Pelajaran' : _printEsc(subjectFilter)} | <strong>Status:</strong> ${statusLabel}
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:28px;">No</th>
+          <th style="width:118px;">NIP</th>
+          <th>Nama Guru</th>
+          <th>Mata Pelajaran</th>
+          <th>Kualifikasi</th>
+          <th style="width:28px;">JK</th>
+          <th style="width:95px;">Telepon</th>
+          <th style="width:58px;">Status</th>
+        </tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    <div class="report-summary">
+      <h3>Ringkasan Data Guru</h3>
+      <div class="report-summary-grid">
+        <div class="report-summary-item"><div class="label">Total Guru Dicetak</div><div class="value">${rows.length}</div></div>
+        <div class="report-summary-item"><div class="label">Status Aktif</div><div class="value">${aktifN}</div></div>
+        <div class="report-summary-item"><div class="label">Status Nonaktif</div><div class="value">${rows.length - aktifN}</div></div>
+        <div class="report-summary-item"><div class="label">Jumlah Kategori Mapel</div><div class="value">${Object.keys(mapelDist).length}</div></div>
+        <div class="report-summary-item" style="grid-column: span 2;"><div class="label">Distribusi per Mata Pelajaran</div><div class="value" style="font-size:10pt;">${Object.entries(mapelDist).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => _printEsc(k) + ': ' + v + ' guru').join('<br>')}</div></div>
+      </div>
+    </div>
+  `;
+  printReport('Laporan Data Guru', body, {
+    metaInfo: 'Kategori Mata Pelajaran: ' + (subjectFilter === 'ALL' ? 'Semua' : _printEsc(subjectFilter)) + ' | Status: ' + statusLabel + ' | Tahun Ajaran 2025/2026'
+  });
+}
+
+/* ---- Picker: Cetak PDF Data Tendik (kategori = jabatan) ---- */
+function openPrintTendikPicker() {
+  if (!_printGuardSuperadmin()) return;
+  const totalTendik = db.users.filter(u => u.role === 'TENDIK').length;
+  if (totalTendik === 0) { showToast('Belum ada tendik', 'Tambahkan data tendik terlebih dahulu di menu Data Tendik', 'warning'); return; }
+  const positions = [...new Set(db.tendiks.map(t => t.position).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const body = `
+    <div class="space-y-4">
+      <div class="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-700 flex items-start gap-1">
+        <i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i>
+        <span>Cetak PDF daftar tenaga kependidikan <b>berdasarkan kategori jabatan</b> dan status keaktifan. Pilih "Semua Kategori" untuk mencetak seluruh tendik.</span>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        ${field('Kategori (Jabatan)', `<select id="pt-position" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Kategori</option>
+          ${positions.map(s => '<option value="' + _printEsc(s) + '">' + _printEsc(s) + '</option>').join('')}
+        </select>`)}
+        ${field('Status', `<select id="pt-status" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Status</option>
+          <option value="AKTIF">Aktif</option>
+          <option value="NONAKTIF">Nonaktif</option>
+        </select>`)}
+      </div>
+      <p class="text-xs text-gray-500 flex items-center gap-1"><i data-lucide="printer" style="font-size:14px; flex-shrink:0;"></i> Total tendik terdata: <b>&nbsp;${totalTendik}</b>&nbsp;orang. PDF memakai kop sekolah &amp; tanda tangan otomatis.</p>
+    </div>`;
+  showModal('Cetak PDF Data Tendik', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Cetak PDF', 'printTendikPDF()', { icon: 'printer' })
+  , 'max-w-lg');
+}
+
+function printTendikPDF() {
+  const posSel = document.getElementById('pt-position');
+  const statSel = document.getElementById('pt-status');
+  const positionFilter = posSel ? posSel.value : 'ALL';
+  const statusFilter = statSel ? statSel.value : 'ALL';
+  closeModal();
+  let rows = db.users.filter(u => u.role === 'TENDIK').map(u => {
+    const t = db.tendiks.find(x => x.userId === u.id);
+    return { u, t, position: (t?.position || '-'), unit: (t?.unit || 'Tenaga Kependidikan'), status: _printStatusUser(u, t) };
+  });
+  if (positionFilter !== 'ALL') rows = rows.filter(r => r.position === positionFilter);
+  if (statusFilter !== 'ALL') rows = rows.filter(r => r.status === statusFilter);
+  if (rows.length === 0) { showToast('Tidak ada data', 'Tidak ada tendik sesuai kategori/filter yang dipilih', 'warning'); return; }
+  rows.sort((a, b) => a.position.localeCompare(b.position) || a.u.name.localeCompare(b.u.name));
+  const tableRows = rows.map((r, i) =>
+    '<tr>' +
+    '<td class="center">' + (i + 1) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.nip || r.t?.nip || '-') + '</td>' +
+    '<td>' + _printEsc(r.u.name) + '</td>' +
+    '<td>' + _printEsc(r.position) + '</td>' +
+    '<td>' + _printEsc(r.unit) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.gender === 'P' ? 'P' : (r.u.gender === 'L' ? 'L' : '-')) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.phone || '-') + '</td>' +
+    '<td class="center">' + _printEsc(r.u.email || '-') + '</td>' +
+    '<td class="center">' + (r.status === 'AKTIF' ? 'Aktif' : 'Nonaktif') + '</td>' +
+    '</tr>'
+  ).join('');
+  const posDist = {};
+  rows.forEach(r => { posDist[r.position] = (posDist[r.position] || 0) + 1; });
+  const aktifN = rows.filter(r => r.status === 'AKTIF').length;
+  const statusLabel = statusFilter === 'ALL' ? 'Semua' : (statusFilter === 'AKTIF' ? 'Aktif' : 'Nonaktif');
+  const body = `
+    ${_PRINT_TABLE_COMPACT}
+    <div class="report-extra">
+      <strong>Kategori:</strong> ${positionFilter === 'ALL' ? 'Semua Jabatan' : _printEsc(positionFilter)} | <strong>Status:</strong> ${statusLabel}
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:28px;">No</th>
+          <th style="width:118px;">NIP</th>
+          <th>Nama Tendik</th>
+          <th>Jabatan</th>
+          <th>Unit</th>
+          <th style="width:28px;">JK</th>
+          <th style="width:95px;">Telepon</th>
+          <th>Email</th>
+          <th style="width:58px;">Status</th>
+        </tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    <div class="report-summary">
+      <h3>Ringkasan Data Tenaga Kependidikan</h3>
+      <div class="report-summary-grid">
+        <div class="report-summary-item"><div class="label">Total Tendik Dicetak</div><div class="value">${rows.length}</div></div>
+        <div class="report-summary-item"><div class="label">Status Aktif</div><div class="value">${aktifN}</div></div>
+        <div class="report-summary-item"><div class="label">Status Nonaktif</div><div class="value">${rows.length - aktifN}</div></div>
+        <div class="report-summary-item"><div class="label">Jumlah Kategori Jabatan</div><div class="value">${Object.keys(posDist).length}</div></div>
+        <div class="report-summary-item" style="grid-column: span 2;"><div class="label">Distribusi per Jabatan</div><div class="value" style="font-size:10pt;">${Object.entries(posDist).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => _printEsc(k) + ': ' + v + ' orang').join('<br>')}</div></div>
+      </div>
+    </div>
+  `;
+  printReport('Laporan Data Tenaga Kependidikan', body, {
+    metaInfo: 'Kategori Jabatan: ' + (positionFilter === 'ALL' ? 'Semua' : _printEsc(positionFilter)) + ' | Status: ' + statusLabel + ' | Tahun Ajaran 2025/2026'
+  });
+}
+
+/* ---- Picker: Cetak PDF Data Siswa (berdasarkan kelas) ---- */
+function openPrintSiswaPicker() {
+  if (!_printGuardSuperadmin()) return;
+  const totalSiswa = db.users.filter(u => u.role === 'SISWA').length;
+  if (totalSiswa === 0) { showToast('Belum ada siswa', 'Tambahkan data siswa terlebih dahulu di menu Data Siswa', 'warning'); return; }
+  const classes = db.classes.slice().sort((a, b) => a.name.localeCompare(b.name, 'id', { numeric: true }));
+  const preClass = window._adminSiswaClass || 'ALL';
+  const preStatus = window._adminSiswaStatus || 'ALL';
+  const body = `
+    <div class="space-y-4">
+      <div class="p-3 rounded-lg bg-indigo-50 border border-indigo-200 text-xs text-indigo-700 flex items-start gap-1">
+        <i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i>
+        <span>Cetak PDF daftar siswa <b>berdasarkan kelas</b>, status, dan jenis kelamin. Pilih "Semua Kelas" untuk mencetak seluruh siswa.</span>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        ${field('Kelas', `<select id="ps-kelas" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Kelas</option>
+          ${classes.map(c => '<option value="' + c.id + '"' + (c.id === preClass ? ' selected' : '') + '>' + _printEsc(c.name) + '</option>').join('')}
+        </select>`)}
+        ${field('Status', `<select id="ps-status" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL" ${preStatus === 'ALL' ? 'selected' : ''}>Semua Status</option>
+          <option value="AKTIF" ${preStatus === 'AKTIF' ? 'selected' : ''}>Aktif</option>
+          <option value="NONAKTIF" ${preStatus === 'NONAKTIF' ? 'selected' : ''}>Nonaktif</option>
+        </select>`)}
+        ${field('Jenis Kelamin', `<select id="ps-gender" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua</option>
+          <option value="L">Laki-laki</option>
+          <option value="P">Perempuan</option>
+        </select>`)}
+      </div>
+      <p class="text-xs text-gray-500 flex items-center gap-1"><i data-lucide="printer" style="font-size:14px; flex-shrink:0;"></i> Total siswa terdata: <b>&nbsp;${totalSiswa}</b>&nbsp;orang. PDF memakai kop sekolah &amp; tanda tangan otomatis.</p>
+    </div>`;
+  showModal('Cetak PDF Data Siswa', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Cetak PDF', 'printSiswaPDF()', { icon: 'printer' })
+  , 'max-w-lg');
+}
+
+function printSiswaPDF() {
+  const kelasSel = document.getElementById('ps-kelas');
+  const statSel = document.getElementById('ps-status');
+  const genSel = document.getElementById('ps-gender');
+  const kelasFilter = kelasSel ? kelasSel.value : 'ALL';
+  const statusFilter = statSel ? statSel.value : 'ALL';
+  const genderFilter = genSel ? genSel.value : 'ALL';
+  closeModal();
+  let rows = db.users.filter(u => u.role === 'SISWA').map(u => {
+    const s = db.students.find(x => x.userId === u.id);
+    const cls = db.classes.find(c => c.id === s?.classId);
+    return { u, s, cls, className: (cls?.name || 'Tanpa Kelas'), status: _printStatusUser(u, s) };
+  });
+  if (kelasFilter !== 'ALL') rows = rows.filter(r => r.cls && r.cls.id === kelasFilter);
+  if (statusFilter !== 'ALL') rows = rows.filter(r => r.status === statusFilter);
+  if (genderFilter !== 'ALL') rows = rows.filter(r => (r.u.gender || '-') === genderFilter);
+  if (rows.length === 0) { showToast('Tidak ada data', 'Tidak ada siswa sesuai kelas/filter yang dipilih', 'warning'); return; }
+  rows.sort((a, b) => a.className.localeCompare(b.className, 'id', { numeric: true }) || a.u.name.localeCompare(b.u.name));
+  const tableRows = rows.map((r, i) =>
+    '<tr>' +
+    '<td class="center">' + (i + 1) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.nis || r.s?.nis || '-') + '</td>' +
+    '<td class="center">' + _printEsc(r.s?.nisn || r.u.nisn || '-') + '</td>' +
+    '<td>' + _printEsc(r.u.name) + '</td>' +
+    '<td class="center">' + _printEsc(r.className) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.gender === 'P' ? 'P' : (r.u.gender === 'L' ? 'L' : '-')) + '</td>' +
+    '<td class="center">' + _printEsc(r.u.phone || '-') + '</td>' +
+    '<td>' + _printEsc(r.s?.parentName || '-') + '</td>' +
+    '<td class="center">' + (r.status === 'AKTIF' ? 'Aktif' : 'Nonaktif') + '</td>' +
+    '</tr>'
+  ).join('');
+  const kelasDist = {};
+  rows.forEach(r => { kelasDist[r.className] = (kelasDist[r.className] || 0) + 1; });
+  const lN = rows.filter(r => r.u.gender === 'L').length;
+  const pN = rows.filter(r => r.u.gender === 'P').length;
+  const aktifN = rows.filter(r => r.status === 'AKTIF').length;
+  const statusLabel = statusFilter === 'ALL' ? 'Semua' : (statusFilter === 'AKTIF' ? 'Aktif' : 'Nonaktif');
+  const genderLabel = genderFilter === 'ALL' ? 'Semua' : (genderFilter === 'L' ? 'Laki-laki' : 'Perempuan');
+  const kelasNama = kelasFilter === 'ALL' ? 'Semua Kelas' : (db.classes.find(c => c.id === kelasFilter)?.name || '-');
+  const body = `
+    ${_PRINT_TABLE_COMPACT}
+    <div class="report-extra">
+      <strong>Kelas:</strong> ${_printEsc(kelasNama)} | <strong>Status:</strong> ${statusLabel} | <strong>JK:</strong> ${genderLabel}
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:28px;">No</th>
+          <th style="width:72px;">NIS</th>
+          <th style="width:80px;">NISN</th>
+          <th>Nama Siswa</th>
+          <th style="width:64px;">Kelas</th>
+          <th style="width:26px;">JK</th>
+          <th style="width:95px;">Telepon</th>
+          <th>Orang Tua / Wali</th>
+          <th style="width:55px;">Status</th>
+        </tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    <div class="report-summary">
+      <h3>Ringkasan Data Siswa</h3>
+      <div class="report-summary-grid">
+        <div class="report-summary-item"><div class="label">Total Siswa Dicetak</div><div class="value">${rows.length}</div></div>
+        <div class="report-summary-item"><div class="label">Laki-laki</div><div class="value">${lN}</div></div>
+        <div class="report-summary-item"><div class="label">Perempuan</div><div class="value">${pN}</div></div>
+        <div class="report-summary-item"><div class="label">Status Aktif</div><div class="value">${aktifN}</div></div>
+        <div class="report-summary-item"><div class="label">Jumlah Kelas Tercakup</div><div class="value">${Object.keys(kelasDist).length}</div></div>
+        <div class="report-summary-item"><div class="label">Status Nonaktif</div><div class="value">${rows.length - aktifN}</div></div>
+        <div class="report-summary-item" style="grid-column: span 3;"><div class="label">Distribusi per Kelas</div><div class="value" style="font-size:10pt;">${Object.entries(kelasDist).sort((a, b) => a[0].localeCompare(b[0], 'id', { numeric: true })).map(([k, v]) => _printEsc(k) + ': ' + v + ' siswa').join(' &nbsp;•&nbsp; ')}</div></div>
+      </div>
+    </div>
+  `;
+  printReport('Laporan Data Siswa', body, {
+    metaInfo: 'Kelas: ' + _printEsc(kelasNama) + ' | Status: ' + statusLabel + ' | Jenis Kelamin: ' + genderLabel + ' | Tahun Ajaran 2025/2026'
+  });
+}
+
 /* ============ PRINT MY RAPOR (Siswa) ============ */
 function printMyRapor() {
   const user = getCurrentUser();
@@ -3030,6 +3881,7 @@ window.ADMIN_PAGES = {
   guru() {
     const users = db.users.filter(u => u.role === 'GURU');
     return pageHeader('Data Guru', 'Daftar guru SMA Negeri Jayaloka',
+      btn('Cetak PDF', 'openPrintGuruPicker()', { variant: 'outline', icon: 'printer' }) + ' ' +
       btn('Beban Mengajar', 'openBebanMengajarPicker()', { icon: 'clipboard-list' })
     ) + `
       <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -3061,7 +3913,9 @@ window.ADMIN_PAGES = {
 
   tendik() {
     const users = db.users.filter(u => u.role === 'TENDIK');
-    return pageHeader('Data Tenaga Kependidikan', 'Daftar tendik SMA Negeri Jayaloka') + `
+    return pageHeader('Data Tenaga Kependidikan', 'Daftar tendik SMA Negeri Jayaloka',
+      btn('Cetak PDF', 'openPrintTendikPicker()', { icon: 'printer' })
+    ) + `
       <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
         ${users.map(u => {
           const t = db.tendiks.find(t => t.userId === u.id);
@@ -3097,6 +3951,7 @@ window.ADMIN_PAGES = {
     }
     const classLabel = filterClass !== 'ALL' ? (db.classes.find(c => c.id === filterClass)?.name || '') : '';
     return pageHeader('Data Siswa', 'Daftar siswa SMA Negeri Jayaloka',
+      btn('Cetak PDF', 'openPrintSiswaPicker()', { variant: 'outline', icon: 'printer' }) + ' ' +
       btn('Kenaikan Kelas', 'openKenaikanKelas(null)', { icon: 'trending-up' })
     ) + `
       <div class="flex flex-wrap gap-3 mb-4">
@@ -5780,6 +6635,90 @@ window.GURU_PAGES = {
     `;
   },
 
+  /* ============ AKTIVITAS WALI KELAS: monitoring LMS siswa ============ */
+  'aktivitas-wali'() {
+    const user = getCurrentUser();
+    const teacher = db.teachers.find(t => t.userId === user.id);
+    const waliClasses = teacher ? db.classes.filter(c => c.homeroomId === teacher.id) : [];
+    if (waliClasses.length === 0) {
+      return pageHeader('Aktivitas Wali Kelas', 'Monitoring aktivitas LMS peserta didik') +
+        emptyState('Anda bukan wali kelas', 'Halaman ini khusus guru yang ditunjuk sebagai wali kelas. Silakan hubungi admin bila ada perubahan penunjukan wali kelas.', 'shield');
+    }
+    const selCls = (window._waliKelasSel && waliClasses.some(c => c.id === window._waliKelasSel)) ? window._waliKelasSel : waliClasses[0].id;
+    const cls = db.classes.find(c => c.id === selCls) || waliClasses[0];
+    const students = db.students.filter(s => s.classId === cls.id);
+    const courses = db.courses.filter(c => c.classId === cls.id);
+    const courseIds = courses.map(c => c.id);
+    const assignments = db.assignments.filter(a => courseIds.includes(a.courseId));
+    const assignmentIds = assignments.map(a => a.id);
+    const dayMs = 86400000;
+    const activeCutoff = Date.now() - 7 * dayMs;
+
+    const rows = students.map(s => {
+      const u = db.users.find(x => x.id === s.userId);
+      const subs = db.submissions.filter(x => x.studentId === s.id && assignmentIds.includes(x.assignmentId));
+      const graded = db.grades.filter(g => g.studentId === s.id && assignmentIds.includes(g.assignmentId));
+      const avg = graded.length ? (graded.reduce((t, g) => t + g.score, 0) / graded.length) : null;
+      const atts = db.attendances.filter(x => x.studentId === s.id);
+      const hadir = atts.filter(x => x.status === 'HADIR').length;
+      const totalAtt = atts.length;
+      const attPct = totalAtt ? Math.round(hadir / totalAtt * 100) : null;
+      const logs = u ? db.logs.filter(l => l.userId === u.id) : [];
+      const lastLog = logs.length ? logs[logs.length - 1] : null;
+      const recentLogin = logs.some(l => l.action === 'LOGIN' && new Date(l.createdAt).getTime() >= activeCutoff);
+      const tugasPct = assignments.length ? Math.round(subs.length / assignments.length * 100) : null;
+      let status;
+      if (!assignments.length) status = { label: 'Tanpa Tugas', variant: 'secondary' };
+      else if (subs.length >= assignments.length) status = { label: 'Tugas Lengkap', variant: 'default' };
+      else if (recentLogin || subs.length > 0) status = { label: 'Berjalan', variant: 'outline' };
+      else status = { label: 'Pasif', variant: 'destructive' };
+      return { s, u, subs, avg, attPct, hadir, totalAtt, lastLog, logs, tugasPct, status, assignmentCount: assignments.length };
+    });
+
+    const totalSubs = rows.reduce((t, r) => t + r.subs.length, 0);
+    const totalSlots = rows.reduce((t, r) => t + r.assignmentCount, 0);
+    const tugasPctAll = totalSlots ? Math.round(totalSubs / totalSlots * 100) : null;
+    const attVals = rows.filter(r => r.attPct !== null);
+    const attAvg = attVals.length ? Math.round(attVals.reduce((t, r) => t + r.attPct, 0) / attVals.length) : null;
+    const gradedRows = rows.filter(r => r.avg !== null);
+    const avgAll = gradedRows.length ? (gradedRows.reduce((t, r) => t + r.avg, 0) / gradedRows.length).toFixed(1) : null;
+    const aktifCount = rows.filter(r => r.status.label !== 'Pasif').length;
+    const waliName = teacher?.name || user.name;
+
+    return pageHeader('Aktivitas Wali Kelas', 'Monitoring aktivitas LMS peserta didik kelas ' + cls.name,
+      db.logs.length > 0 ? btn('Perbarui', 'refreshMainContent()', { variant: 'outline', icon: 'refresh-cw' }) : ''
+    ) + `
+      <div class="p-4 rounded-xl bg-emerald-50 border border-emerald-200 mb-5">
+        <p class="text-xs text-emerald-800 flex items-start gap-2"><i data-lucide="shield-check" style="font-size:16px;margin-top:1px;flex-shrink:0;"></i>
+        <span>Anda wali kelas <b>${cls.name}</b> (Wali: ${_printEsc(waliName)}). Pantau <b>apakah siswa mengerjakan tugas</b> dan <b>mengikuti pembelajaran</b> (kehadiran, membaca materi, login, dan live class). Klik <b>Detail</b> untuk rincian per siswa.</span></p>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+        ${statCard('Total Siswa', students.length, 'users', 'indigo')}
+        ${statCard('Siswa Aktif', aktifCount + ' / ' + students.length, 'activity', 'emerald')}
+        ${statCard('Pengerjaan Tugas', tugasPctAll === null ? '-' : tugasPctAll + '%', 'clipboard-check', 'amber', totalSubs + ' dari ' + totalSlots + ' tugas')}
+        ${statCard('Rata Kehadiran', attAvg === null ? '-' : attAvg + '%', 'calendar', 'cyan', avgAll !== null ? 'Rata nilai: ' + avgAll : '')}
+      </div>
+      <div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden">
+        ${rows.length === 0 ? emptyState('Belum ada siswa', 'Kelas ini belum memiliki siswa', 'users') :
+          table(['Siswa', 'Tugas Dikerjakan', 'Kehadiran', 'Rata Nilai', 'Aktivitas Terakhir', 'Status', 'Aksi'],
+            rows.map(r => [
+              `<div class="flex items-center gap-2">${userAvatar(r.u, 32, 'bg-indigo-50 text-indigo-700')}<div><p class="font-medium text-sm">${_printEsc(r.s.name)}</p><p class="text-xs text-gray-500">NIS: ${r.s.nis || '-'}</p></div></div>`,
+              assignments.length === 0 ? '<span class="text-xs text-gray-400">-</span>' :
+                `<div class="w-32"><div class="flex justify-between text-xs mb-1"><span>${r.subs.length}/${r.assignmentCount}</span><span class="text-gray-400">${r.tugasPct === null ? '' : r.tugasPct + '%'}</span></div><div class="h-1.5 bg-gray-100 rounded-full overflow-hidden"><div class="h-full ${r.tugasPct >= 80 ? 'bg-emerald-500' : r.tugasPct >= 40 ? 'bg-amber-500' : 'bg-red-400'}" style="width:${r.tugasPct || 0}%;"></div></div></div>`,
+              r.attPct === null ? '<span class="text-xs text-gray-400">Belum ada absensi</span>' :
+                `<span class="text-sm font-medium ${r.attPct >= 90 ? 'text-emerald-700' : r.attPct >= 75 ? 'text-amber-600' : 'text-red-600'}">${r.attPct}%</span> <span class="text-xs text-gray-400">(${r.hadir}/${r.totalAtt} hadir)</span>`,
+              r.avg === null ? '<span class="text-xs text-gray-400">-</span>' : `<span class="text-sm font-semibold">${r.avg.toFixed(1)}</span>`,
+              r.lastLog ? `<div class="text-xs"><p class="font-medium text-gray-700">${_printEsc(r.lastLog.action)}</p><p class="text-gray-400">${formatDateTime(r.lastLog.createdAt)}</p></div>` : '<span class="text-xs text-gray-400">Belum ada aktivitas</span>',
+              badge(r.status.label, r.status.variant),
+              `<button onclick="openWaliSiswaDetail('${r.s.id}')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="eye" style="font-size:12px;"></i> Detail</button>`
+            ])
+          )
+        }
+      </div>
+      ${assignments.length === 0 ? '<p class="text-xs text-gray-500 mt-3">Belum ada tugas untuk kelas ini — progress tugas akan tampil setelah guru pengampu membuat tugas.</p>' : ''}
+    `;
+  },
+
   pengumuman() {
     return pageHeader('Pengumuman', 'Pengumuman untuk guru dan staf') + `
       <div class="space-y-3">
@@ -6143,6 +7082,95 @@ function saveAttendance() {
   });
   saveDB();
   showToast('Absensi disimpan', count + ' data absensi disimpan', 'success');
+}
+
+/* ============ DETAIL AKTIVITAS SISWA (Wali Kelas) ============ */
+/* Modal rincian: status per tugas (dikerjakan/tanggal/nilai) + riwayat aktivitas LMS siswa */
+function openWaliSiswaDetail(studentId) {
+  const user = getCurrentUser();
+  const teacher = db.teachers.find(t => t.userId === user.id);
+  const waliClasses = teacher ? db.classes.filter(c => c.homeroomId === teacher.id) : [];
+  const s = db.students.find(x => x.id === studentId);
+  if (!s) { showToast('Data siswa tidak ditemukan', '', 'error'); return; }
+  if (!user || user.role !== 'GURU' || !waliClasses.some(c => c.id === s.classId)) {
+    showToast('Akses ditolak', 'Hanya wali kelas yang dapat melihat detail aktivitas siswa', 'error');
+    return;
+  }
+  const u = db.users.find(x => x.id === s.userId);
+  const cls = db.classes.find(c => c.id === s.classId);
+  const courses = db.courses.filter(c => c.classId === s.classId);
+  const courseIds = courses.map(c => c.id);
+  const assignments = db.assignments.filter(a => courseIds.includes(a.courseId)).sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)));
+  const atts = db.attendances.filter(x => x.studentId === s.id);
+  const logs = u ? db.logs.filter(l => l.userId === u.id).slice().reverse() : [];
+
+  const perAssignment = assignments.map(a => {
+    const sub = db.submissions.find(x => x.assignmentId === a.id && x.studentId === s.id);
+    const gr = sub ? db.grades.find(g => g.submissionId === sub.id) : null;
+    const late = sub && a.dueDate && new Date(sub.submittedAt) > new Date(a.dueDate);
+    let statusBadge;
+    if (gr) statusBadge = badge('Dinilai: ' + gr.score + ' (' + gr.grade + ')', 'default');
+    else if (sub) statusBadge = badge(late ? 'Dikumpulkan (terlambat)' : 'Sudah dikumpulkan', 'outline');
+    else statusBadge = badge('Belum dikerjakan', 'destructive');
+    const course = db.courses.find(c => c.id === a.courseId);
+    return `<tr class="border-b">
+      <td class="py-2 px-2 text-xs">${_printEsc(course?.name || '-')}</td>
+      <td class="py-2 px-2 text-xs font-medium">${_printEsc(a.title)}</td>
+      <td class="py-2 px-2 text-xs text-gray-500">${a.dueDate ? formatDate(a.dueDate) : '-'}</td>
+      <td class="py-2 px-2">${statusBadge}</td>
+      <td class="py-2 px-2 text-xs text-gray-500">${sub?.submittedAt ? formatDateTime(sub.submittedAt) : '-'}</td>
+    </tr>`;
+  }).join('');
+
+  const attRows = atts.length ? atts.slice().reverse().slice(0, 10).map(a =>
+    `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs ${a.status === 'HADIR' ? 'bg-emerald-100 text-emerald-700' : a.status === 'SAKIT' ? 'bg-amber-100 text-amber-700' : a.status === 'IZIN' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}">${_printEsc(a.status)} • ${formatDate(a.date)}</span>`
+  ).join(' ') : '<span class="text-xs text-gray-400">Belum ada data absensi</span>';
+
+  const logRows = logs.length ? logs.slice(0, 12).map(l =>
+    `<div class="flex items-start gap-2 p-2 rounded-lg border bg-white">
+      <i data-lucide="activity" class="text-emerald-600 flex-shrink-0" style="font-size:14px;margin-top:1px;"></i>
+      <div class="min-w-0 flex-1"><p class="text-xs font-medium">${_printEsc(l.action)}</p><p class="text-[11px] text-gray-500 line-clamp-1">${_printEsc(l.detail || '')}</p></div>
+      <span class="text-[10px] text-gray-400 whitespace-nowrap">${formatDateTime(l.createdAt)}</span>
+    </div>`
+  ).join('') : '<p class="text-xs text-gray-400">Belum ada aktivitas tercatat</p>';
+
+  const subsCount = db.submissions.filter(x => x.studentId === s.id && assignments.some(a => a.id === x.assignmentId)).length;
+  const graded = db.grades.filter(g => g.studentId === s.id && assignments.some(a => a.id === g.assignmentId));
+  const avg = graded.length ? (graded.reduce((t, g) => t + g.score, 0) / graded.length).toFixed(1) : '-';
+  const hadirN = atts.filter(x => x.status === 'HADIR').length;
+
+  const body = `
+    <div class="space-y-4">
+      <div class="p-4 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center gap-3">
+        ${userAvatar(u, 48, 'bg-indigo-100 text-indigo-700')}
+        <div class="min-w-0">
+          <p class="font-semibold">${_printEsc(s.name)}</p>
+          <p class="text-xs text-gray-600">Kelas ${cls?.name || '-'} • NIS ${s.nis || '-'} • NISN ${s.nisn || '-'}</p>
+          <p class="text-xs text-gray-500">Email: ${_printEsc(u?.email || '-')} • Telp: ${_printEsc(u?.phone || '-')}</p>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div class="p-3 rounded-lg bg-white border text-center"><p class="text-xl font-bold text-amber-600">${assignments.length ? Math.round(subsCount / assignments.length * 100) + '%' : '-'}</p><p class="text-[11px] text-gray-500">Tugas Dikerjakan</p></div>
+        <div class="p-3 rounded-lg bg-white border text-center"><p class="text-xl font-bold text-emerald-600">${avg}</p><p class="text-[11px] text-gray-500">Rata-rata Nilai</p></div>
+        <div class="p-3 rounded-lg bg-white border text-center"><p class="text-xl font-bold text-cyan-600">${atts.length ? Math.round(hadirN / atts.length * 100) + '%' : '-'}</p><p class="text-[11px] text-gray-500">Kehadiran</p></div>
+        <div class="p-3 rounded-lg bg-white border text-center"><p class="text-xl font-bold text-indigo-600">${logs.length}</p><p class="text-[11px] text-gray-500">Total Aktivitas</p></div>
+      </div>
+      <div>
+        <p class="text-sm font-semibold mb-2 flex items-center gap-1"><i data-lucide="clipboard-check" class="text-amber-600" style="font-size:16px;"></i> Rincian Tugas (${subsCount}/${assignments.length} dikerjakan)</p>
+        ${assignments.length === 0 ? '<p class="text-xs text-gray-400">Belum ada tugas untuk kelas ini</p>' :
+          '<div class="rounded-lg border overflow-x-auto max-h-64 overflow-y-auto"><table class="w-full"><thead><tr class="bg-gray-50"><th class="py-2 px-2 text-left text-xs font-medium text-gray-500">Mapel</th><th class="py-2 px-2 text-left text-xs font-medium text-gray-500">Judul Tugas</th><th class="py-2 px-2 text-left text-xs font-medium text-gray-500">Deadline</th><th class="py-2 px-2 text-left text-xs font-medium text-gray-500">Status</th><th class="py-2 px-2 text-left text-xs font-medium text-gray-500">Dikumpulkan</th></tr></thead><tbody>' + perAssignment + '</tbody></table></div>'}
+      </div>
+      <div>
+        <p class="text-sm font-semibold mb-2 flex items-center gap-1"><i data-lucide="calendar" class="text-cyan-600" style="font-size:16px;"></i> Kehadiran Terakhir</p>
+        <div class="flex flex-wrap gap-1.5">${attRows}</div>
+      </div>
+      <div>
+        <p class="text-sm font-semibold mb-2 flex items-center gap-1"><i data-lucide="activity" class="text-emerald-600" style="font-size:16px;"></i> Riwayat Aktivitas LMS Terbaru</p>
+        <div class="space-y-1.5 max-h-60 overflow-y-auto">${logRows}</div>
+      </div>
+    </div>
+  `;
+  showModal('Aktivitas Siswa — ' + s.name, body, btn('Tutup', 'closeModal()', { variant: 'outline' }), 'max-w-3xl');
 }
 
 /* ============ TENDIK DASHBOARD ============ */
@@ -6900,6 +7928,11 @@ function viewMaterial(id) {
   if (!guardClassAccess(m.courseId, 'Materi ini')) return;
   const c = db.courses.find(x => x.id === m.courseId);
   const author = db.users.find(u => u.id === m.authorId);
+  const _me = getCurrentUser();
+  if (_me && _me.role === 'SISWA') {
+    db.logs.push({ id: uid('log'), userId: _me.id, action: 'BACA MATERI', detail: 'Membaca materi "' + m.title + '" (' + (c?.name || '-') + ')', createdAt: now() });
+    saveDB();
+  }
   showModal(m.title,
     `<div class="flex items-center gap-2 mb-3">
       ${badge(c?.name || '', 'outline')}
@@ -7090,6 +8123,7 @@ function submitAssignment(assignmentId) {
       ...subData, createdAt: now()
     });
   }
+  db.logs.push({ id: uid('log'), userId: user.id, action: 'SUBMIT TUGAS', detail: 'Mengumpulkan tugas "' + (a?.title || '-') + '"' + (existing ? ' (revisi)' : ''), createdAt: now() });
   saveDB();
   closeModal();
   showToast('Tugas berhasil dikumpulkan!', '', 'success');
@@ -7904,6 +8938,10 @@ function openLiveRoom(liveClassId) {
         </div>
       </div>
       <div class="flex items-center gap-2 flex-shrink-0">
+        <div id="live-room-mode" class="flex rounded-md overflow-hidden" style="border:1px solid #334155;display:none;">
+          <button id="live-room-tab-conf" onclick="liveRoomSwitchMode('conf')" style="padding:6px 12px;font-size:12px;font-weight:600;background:#065f46;color:#fff;border:0;cursor:pointer;">Conference</button>
+          <button id="live-room-tab-cast" onclick="liveRoomSwitchMode('cast')" style="padding:6px 12px;font-size:12px;font-weight:600;background:#0f172a;color:#94a3b8;border:0;cursor:pointer;">Tayangan Layar</button>
+        </div>
         <span id="live-room-count" class="hidden sm:flex items-center gap-1.5 text-xs text-slate-300 rounded-full px-3 py-1.5" style="background:#1e293b;display:none;">
           <i data-lucide="users" class="text-emerald-400" style="font-size:14px;"></i> <span id="live-room-count-num">1</span> peserta
         </span>
@@ -7914,6 +8952,26 @@ function openLiveRoom(liveClassId) {
     </div>
     <div class="relative flex-1" style="min-height:0;">
       <div id="live-room-jitsi" style="position:absolute;inset:0;display:none;"></div>
+
+      <div id="live-room-cast" style="position:absolute;inset:0;display:none;flex-direction:column;background:#020617;">
+        <div id="cast-toolbar" class="flex items-center gap-2 flex-wrap px-4 py-2" style="background:#0f172a;border-bottom:1px solid #1e293b;"></div>
+        <div class="relative flex-1" style="min-height:0;">
+          <video id="cast-video" autoplay playsinline style="width:100%;height:100%;object-fit:contain;background:#000;display:none;"></video>
+          <div id="cast-idle" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;">
+            <div class="text-center space-y-2" style="max-width:440px;">
+              <div class="w-16 h-16 mx-auto rounded-2xl flex items-center justify-center mb-2" style="background:rgba(16,185,129,.15);">
+                <i data-lucide="monitor" class="text-emerald-400" style="font-size:30px;"></i>
+              </div>
+              <p id="cast-idle-title" class="text-lg font-bold text-slate-100">Mode Tayangan Layar</p>
+              <p id="cast-idle-desc" class="text-sm text-slate-400">Memuat status tayangan...</p>
+            </div>
+          </div>
+          <div id="cast-badge" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium text-white bg-red-500/90" style="position:absolute;top:12px;left:12px;display:none;">
+            <span class="w-2 h-2 bg-white rounded-full animate-pulse"></span> <span id="cast-badge-text">LIVE</span>
+          </div>
+        </div>
+        <div id="cast-footnote" class="px-4 py-2 text-xs text-slate-400" style="background:#0f172a;border-top:1px solid #1e293b;"></div>
+      </div>
 
       <div id="live-room-preflight" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow-y:auto;padding:16px;">
         <div style="width:100%;max-width:480px;" class="space-y-4">
@@ -7930,6 +8988,9 @@ function openLiveRoom(liveClassId) {
           </button>
           <div class="text-center">
             <a href="${fbUrl}" target="_blank" rel="noopener noreferrer" class="text-xs text-slate-400 hover:text-emerald-400 underline">atau buka di tab baru (mode ringan)</a>
+          </div>
+          <div class="text-center">
+            <button onclick="liveRoomSwitchMode('cast')" class="text-xs text-slate-400 hover:text-emerald-400 underline">atau buka Mode Tayangan Layar (berbagi layar &amp; audio tanpa conference)</button>
           </div>
         </div>
       </div>
@@ -7997,6 +9058,9 @@ async function liveRoomJoin() {
     });
     const countWrap = document.getElementById('live-room-count');
     if (countWrap) countWrap.style.display = 'flex';
+    window._liveRoomJoined = true;
+    const modeWrap = document.getElementById('live-room-mode');
+    if (modeWrap) modeWrap.style.display = 'flex';
     liveRoomApi = new JitsiMeetExternalAPI(domain, {
       roomName: lc.roomName,
       parentNode: container,
@@ -8038,12 +9102,15 @@ async function liveRoomJoin() {
 }
 
 function closeLiveRoom(silent) {
+  try { castLeave(); } catch (e) { /* abaikan */ }
+  window._liveRoomJoined = false;
   if (liveRoomApi) {
     try { liveRoomApi.dispose(); } catch (e) { /* abaikan */ }
     liveRoomApi = null;
   }
   const overlay = document.getElementById('live-room-overlay');
   if (overlay) overlay.remove();
+  rsScheduleUI(100); // terapkan penyegaran tampilan yang tertunda selama berada di ruang live
   if (!silent && typeof refreshMainContent === 'function') {
     try { refreshMainContent(); } catch (e) { /* abaikan */ }
   }
@@ -8060,9 +9127,472 @@ function joinLiveClass(liveClassId) {
       showToast('Akses ditolak', 'Live class ini hanya untuk siswa kelas ' + (cls?.name || 'lain'), 'error');
       return;
     }
+    db.logs.push({ id: uid('log'), userId: user.id, action: 'GABUNG LIVE CLASS', detail: 'Mengikuti live class "' + lc.title + '"', createdAt: now() });
+    saveDB();
   }
   liveRoomCurrentId = liveClassId;
   openLiveRoom(liveClassId);
+}
+
+/* ============================================================
+   TAYANGAN LANGSUNG (CAST) — Berbagi layar & audio via WebRTC
+   - GURU  : menyiarkan layar (+ audio tab/sistem & mikrofon) ke semua siswa
+   - SISWA : menonton tayangan; dapat berbagi layar & audio ke guru
+             HANYA bila guru membuka izin (toggle "Izinkan Siswa Berbagi")
+   - Signaling: BroadcastChannel (antar tab / 1 browser) + Firebase RTDB
+     (lintas perangkat, node sija_cast/<room>), dedup lewat message id
+   ============================================================ */
+const CAST_ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+let castCtx = null;
+
+function castRtdbAvailable() {
+  try { return typeof firebaseRTDB !== 'undefined' && !!firebaseRTDB && typeof isRtdbConnected === 'function' && isRtdbConnected(); }
+  catch (e) { return false; }
+}
+
+function liveRoomSwitchMode(mode) {
+  const overlay = document.getElementById('live-room-overlay');
+  if (!overlay) return;
+  const jitsi = document.getElementById('live-room-jitsi');
+  const cast = document.getElementById('live-room-cast');
+  const tabConf = document.getElementById('live-room-tab-conf');
+  const tabCast = document.getElementById('live-room-tab-cast');
+  const joined = !!window._liveRoomJoined;
+  const on = 'padding:6px 12px;font-size:12px;font-weight:600;background:#065f46;color:#fff;border:0;cursor:pointer;';
+  const off = 'padding:6px 12px;font-size:12px;font-weight:600;background:#0f172a;color:#94a3b8;border:0;cursor:pointer;';
+  if (tabConf) tabConf.style.cssText = mode === 'conf' ? on : off;
+  if (tabCast) tabCast.style.cssText = mode === 'cast' ? on : off;
+  if (mode === 'cast') {
+    ['live-room-preflight', 'live-room-connecting', 'live-room-fallback'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.style.display = 'none';
+    });
+    if (jitsi) jitsi.style.display = 'none';
+    if (cast) cast.style.display = 'flex';
+    castInit();
+  } else {
+    if (cast) cast.style.display = 'none';
+    try { castLeave(); } catch (e) { /* abaikan */ }
+    if (joined) { if (jitsi) jitsi.style.display = 'block'; }
+    else liveRoomSetPanel('preflight');
+  }
+}
+
+function castInit() {
+  const lc = db.liveClasses.find(x => x.id === liveRoomCurrentId);
+  const user = getCurrentUser();
+  if (!lc || !user) { showToast('Sesi live class tidak ditemukan', '', 'error'); return; }
+  if (castCtx && castCtx.lcId === lc.id) { castRenderToolbar(); castRenderMedia(); return; }
+  if (castCtx) castLeave();
+  const ctx = {
+    lcId: lc.id, room: lc.roomName, role: user.role, name: user.name,
+    peerId: 'p_' + String(user.id || 'x').replace(/[^a-zA-Z0-9]/g, '') + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    bc: null, rtdbRef: null, rtdbOn: null, rtdbLastKey: null,
+    pcs: {}, remoteStreams: {}, localStream: null, screenStream: null, micStream: null,
+    sharing: false, shareKind: null,
+    allowStudentShare: false, teacherSharing: false, teacherName: '',
+    studentSharers: {}, peers: {}, seen: {}, seenOrder: [],
+    hbTimer: null, wantMic: true, viewSource: 'auto'
+  };
+  castCtx = ctx;
+  try {
+    ctx.bc = new BroadcastChannel('sija_cast_' + lc.roomName);
+    ctx.bc.onmessage = ev => { if (ev && ev.data) castHandleMsg(ev.data); };
+  } catch (e) { ctx.bc = null; }
+  if (castRtdbAvailable()) castAttachRtdb();
+  castSend({ t: 'hello' });
+  castReadStateOnce();
+  if (ctx.role === 'GURU') {
+    try { ctx.allowStudentShare = localStorage.getItem('sija_cast_allow_' + lc.roomName) === '1'; } catch (e) { /* abaikan */ }
+    castBroadcastState();
+  }
+  ctx.hbTimer = setInterval(() => {
+    if (!castCtx) return;
+    castSend({ t: 'hello' });
+    castPrunePeers();
+    if (castCtx.role === 'GURU') castBroadcastState(); // heartbeat agar peserta baru tahu status izin/tayangan
+  }, 10000);
+  window.addEventListener('beforeunload', castBeforeUnload);
+  castRenderToolbar();
+  castRenderMedia();
+}
+
+function castAttachRtdb() {
+  const ctx = castCtx; if (!ctx) return;
+  try {
+    ctx.rtdbRef = firebaseRTDB.ref('sija_cast/' + ctx.room);
+    ctx.rtdbRef.child('msg').orderByKey().limitToLast(1).once('value').then(snap => {
+      if (!castCtx || castCtx !== ctx) return;
+      snap.forEach(ch => { ctx.rtdbLastKey = ch.key; });
+      ctx.rtdbOn = ctx.rtdbRef.child('msg').on('child_added', s => {
+        if (!castCtx) return;
+        if (ctx.rtdbLastKey && s.key <= ctx.rtdbLastKey) return;
+        const m = s.val();
+        if (m) castHandleMsg(m);
+      });
+    }).catch(() => { /* abaikan */ });
+  } catch (e) { ctx.rtdbRef = null; }
+}
+
+function castSend(m) {
+  const ctx = castCtx; if (!ctx) return;
+  m.from = ctx.peerId; m.fromName = ctx.name; m.fromRole = ctx.role;
+  m.mid = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  m.ts = Date.now();
+  try { if (ctx.bc) ctx.bc.postMessage(m); } catch (e) { /* abaikan */ }
+  try { if (ctx.rtdbRef) { const p = ctx.rtdbRef.child('msg').push(m); if (p && p.catch) p.catch(() => { /* abaikan */ }); } } catch (e) { /* abaikan */ }
+}
+
+function castHandleMsg(m) {
+  const ctx = castCtx; if (!ctx || !m || !m.t) return;
+  if (m.from === ctx.peerId) return;
+  if (m.mid) {
+    if (ctx.seen[m.mid]) return;
+    ctx.seen[m.mid] = true;
+    ctx.seenOrder.push(m.mid);
+    if (ctx.seenOrder.length > 600) { ctx.seenOrder.splice(0, 300).forEach(k => { delete ctx.seen[k]; }); }
+  }
+  switch (m.t) {
+    case 'hello':
+      ctx.peers[m.from] = { name: m.fromName || 'Peserta', role: m.fromRole || '?', ts: Date.now() };
+      if (ctx.sharing && ctx.localStream) {
+        if (ctx.shareKind === 'GURU' && m.fromRole === 'SISWA') castOfferTo(m.from, 'GURU');
+        else if (ctx.shareKind === 'SISWA' && m.fromRole === 'GURU') castOfferTo(m.from, 'SISWA');
+      }
+      castRenderToolbar();
+      break;
+    case 'bye':
+      delete ctx.peers[m.from];
+      if (ctx.studentSharers[m.from]) { delete ctx.studentSharers[m.from]; castRenderToolbar(); }
+      castClosePc(m.from);
+      if (ctx.remoteStreams[m.from]) { delete ctx.remoteStreams[m.from]; castRenderMedia(); }
+      break;
+    case 'state':
+      if (m.fromRole === 'GURU') {
+        ctx.teacherSharing = !!m.sharing;
+        ctx.teacherName = m.presenterName || '';
+        if (typeof m.allowStudentShare === 'boolean') {
+          ctx.allowStudentShare = m.allowStudentShare;
+          if (!m.allowStudentShare && ctx.role === 'SISWA' && ctx.sharing && ctx.shareKind === 'SISWA') castStopShare(true);
+        }
+        if (!m.sharing) {
+          Object.keys(ctx.remoteStreams).forEach(pid => {
+            if (ctx.remoteStreams[pid].kind === 'GURU') { castClosePc(pid); delete ctx.remoteStreams[pid]; }
+          });
+          if (ctx.viewSource !== 'auto' && ctx.viewSource !== 'self' && !ctx.remoteStreams[ctx.viewSource]) ctx.viewSource = 'auto';
+        }
+        castRenderToolbar(); castRenderMedia();
+      }
+      break;
+    case 'studentshare':
+      if (m.fromRole === 'SISWA') {
+        if (m.status === 'start') ctx.studentSharers[m.from] = m.fromName || 'Siswa';
+        else delete ctx.studentSharers[m.from];
+        castRenderToolbar();
+      }
+      break;
+    case 'offer':
+      if (m.to === ctx.peerId) castHandleOffer(m);
+      break;
+    case 'answer':
+      if (m.to === ctx.peerId) castHandleAnswer(m);
+      break;
+    case 'ice':
+      if (m.to === ctx.peerId && ctx.pcs[m.from] && m.cand) {
+        try { ctx.pcs[m.from].addIceCandidate(new RTCIceCandidate(m.cand)); } catch (e) { /* abaikan */ }
+      }
+      break;
+    case 'stopreq':
+      if (m.to === ctx.peerId && ctx.sharing && ctx.shareKind === 'SISWA') {
+        showToast('Berbagi dihentikan', 'Guru menutup izin berbagi layar siswa', 'info');
+        castStopShare(true);
+      }
+      break;
+  }
+}
+
+function castPrunePeers() {
+  const ctx = castCtx; if (!ctx) return;
+  const cut = Date.now() - 40000;
+  let changed = false;
+  Object.keys(ctx.peers).forEach(pid => {
+    if (ctx.peers[pid].ts < cut) { delete ctx.peers[pid]; changed = true; }
+  });
+  if (changed) castRenderToolbar();
+}
+
+function castNewPc(targetId, kind) {
+  const ctx = castCtx;
+  const pc = new RTCPeerConnection({ iceServers: CAST_ICE_SERVERS });
+  pc._castKind = kind || null;
+  ctx.pcs[targetId] = pc;
+  pc.onicecandidate = ev => {
+    if (ev.candidate) castSend({ t: 'ice', to: targetId, cand: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate });
+  };
+  pc.onconnectionstatechange = () => { castRenderToolbar(); castRenderFootnote(); };
+  pc.ontrack = ev => {
+    const stream = ev.streams && ev.streams[0];
+    if (!stream) return;
+    const meta = ctx.peers[targetId] || {};
+    ctx.remoteStreams[targetId] = {
+      stream, name: meta.name || 'Peserta',
+      kind: pc._castKind || meta.role || 'GURU'
+    };
+    castRenderToolbar(); castRenderMedia();
+  };
+  return pc;
+}
+
+async function castOfferTo(targetId, kind) {
+  const ctx = castCtx; if (!ctx || !ctx.localStream) return;
+  try {
+    castClosePc(targetId);
+    const pc = castNewPc(targetId, kind);
+    ctx.localStream.getTracks().forEach(tr => pc.addTrack(tr, ctx.localStream));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    castSend({ t: 'offer', to: targetId, kind, sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+  } catch (e) { console.warn('[Cast] offer gagal:', e); }
+}
+
+async function castHandleOffer(m) {
+  const ctx = castCtx; if (!ctx) return;
+  try {
+    castClosePc(m.from);
+    const pc = castNewPc(m.from, m.kind || null);
+    await pc.setRemoteDescription(new RTCSessionDescription(m.sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    castSend({ t: 'answer', to: m.from, sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
+  } catch (e) { console.warn('[Cast] jawab offer gagal:', e); }
+}
+
+async function castHandleAnswer(m) {
+  const ctx = castCtx; if (!ctx) return;
+  const pc = ctx.pcs[m.from]; if (!pc) return;
+  try { await pc.setRemoteDescription(new RTCSessionDescription(m.sdp)); } catch (e) { console.warn('[Cast] answer gagal:', e); }
+}
+
+function castClosePc(targetId) {
+  const ctx = castCtx; if (!ctx) return;
+  const pc = ctx.pcs[targetId];
+  if (pc) { try { pc.close(); } catch (e) { /* abaikan */ } delete ctx.pcs[targetId]; }
+}
+
+async function castStartShare() {
+  const ctx = castCtx; if (!ctx || ctx.sharing) return;
+  const isTeacher = ctx.role === 'GURU';
+  if (!isTeacher && !ctx.allowStudentShare) {
+    showToast('Izin belum dibuka', 'Guru belum mengizinkan siswa berbagi layar & audio', 'warning');
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    showToast('Tidak didukung', 'Browser ini tidak mendukung berbagi layar. Gunakan Chrome/Edge desktop terbaru.', 'error');
+    return;
+  }
+  try {
+    const screen = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: true });
+    let mic = null;
+    if (ctx.wantMic) {
+      try { mic = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (e) { /* tanpa mikrofon tetap lanjut */ }
+    }
+    ctx.screenStream = screen;
+    ctx.micStream = mic;
+    ctx.localStream = new MediaStream();
+    screen.getTracks().forEach(t => ctx.localStream.addTrack(t));
+    if (mic) mic.getTracks().forEach(t => ctx.localStream.addTrack(t));
+    ctx.sharing = true;
+    ctx.shareKind = isTeacher ? 'GURU' : 'SISWA';
+    const vt = screen.getVideoTracks()[0];
+    if (vt) vt.addEventListener('ended', () => { if (castCtx && castCtx.sharing) castStopShare(false); });
+    if (isTeacher) {
+      castBroadcastState();
+      Object.keys(ctx.peers).forEach(pid => { if (ctx.peers[pid].role === 'SISWA') castOfferTo(pid, 'GURU'); });
+      showToast('Tayangan dimulai', 'Layar & audio Anda disiarkan ke seluruh siswa', 'success');
+    } else {
+      castSend({ t: 'studentshare', status: 'start' });
+      Object.keys(ctx.peers).forEach(pid => { if (ctx.peers[pid].role === 'GURU') castOfferTo(pid, 'SISWA'); });
+      showToast('Berbagi dimulai', 'Layar & audio Anda dibagikan ke guru pengampu', 'success');
+    }
+    castRenderToolbar(); castRenderMedia();
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') showToast('Izin dibatalkan', 'Berbagi layar tidak diizinkan', 'warning');
+    else showToast('Gagal berbagi layar', (e && e.message) || 'Silakan coba lagi', 'error');
+  }
+}
+
+function castStopShare(silent) {
+  const ctx = castCtx; if (!ctx) return;
+  const wasTeacher = ctx.shareKind === 'GURU';
+  [ctx.localStream, ctx.screenStream, ctx.micStream].forEach(st => {
+    if (st) st.getTracks().forEach(t => { try { t.stop(); } catch (e) { /* abaikan */ } });
+  });
+  ctx.localStream = ctx.screenStream = ctx.micStream = null;
+  ctx.sharing = false; ctx.shareKind = null; ctx.viewSource = 'auto';
+  Object.keys(ctx.pcs).forEach(pid => castClosePc(pid));
+  Object.keys(ctx.remoteStreams).forEach(pid => delete ctx.remoteStreams[pid]);
+  if (wasTeacher) castBroadcastState();
+  else castSend({ t: 'studentshare', status: 'stop' });
+  castRenderToolbar(); castRenderMedia();
+  if (!silent) showToast('Berbagi dihentikan', '', 'info');
+}
+
+function castToggleMic(v) { const ctx = castCtx; if (ctx) { ctx.wantMic = !!v; } }
+function castToggleAllow(v) {
+  const ctx = castCtx; if (!ctx || ctx.role !== 'GURU') return;
+  ctx.allowStudentShare = !!v;
+  try { localStorage.setItem('sija_cast_allow_' + ctx.room, v ? '1' : '0'); } catch (e) { /* abaikan */ }
+  if (!v) Object.keys(ctx.studentSharers).forEach(pid => castSend({ t: 'stopreq', to: pid }));
+  castBroadcastState(); castRenderToolbar();
+}
+function castViewSource(src) { const ctx = castCtx; if (ctx) { ctx.viewSource = src; castRenderMedia(); } }
+
+function castBroadcastState() {
+  const ctx = castCtx; if (!ctx || ctx.role !== 'GURU') return;
+  castSend({ t: 'state', sharing: ctx.sharing && ctx.shareKind === 'GURU', presenterName: ctx.name, allowStudentShare: ctx.allowStudentShare });
+  try {
+    if (ctx.rtdbRef) {
+      const p = ctx.rtdbRef.child('state').set({ sharing: ctx.sharing && ctx.shareKind === 'GURU', presenterName: ctx.name, allowStudentShare: ctx.allowStudentShare, ts: Date.now() });
+      if (p && p.catch) p.catch(() => { /* abaikan */ });
+    }
+  } catch (e) { /* abaikan */ }
+}
+
+function castReadStateOnce() {
+  const ctx = castCtx; if (!ctx || !ctx.rtdbRef) return;
+  try {
+    ctx.rtdbRef.child('state').once('value').then(snap => {
+      if (!castCtx || castCtx !== ctx || ctx.role === 'GURU') return;
+      const st = snap.val();
+      if (st) {
+        ctx.teacherSharing = !!st.sharing;
+        ctx.teacherName = st.presenterName || '';
+        ctx.allowStudentShare = !!st.allowStudentShare;
+        castRenderToolbar();
+      }
+    });
+  } catch (e) { /* abaikan */ }
+}
+
+function castPickStream() {
+  const ctx = castCtx;
+  const entries = Object.entries(ctx.remoteStreams);
+  if (ctx.viewSource && ctx.viewSource !== 'auto') {
+    if (ctx.viewSource === 'self' && ctx.sharing && ctx.localStream) return { stream: ctx.localStream, label: 'Anda (pratinjau berbagi)' };
+    const pick = entries.find(([pid]) => pid === ctx.viewSource);
+    if (pick) return { stream: pick[1].stream, label: 'Tayangan: ' + pick[1].name };
+  }
+  if (ctx.sharing && ctx.localStream) return { stream: ctx.localStream, label: 'Anda sedang berbagi layar' };
+  const guruEntry = entries.find(([, v]) => v.kind === 'GURU');
+  const stuEntries = entries.filter(([, v]) => v.kind === 'SISWA');
+  const pick = guruEntry || stuEntries[stuEntries.length - 1];
+  if (pick) return { stream: pick[1].stream, label: 'Tayangan: ' + pick[1].name };
+  return null;
+}
+
+function castRenderToolbar() {
+  const ctx = castCtx; const bar = document.getElementById('cast-toolbar');
+  if (!ctx || !bar) return;
+  const peersN = Object.keys(ctx.peers).length + 1;
+  let html = '';
+  if (ctx.role === 'GURU') {
+    html += ctx.sharing
+      ? '<button onclick="castStopShare()" class="px-3 py-1.5 rounded-md bg-red-500 hover:bg-red-600 text-white text-xs font-medium flex items-center gap-1.5"><i data-lucide="square" style="font-size:13px;"></i> Hentikan Tayangan</button>'
+      : '<button onclick="castStartShare()" class="px-3 py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-medium flex items-center gap-1.5"><i data-lucide="monitor-up" style="font-size:13px;"></i> Bagikan Layar &amp; Audio</button>';
+    html += '<label class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium ' + (ctx.allowStudentShare ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-800 text-slate-300') + '" style="cursor:pointer;" title="Bila dicentang, siswa diizinkan membagikan layar & audio ke Anda"><input type="checkbox" ' + (ctx.allowStudentShare ? 'checked' : '') + ' onchange="castToggleAllow(this.checked)"> Izinkan Siswa Berbagi</label>';
+    html += '<label class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 text-slate-300" style="cursor:pointer;" title="Sertakan suara mikrofon Anda selain audio dari layar"><input type="checkbox" ' + (ctx.wantMic ? 'checked' : '') + ' onchange="castToggleMic(this.checked)"> Suara Mikrofon</label>';
+  } else {
+    html += ctx.sharing
+      ? '<button onclick="castStopShare()" class="px-3 py-1.5 rounded-md bg-red-500 hover:bg-red-600 text-white text-xs font-medium flex items-center gap-1.5"><i data-lucide="square" style="font-size:13px;"></i> Hentikan Berbagi</button>'
+      : (ctx.allowStudentShare
+        ? '<button onclick="castStartShare()" class="px-3 py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-medium flex items-center gap-1.5"><i data-lucide="monitor-up" style="font-size:13px;"></i> Bagikan Layar &amp; Audio</button>'
+        : '<span class="px-3 py-1.5 rounded-md bg-slate-800 text-slate-400 text-xs flex items-center gap-1.5" title="Menunggu guru membuka izin berbagi"><i data-lucide="lock" style="font-size:13px;"></i> Berbagi Layar (menunggu izin guru)</span>');
+  }
+  if (ctx.teacherSharing) {
+    html += '<span class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium text-white bg-red-500/90"><span class="w-1.5 h-1.5 bg-white rounded-full animate-pulse"></span> ' + _printEsc(ctx.teacherName || 'Guru') + ' sedang menayangkan</span>';
+  }
+  const sharers = Object.values(ctx.studentSharers);
+  if (sharers.length) {
+    html += '<span class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs bg-blue-500/20 text-blue-300"><i data-lucide="monitor-up" style="font-size:12px;"></i> ' + sharers.map(n => _printEsc(n)).join(', ') + ' berbagi ke guru</span>';
+  }
+  const srcChips = [];
+  if (ctx.sharing) srcChips.push(['self', 'Saya']);
+  Object.entries(ctx.remoteStreams).forEach(([pid, v]) => srcChips.push([pid, v.name]));
+  if (srcChips.length > 1) {
+    html += '<span class="flex items-center gap-1">' + srcChips.map(([pid, label]) =>
+      '<button onclick="castViewSource(\'' + pid + '\')" class="px-2 py-1 rounded text-xs ' + ((ctx.viewSource === pid || (ctx.viewSource === 'auto' && pid === 'self')) ? 'bg-emerald-500 text-white' : 'bg-slate-800 text-slate-300') + '">' + _printEsc(label) + '</button>'
+    ).join('') + '</span>';
+  }
+  html += '<span class="ml-auto text-xs text-slate-400 flex items-center gap-1"><i data-lucide="users" style="font-size:13px;"></i> ' + peersN + ' peserta</span>';
+  bar.innerHTML = html;
+  if (window.lucide && lucide.createIcons) lucide.createIcons();
+}
+
+function castRenderMedia() {
+  const ctx = castCtx; if (!ctx) return;
+  const video = document.getElementById('cast-video');
+  const idle = document.getElementById('cast-idle');
+  const idleTitle = document.getElementById('cast-idle-title');
+  const idleDesc = document.getElementById('cast-idle-desc');
+  const badge = document.getElementById('cast-badge');
+  const badgeText = document.getElementById('cast-badge-text');
+  if (!video || !idle) return;
+  const pick = castPickStream();
+  if (pick) {
+    if (video.srcObject !== pick.stream) video.srcObject = pick.stream;
+    video.style.display = 'block';
+    idle.style.display = 'none';
+    video.muted = !!(ctx.sharing && ctx.localStream === pick.stream); // pratinjau sendiri dibisukan
+    try { const p = video.play(); if (p && p.catch) p.catch(() => { video.muted = true; const q = video.play(); if (q && q.catch) q.catch(() => {}); }); } catch (e) { /* abaikan */ }
+    if (badge) { badge.style.display = 'flex'; if (badgeText) badgeText.textContent = pick.label; }
+  } else {
+    if (video.srcObject) video.srcObject = null;
+    video.style.display = 'none';
+    idle.style.display = 'flex';
+    if (badge) badge.style.display = 'none';
+    if (idleTitle && idleDesc) {
+      if (ctx.role === 'GURU') {
+        idleTitle.textContent = 'Mode Tayangan Layar';
+        idleDesc.innerHTML = 'Klik <b>Bagikan Layar &amp; Audio</b> untuk menyiarkan layar Anda — lengkap dengan suara tab/sistem dan mikrofon — ke seluruh siswa secara langsung. Siswa lain menonton dari halaman Live Class mereka.';
+      } else if (ctx.teacherSharing) {
+        idleTitle.textContent = 'Menyambungkan tayangan...';
+        idleDesc.textContent = 'Guru sedang berbagi layar. Menghubungkan streaming, mohon tunggu beberapa detik.';
+      } else if (ctx.allowStudentShare) {
+        idleTitle.textContent = 'Belum ada tayangan';
+        idleDesc.innerHTML = 'Guru belum menayangkan layar. Anda <b>diizinkan</b> berbagi layar &amp; audio — klik tombol <b>Bagikan Layar &amp; Audio</b>.';
+      } else {
+        idleTitle.textContent = 'Belum ada tayangan';
+        idleDesc.innerHTML = 'Guru belum menayangkan layar dan belum membuka izin berbagi. Tayangan guru akan tampil otomatis di sini saat dimulai.';
+      }
+    }
+  }
+  castRenderFootnote();
+}
+
+function castRenderFootnote() {
+  const ctx = castCtx; const el = document.getElementById('cast-footnote');
+  if (!ctx || !el) return;
+  const conns = Object.keys(ctx.pcs).map(pid => {
+    const meta = ctx.peers[pid] || {};
+    return _printEsc((meta.name || 'Peserta') + ': ' + (ctx.pcs[pid].connectionState || 'baru'));
+  }).join(' \u2022 ');
+  el.innerHTML = (conns ? '<span class="text-slate-300">Koneksi:</span> ' + conns + ' &nbsp;|&nbsp; ' : '') +
+    'Streaming WebRTC langsung (peer-to-peer). Bila tayangan tidak muncul dalam 15 detik, pindah mode lalu kembali, atau pastikan pengirim masih berbagi.';
+}
+
+function castBeforeUnload() { try { if (castCtx) castSend({ t: 'bye' }); } catch (e) { /* abaikan */ } }
+
+function castLeave() {
+  const ctx = castCtx; if (!ctx) return;
+  try { castSend({ t: 'bye' }); } catch (e) { /* abaikan */ }
+  castCtx = null;
+  if (ctx.hbTimer) { clearInterval(ctx.hbTimer); ctx.hbTimer = null; }
+  Object.keys(ctx.pcs).forEach(pid => { try { ctx.pcs[pid].close(); } catch (e) { /* abaikan */ } });
+  [ctx.localStream, ctx.screenStream, ctx.micStream].forEach(st => {
+    if (st) st.getTracks().forEach(t => { try { t.stop(); } catch (e) { /* abaikan */ } });
+  });
+  try { if (ctx.bc) { ctx.bc.onmessage = null; ctx.bc.close(); } } catch (e) { /* abaikan */ }
+  try { if (ctx.rtdbRef && ctx.rtdbOn) ctx.rtdbRef.child('msg').off('child_added', ctx.rtdbOn); } catch (e) { /* abaikan */ }
+  window.removeEventListener('beforeunload', castBeforeUnload);
 }
 
 </script>
