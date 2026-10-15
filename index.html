@@ -479,6 +479,7 @@
 const DB_KEY = 'sija_db_v1';
 const DB_BAK_KEY = 'sija_db_bak_v1';  // salinan cadangan lokal — pemulihan bila database utama rusak/hilang
 const SESSION_KEY = 'sija_session_v1';
+const SESSION_BAK_KEY = 'sija_session_bak_v1'; // salinan sesi anti-hilang (storage di-evict/dibersihkan browser)
 const UI_KEY = 'sija_ui_v1';
 
 let db = null;
@@ -537,20 +538,38 @@ function loadDB() {
   let recovered = false;
   const main = parseDbJson(localStorage.getItem(DB_KEY));
   if (main) {
-    db = main;
+    if (db && isValidDatabase(db) && !db.__seed) {
+      // db di memori valid & mungkin LEBIH BARU dari storage (penulisan tertunda / kuota
+      // sempat penuh) — JANGAN ditimpa mentah-mentah: gabungkan anti-hilang agar
+      // perubahan yang belum tersimpan tidak terbuang (penyebab "data tiba-tiba berubah")
+      adoptCloudData(main);
+    } else {
+      db = main;
+    }
   } else {
     // Database utama rusak / tidak terbaca — pulihkan dari cadangan lokal
     const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
     if (bak) {
-      db = bak;
-      recovered = true;
+      if (db && isValidDatabase(db) && !db.__seed) {
+        adoptCloudData(bak); // gabung anti-hilang — data memori tidak hilang
+      } else {
+        db = bak;
+        recovered = true;
+      }
       try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
     }
   }
   if (!db) {
     db = seedDatabase();
     _dbFreshSeed = true; // data masih bawaan pabrik (browser baru/localStorage bersih) — JANGAN kirim ke cloud sebelum yakin cloud memang kosong, agar data asli sekolah tidak tertimpa
-    saveDB();
+    // DATA CONTOH tidak boleh menyebar: saat online, seed TIDAK ditulis ke penyimpanan
+    // (tab lain/reload tidak akan mengadopsinya sebagai "database" — penyebab data
+    // sekolah terganti data contoh). Seed hanya disimpan bila perangkat memang offline
+    // atau cloud dimatikan sengaja, karena saat itu tidak ada sumber pemulihan lain.
+    const offlineOnly = (typeof isCloudDisabled === 'function' && isCloudDisabled()) || !navigator.onLine;
+    if (offlineOnly) {
+      try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
+    }
   }
   // Migrasi ringan: pastikan field baru tersedia untuk database lama
   if (db && !Array.isArray(db.presentations)) db.presentations = [];
@@ -592,6 +611,19 @@ function saveDB() {
   // memperbarui halamannya masing-masing lewat refresh eksplisit di handler-nya, dan perubahan
   // dari luar ditampilkan lewat tombol "Sinkron" di bilah atas — agar halaman tidak ter-reset
   // dan isian form tidak hilang saat pengguna sedang bekerja.
+}
+
+// Penanda waktu per-grup konten schoolProfile (anti timpa-balik antar perangkat):
+// saat merge cloud↔lokal, grup konten (hero/logo/profil) yang terakhir DIPERBARUI yang menang,
+// sehingga gambar & tulisan halaman depan tidak lagi tertimpa snapshot cloud yang lebih tua.
+function _touchProfileGroup(group) {
+  try { if (db && db.schoolProfile) db.schoolProfile[group] = now(); } catch (e) { /* abaikan */ }
+}
+// Kirim SEGERA konten halaman depan ke cloud + backup RTDB (tanpa menunggu debounce) —
+// mencegah foto/judul baru hilang bila tab ditutup begitu selesai mengunggah.
+function _pushProfileNow() {
+  try { if (typeof saveToCloud === 'function' && !_cloudPushInFlight) saveToCloud(true); } catch (e) { /* abaikan */ }
+  try { if (typeof saveToRTDB === 'function') saveToRTDB(true); } catch (e) { /* abaikan */ }
 }
 
 /* ============================================================
@@ -741,6 +773,7 @@ function rsApplyUI() {
     if (document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; } // jangan ganggu sesi Live Class
     if (document.hidden || rsUiBusy()) { _rsPendingUI = true; rsRetryLater(); return; } // tunda bila modal terbuka / user sedang mengetik
     _rsPendingUI = false; // refresh berhasil — reset penanda tertunda
+    if (!session && rsRescueSession()) { applyRoleVisibility(); } // sesi dipulihkan dari salinan cadangan
     if (!session) { renderLanding(); lucide.createIcons(); return; }
     // Pengaman sesi: akun hilang dari data terbaru → COBA PULIHKAN DULU (storage utama,
     // lalu backup lokal) — baru logout bila akun benar-benar tidak ada di mana pun.
@@ -809,15 +842,19 @@ function rsReloadFromStorage() {
       }
     }
   } catch (e) { /* abaikan — pengaman jangan pernah menggagalkan adopsi */ }
-  db = parsed;
-  _dbFreshSeed = false; // data dari tab/proses lain adalah data nyata — bukan lagi seed bawaan
-  rsNotifyNewData('tab lain');
-  return true;
+  // ===== PENGAMAN ANTI-SEED: tulisan tab lain berisi DATA CONTOH tidak boleh menggantikan database asli =====
+  if (parsed.__seed) { console.log('[SYNC] Tulisan tab lain berisi data contoh — diabaikan'); return false; }
+  // ===== MERGE ANTI-HILANG (bukan penimpaan!): record milik tab ini tidak akan hilang
+  // walau tab lain menulis data yang lebih lama. Bila tab ini masih menampilkan data
+  // contoh (seed), data asli dari tab lain menggantikan penuh. =====
+  const mergedChanged = adoptCloudData(parsed);
+  if (mergedChanged) rsNotifyNewData('tab lain');
+  return mergedChanged;
 }
 
 // Jaring pengaman: perubahan db di memori yang belum tersimpan → simpan otomatis
 function rsAutosaveCheck() {
-  if (!db) return;
+  if (!db || _dbFreshSeed || db.__seed) return; // data contoh tidak di-autosave saat online (agar tidak menyebar)
   let json;
   try { json = JSON.stringify(db); } catch (e) { return; }
   const raw = rsReadStorage();
@@ -833,6 +870,7 @@ function rsReloadSessionFromStorage() {
     const s = raw ? JSON.parse(raw) : null;
     const changed = JSON.stringify(s) !== JSON.stringify(session);
     session = s;
+    if (!session && rsRescueSession()) return; // sesi utama hilang tapi cadangan valid — pulihkan tanpa logout
     if (changed) { renderApp(); lucide.createIcons(); }
   } catch (e) { /* abaikan */ }
 }
@@ -954,8 +992,40 @@ function loadSession() {
   if (raw) { try { session = JSON.parse(raw); } catch (e) { session = null; } }
 }
 function saveSession() {
-  if (session) localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-  else localStorage.removeItem(SESSION_KEY);
+  if (session) {
+    const raw = JSON.stringify(session);
+    try { localStorage.setItem(SESSION_KEY, raw); } catch (e) { /* kuota */ }
+    try { localStorage.setItem(SESSION_BAK_KEY, raw); } catch (e) { /* kuota */ } // salinan anti-hilang sesi
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}
+// Pulihkan sesi dari salinan cadangan bila sesi utama hilang (storage dibersihkan/eviksi
+// browser, kuota penuh). Sesi hanya dipulihkan bila akunnya benar-benar masih ada di
+// database (utama atau backup) — sehingga logout sengaja TIDAK dibatalkan otomatis.
+function rsRescueSession() {
+  try {
+    if (session) return true;
+    const raw = localStorage.getItem(SESSION_BAK_KEY);
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    if (!s || !s.userId) return false; // penanda logged-out / rusak — jangan pulihkan
+    if (!(db && Array.isArray(db.users) && db.users.some(function(u) { return u.id === s.userId; }))) {
+      const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
+      if (bak && Array.isArray(bak.users) && bak.users.some(function(u) { return u.id === s.userId; })) {
+        db = bak; _dbFreshSeed = false;
+        try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota */ }
+        rsNoteLocalWrite();
+      }
+    }
+    if (db && Array.isArray(db.users) && db.users.some(function(u) { return u.id === s.userId; })) {
+      session = s;
+      try { localStorage.setItem(SESSION_KEY, raw); } catch (e) { /* kuota */ }
+      console.warn('[SYNC] Sesi dipulihkan dari salinan cadangan');
+      return true;
+    }
+  } catch (e) { /* abaikan */ }
+  return false;
 }
 function loadUIState() {
   const raw = localStorage.getItem(UI_KEY);
@@ -1211,13 +1281,36 @@ function mergeArrayAntiLoss(localArr, inArr, colName) {
 // Adopsi data dari cloud/backup: DIGABUNG dengan data lokal (bukan menimpa),
 // lalu simpan. Isi ulang field array yang kosong agar halaman tidak menemui
 // undefined. Mengembalikan true bila ada perubahan yang perlu disebarkan.
-function adoptCloudData(data) {
+function adoptCloudData(data, replaceAll) {
   if (!data || typeof data !== 'object') return false;
   // PENGAMAN WAJIB: data yang tidak sah (users kosong/hilang) tidak boleh
   // menyentuh db — inilah penyebab "kembali ke tampilan awal tanpa database"
   if (!isValidDatabase(data)) {
     console.warn('[SYNC] Data masuk tidak sah (users kosong/struktur rusak) — adopsi dibatalkan, data lokal aman');
     return false;
+  }
+  // PENGAMAN DATA CONTOH: seed dari sumber luar TIDAK PERNAH boleh masuk ke database
+  if (data.__seed) { console.warn('[SYNC] Data masuk adalah data contoh — ditolak, data lokal dipertahankan'); return false; }
+  const wasSeed = !!_dbFreshSeed || !!(db && db.__seed);
+  // Bila db lokal masih DATA CONTOH (seed), database asli yang datang MENGGANTIKAN penuh —
+  // jangan digabung, agar record demo tidak bercampur ke database sekolah.
+  if (replaceAll || wasSeed) {
+    db = data;
+    delete db.__seed;
+    _dbFreshSeed = false;
+    if (!Array.isArray(db.presentations)) db.presentations = [];
+    if (!Array.isArray(db.tombstones)) db.tombstones = [];
+    applyTombstones();
+    ensureKepsekAccount();
+    try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
+    rsNoteLocalWrite();
+    console.log('[SYNC] Data asli menggantikan data contoh (seed) — database sekolah dimuat');
+    // Bila sesi belum aktif (storage pernah dibersihkan/di-evict browser), coba pulihkan
+    // dari salinan cadangan SEKARANG — database sekolah sudah tersedia di memori.
+    try {
+      if ((!session || !getCurrentUser()) && typeof rsRescueSession === 'function' && rsRescueSession() && typeof renderApp === 'function') renderApp();
+    } catch (e) { /* abaikan */ }
+    return true;
   }
   _dbFreshSeed = false; // data nyata (cloud/backup) telah diterima — bukan lagi seed bawaan
   let changed = false;
@@ -1229,15 +1322,35 @@ function adoptCloudData(data) {
       return;
     }
     if (k === 'schoolProfile' && data[k] && typeof data[k] === 'object') {
-      const mergedP = Object.assign({}, db[k] || {});
+      const lp = db[k] || {}, cp = data[k];
+      const mergedP = Object.assign({}, lp);
       let pChanged = false;
-      Object.keys(data[k]).forEach(function(pk) {
-        if (pk === 'facilities') {
-          const m = mergeArrayAntiLoss(mergedP.facilities, data[k][pk]);
-          if (stableStringify(m) !== stableStringify(mergedP.facilities)) { mergedP.facilities = m; pChanged = true; }
-          return;
-        }
-        if (data[k][pk] !== undefined && data[k][pk] !== null && stableStringify(data[k][pk]) !== stableStringify(mergedP[pk])) { mergedP[pk] = data[k][pk]; pChanged = true; }
+      // Fasilitas: gabungan union anti-hilang dari kedua sisi (record tidak pernah hilang)
+      const mf = mergeArrayAntiLoss(lp.facilities, cp.facilities);
+      if (stableStringify(mf) !== stableStringify(mergedP.facilities)) { mergedP.facilities = mf; pChanged = true; }
+      // ANTI TIMPA-BALIK: konten halaman depan & profil dibagi per grup berpenanda waktu —
+      // sisi (cloud/lokal) yang terakhir diperbarui yang menang untuk grupnya, sehingga
+      // foto/judul/teks yang baru disunting tidak lagi tertimpa snapshot yang lebih tua.
+      const _spGroups = [
+        { stamp: 'heroUpdatedAt', fields: ['heroTitle', 'heroSubtitle', 'heroBadge', 'heroPrimaryButton', 'heroSecondaryButton', 'heroWelcomeTitle', 'heroWelcomeSubtitle', 'heroPhotos'] },
+        { stamp: 'logoUpdatedAt', fields: ['logo'] },
+        { stamp: 'profileUpdatedAt', fields: ['name', 'npsn', 'address', 'phone', 'email', 'website', 'vision', 'mission', 'history', 'principalName', 'principalNip', 'accreditation', 'foundedYear', 'totalStudents', 'totalTeachers', 'totalStaff'] }
+      ];
+      _spGroups.forEach(function(g) {
+        const lt = Date.parse(lp[g.stamp]) || 0, ct = Date.parse(cp[g.stamp]) || 0;
+        // keduanya tanpa penanda waktu (data lama pra-pembaruan) → cloud dianggap sumber utama
+        const takeCloud = (ct > lt) || (ct === 0 && lt === 0);
+        g.fields.forEach(function(fk) {
+          if (takeCloud) {
+            if (cp[fk] !== undefined && cp[fk] !== null && stableStringify(cp[fk]) !== stableStringify(mergedP[fk])) { mergedP[fk] = cp[fk]; pChanged = true; }
+          } else if (mergedP[fk] === undefined && cp[fk] !== undefined && cp[fk] !== null) { mergedP[fk] = cp[fk]; pChanged = true; }
+        });
+        if (takeCloud && cp[g.stamp] !== undefined && cp[g.stamp] !== mergedP[g.stamp]) { mergedP[g.stamp] = cp[g.stamp]; pChanged = true; }
+      });
+      // field lain di luar grup (fitur baru dari versi aplikasi lain): ambil dari cloud bila lokal belum punya
+      Object.keys(cp).forEach(function(pk) {
+        if (pk === 'facilities' || mergedP[pk] !== undefined || cp[pk] === undefined || cp[pk] === null) return;
+        mergedP[pk] = cp[pk]; pChanged = true;
       });
       if (pChanged) { db[k] = mergedP; changed = true; }
       return;
@@ -1328,6 +1441,19 @@ function handleCloudSnapshot() {
     console.log('[Firebase] Snapshot cloud lebih lama dari yang diterima — diabaikan (anti-revert)');
     return;
   }
+  // 1b) Data lokal masih DATA CONTOH (seed) — database asli dari cloud MENGGANTIKAN
+  //     penuh (bukan digabung) agar data demo tidak bercampur ke database sekolah.
+  if (_dbFreshSeed) {
+    _dbFreshSeed = false;
+    _lastCloudMetaMs = metaMs;
+    if (adoptCloudData(data, true)) {
+      saveDB();
+      if (session) rsNotifyNewData('perangkat lain');
+      else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — segarkan agar konten cloud langsung tampil
+      console.log('[Firebase] Database asli dimuat dari cloud — data contoh digantikan');
+    }
+    return;
+  }
   // 2) Ada perubahan lokal yang belum selesai dikirim (antrean/debounce/sedang berjalan/baru saja berubah) →
   //    tunda adopsi agar data baru lokal tidak terganti data lama; snapshot disimpan & diproses ulang tick 4 dtk
   if (cloudPushTimer || cloudPendingPush || _cloudPushInFlight || (Date.now() - _dbLocalDirtyAt < 2500)) {
@@ -1342,6 +1468,7 @@ function handleCloudSnapshot() {
   if (changed) {
     saveDB(); // sebarkan hasil gabungan ke localStorage + cloud + RTDB — perangkat lain yang datanya lama ikut pulih
     if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
+    else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka (tanpa sesi) — konten terbaru langsung dirender ulang
   }
 }
 
@@ -1502,7 +1629,7 @@ function updateCloudStatusUI() {
 function saveToCloud(immediate) {
   // PROTEKSI DATA SEKOLAH: data masih seed bawaan browser baru → JANGAN kirim ke cloud
   // sampai terbukti cloud kosong (perangkat pertama) atau data asli sudah teradopsi
-  if (_dbFreshSeed) return;
+  if (_dbFreshSeed || (db && db.__seed)) return;
   if (!cloudConnected || !firebaseFS || !cloudServerConfirmed) {
     if (!isCloudDisabled()) cloudPendingPush = true; // antre: kirim begitu koneksi pulih
     return;
@@ -1793,12 +1920,14 @@ function processRtdbSnapshot() {
   // (sudah lebih dari 8 detik, bukan sekadar jeda awal saat aplikasi baru dibuka)
   const cloudDownLong = !isCloudConnected() && cloudDownSince !== null && (Date.now() - cloudDownSince > 8000);
   if (cloudDownLong) {
+    const wasSeed = !!_dbFreshSeed; // bila lokal masih data contoh, backup asli MENGGANTIKAN penuh (bukan digabung)
     _dbFreshSeed = false;
-    const changed = adoptCloudData(parsed.data); // MERGE anti-hilang: data lokal & backup digabung
+    const changed = adoptCloudData(parsed.data, wasSeed); // MERGE anti-hilang: data lokal & backup digabung
     _lastRtdbMetaMs = metaMs;
     if (changed) {
       saveDB(); // sebarkan hasil gabungan (localStorage + cloud saat pulih + RTDB)
       if (session) rsNotifyNewData('Backup RTDB'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
+      else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — konten terbaru langsung dirender ulang
     }
   }
 }
@@ -1807,7 +1936,7 @@ function processRtdbSnapshot() {
 // Debounce 1400ms — dikirim sedikit lebih lambat dari Firestore agar jadi lapisan kedua.
 // Bila RTDB belum aktif, perubahan ditandai "menunggu" dan dikirim saat backup tersambung.
 function saveToRTDB(immediate) {
-  if (_dbFreshSeed) return; // seed bawaan browser baru — jangan timpa backup asli sebelum yakin node kosong
+  if (_dbFreshSeed || (db && db.__seed)) return; // seed bawaan browser baru — jangan timpa backup asli sebelum yakin node kosong
   if (!isRtdbActive() || !firebaseRTDB) {
     if (!isCloudDisabled()) rtdbPendingPush = true; // antre: kirim begitu RTDB tersambung
     return;
@@ -2809,7 +2938,7 @@ function startDbWatchdog() {
   setInterval(function() {
     // 1) Pulihkan localStorage bila terhapus saat aplikasi berjalan (anti "database hilang")
     try {
-      if (db && !localStorage.getItem(DB_KEY)) {
+      if (db && !_dbFreshSeed && !db.__seed && !localStorage.getItem(DB_KEY)) {
         localStorage.setItem(DB_KEY, JSON.stringify(db));
         console.warn('[DB] Penyimpanan lokal hilang — database ditulis ulang otomatis');
       }
@@ -3229,6 +3358,7 @@ function seedDatabase() {
   Object.keys(db).forEach(function(k) {
     if (Array.isArray(db[k])) db[k].forEach(function(r) { if (r && typeof r === 'object' && !r._seed) r._seed = true; });
   });
+  db.__seed = true; // penanda level-database: ini DATA CONTOH — tidak boleh menyebar/menggantikan database asli
 
   return db;
 }
@@ -3315,6 +3445,7 @@ function handleLogin(e) {
 function handleLogout() {
   session = null;
   saveSession();
+  try { localStorage.setItem(SESSION_BAK_KEY, JSON.stringify({ loggedOut: true, at: now() })); } catch (e) { /* abaikan */ } // tandai logout sengaja — sesi tidak di-pulihkan otomatis
   uiState.currentPage = 'dashboard';
   saveUIState();
   showToast('Logout Berhasil', 'Anda telah keluar dari sistem', 'info');
@@ -3549,9 +3680,23 @@ function scrollToSection(id) {
    APP RENDERING
    ============================================================ */
 function renderApp() {
-  loadDB(); loadSession(); loadUIState();
-  // Pengaman sesi: akun pada sesi tidak ditemukan di data terbaru (mis. data terganti
-  // oleh perangkat lain) → logout bersih & kembali ke halaman depan, BUKAN shell kosong
+  loadDB(); loadSession();
+  if (!session) rsRescueSession(); // sesi hilang dari storage (dibersihkan/eviksi) → pulihkan dari cadangan dulu
+  loadUIState();
+  // Pengaman sesi: akun pada sesi tidak ditemukan di data terbaru → COBA PULIHKAN DULU
+  // (baca ulang storage, lalu backup lokal) — logout hanya bila akun benar-benar tidak ada
+  if (session && !getCurrentUser()) {
+    try { rsReloadFromStorage(); } catch (e) { /* abaikan */ }
+    if (!getCurrentUser()) {
+      const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
+      if (bak && session.userId && bak.users.some(function(u) { return u.id === session.userId; })) {
+        db = bak; _dbFreshSeed = false;
+        try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota */ }
+        rsNoteLocalWrite();
+        console.warn('[APP] Sesi diselamatkan dari backup lokal');
+      }
+    }
+  }
   if (session && !getCurrentUser()) {
     session = null; saveSession();
     showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
@@ -5994,7 +6139,7 @@ window.ADMIN_PAGES = {
                 <input type="file" id="hero-photo-input" accept="image/jpeg,image/png,image/webp" multiple class="hidden" onchange="uploadHeroPhotos(this)">
               </div>
               <div class="p-3 rounded-lg bg-amber-50 border border-amber-200">
-                <p class="text-xs text-amber-700 flex items-start gap-1"><i data-lucide="lightbulb" style="font-size:14px; margin-top:1px;"></i> <span><strong>Tips:</strong> Gunakan foto landscape (melebar) yang terang, hindari foto ber-tulisan besar atau ber-watermark. Foto pertama = tampilan pembuka halaman depan.</span></p>
+                <p class="text-xs text-amber-700 flex items-start gap-1"><i data-lucide="lightbulb" style="font-size:14px; margin-top:1px;"></i> <span><strong>Tips:</strong> Gunakan foto landscape (melebar) yang terang, hindari foto ber-tulisan besar atau ber-watermark. Foto pertama = tampilan pembuka halaman depan. Semua foto tersimpan di database cloud &amp; otomatis muncul di semua browser/perangkat.</span></p>
               </div>
               <button type="button" onclick="resetHeroPhotos()" class="w-full px-4 py-2 border border-gray-300 text-gray-700 hover:bg-gray-50 rounded-md text-sm font-medium flex items-center justify-center gap-1"><i data-lucide="rotate-ccw" style="font-size:14px;"></i> Kembalikan ke Foto Bawaan</button>
             </div>`
@@ -6003,7 +6148,14 @@ window.ADMIN_PAGES = {
       `;
     }
 
+    const _tp = db.schoolProfile;
+    const _tpStamps = [_tp.heroUpdatedAt, _tp.logoUpdatedAt, _tp.profileUpdatedAt].filter(Boolean).map(function(s) { const t = Date.parse(s); return isNaN(t) ? 0 : t; }).filter(function(t) { return t > 0; });
+    const _tpLast = _tpStamps.length ? Math.max.apply(null, _tpStamps) : 0;
     return pageHeader('Tampilan Depan', 'Atur konten yang tampil di halaman depan publik') + `
+      <div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200 flex items-start gap-2">
+        <i data-lucide="cloud" class="text-emerald-600 flex-shrink-0" style="font-size: 18px; margin-top: 1px;"></i>
+        <p class="text-xs text-emerald-800 leading-relaxed"><strong>Gambar &amp; tulisan halaman depan tersimpan di Database Cloud</strong> — otomatis tersinkron ke semua browser &amp; perangkat, tidak hilang walau ganti perangkat/browser.${_tpLast ? ' Pembaruan terakhir: ' + formatDateTime(new Date(_tpLast).toISOString()) + '.' : ''}</p>
+      </div>
       <div class="border-b mb-4 flex flex-wrap gap-1">
         ${tabBtn('hero', 'Hero Section', 'layout')}
         ${tabBtn('foto-latar', 'Foto Latar', 'images')}
@@ -7919,9 +8071,11 @@ function saveSchool(e) {
     mission: document.getElementById('sf-mission').value,
     history: document.getElementById('sf-history').value
   });
+  _touchProfileGroup('profileUpdatedAt');
   saveDB();
+  _pushProfileNow();
   closeModal();
-  showToast('Profil sekolah disimpan', '', 'success');
+  showToast('Profil sekolah disimpan', 'Tersinkron ke semua perangkat', 'success');
   refreshMainContent();
 }
 
@@ -7931,7 +8085,7 @@ function openHeroForm() {
   const body = `
     <form id="hero-form" onsubmit="saveHero(event)" class="space-y-4">
       <div class="p-3 rounded-lg bg-emerald-50 border border-emerald-200">
-        <p class="text-xs text-emerald-700 flex items-center gap-1"><i data-lucide="info" style="font-size: 14px;"></i> Perubahan akan langsung tampil di halaman depan publik.</p>
+        <p class="text-xs text-emerald-700 flex items-center gap-1"><i data-lucide="info" style="font-size: 14px;"></i> Perubahan langsung tampil di halaman depan publik dan otomatis tersimpan ke Database Cloud — aman dibuka dari browser/perangkat mana pun.</p>
       </div>
       ${field('Judul Hero (Nama Sekolah)', inputText('hf-title', p.heroTitle || '', { required: true }))}
       ${field('Subtitle Hero', textarea('hf-subtitle', p.heroSubtitle || '', 3))}
@@ -7965,9 +8119,11 @@ function saveHero(e) {
     heroWelcomeTitle: document.getElementById('hf-welcome-title').value,
     heroWelcomeSubtitle: document.getElementById('hf-welcome-subtitle').value
   });
+  _touchProfileGroup('heroUpdatedAt'); // penanda waktu — merge antar perangkat memakai ini
   saveDB();
+  _pushProfileNow(); // kirim segera ke cloud + backup RTDB (aman bila tab ditutup cepat)
   closeModal();
-  showToast('Hero section disimpan', 'Perubahan langsung tampil di halaman depan', 'success');
+  showToast('Hero section disimpan', 'Tersimpan di database cloud — tampil di semua perangkat', 'success');
   refreshMainContent();
 }
 
@@ -7993,9 +8149,11 @@ function uploadLogo(input) {
   const reader = new FileReader();
   reader.onload = function(e) {
     db.schoolProfile.logo = e.target.result;
+    _touchProfileGroup('logoUpdatedAt');
     saveDB();
+    _pushProfileNow();
     updateAllLogos();
-    showToast('Logo berhasil diunggah!', 'Logo tampil di seluruh aplikasi', 'success');
+    showToast('Logo berhasil diunggah!', 'Tersimpan di database cloud — tampil di semua perangkat', 'success');
     refreshMainContent();
   };
   reader.onerror = function() {
@@ -8007,7 +8165,9 @@ function uploadLogo(input) {
 function deleteLogo() {
   confirmDialog('Hapus Logo Sekolah', 'Yakin ingin menghapus logo? Aplikasi akan kembali menggunakan icon default (graduation cap).', function() {
     db.schoolProfile.logo = '';
+    _touchProfileGroup('logoUpdatedAt');
     saveDB();
+    _pushProfileNow();
     updateAllLogos();
     showToast('Logo dihapus', 'Menggunakan icon default', 'success');
     refreshMainContent();
@@ -8063,9 +8223,11 @@ async function uploadHeroPhotos(input) {
     } catch (err) { skipped++; }
   }
   if (added > 0) {
+    _touchProfileGroup('heroUpdatedAt'); // foto tersimpan di database + cloud, ikut ke semua perangkat
     saveDB();
+    _pushProfileNow(); // kirim segera — hindari foto hilang bila tab ditutup begitu selesai upload
     renderHeroSlideshow();
-    showToast(added + ' foto ditambahkan', 'Latar slideshow halaman depan diperbarui', 'success');
+    showToast(added + ' foto ditambahkan', 'Tersimpan di database cloud — tampil di semua perangkat', 'success');
   } else if (skipped > 0) {
     showToast('Tidak ada foto yang valid', 'Gunakan JPG/PNG/WebP maks 10MB per foto', 'error');
   }
@@ -8078,7 +8240,9 @@ function moveHeroPhoto(i, dir) {
   const j = i + dir;
   if (j < 0 || j >= list.length) return;
   const tmp = list[i]; list[i] = list[j]; list[j] = tmp;
+  _touchProfileGroup('heroUpdatedAt');
   saveDB();
+  _pushProfileNow();
   renderHeroSlideshow();
   refreshMainContent();
 }
@@ -8088,9 +8252,11 @@ function deleteHeroPhoto(i) {
   if (!Array.isArray(list) || !list[i]) return;
   confirmDialog('Hapus Foto Ini?', 'Foto akan dihapus dari slideshow halaman depan. Jika semua foto unggahan habis, slideshow kembali memakai foto bawaan.', function() {
     list.splice(i, 1);
+    _touchProfileGroup('heroUpdatedAt');
     saveDB();
+    _pushProfileNow();
     renderHeroSlideshow();
-    showToast('Foto dihapus', '', 'success');
+    showToast('Foto dihapus', 'Tersinkron ke semua perangkat', 'success');
     refreshMainContent();
   }, 'Ya, Hapus');
 }
@@ -8098,7 +8264,9 @@ function deleteHeroPhoto(i) {
 function resetHeroPhotos() {
   confirmDialog('Kembalikan ke Foto Bawaan?', 'Semua foto unggahan akan dihapus dan slideshow kembali menggunakan 4 foto bawaan aplikasi.', function() {
     db.schoolProfile.heroPhotos = [];
+    _touchProfileGroup('heroUpdatedAt');
     saveDB();
+    _pushProfileNow();
     renderHeroSlideshow();
     showToast('Foto bawaan dipulihkan', 'Slideshow memakai 4 foto bawaan', 'success');
     refreshMainContent();
@@ -8184,9 +8352,11 @@ function saveStats(e) {
     totalStudents: parseInt(document.getElementById('sf-totalStudents').value) || 0,
     totalTeachers: parseInt(document.getElementById('sf-totalTeachers').value) || 0
   });
+  _touchProfileGroup('profileUpdatedAt');
   saveDB();
+  _pushProfileNow();
   closeModal();
-  showToast('Statistik disimpan', '', 'success');
+  showToast('Statistik disimpan', 'Tersinkron ke semua perangkat', 'success');
   refreshMainContent();
 }
 
