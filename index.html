@@ -637,6 +637,52 @@ function rsScheduleUI(delay) {
   _rsUiTimer = setTimeout(function() { _rsUiTimer = null; rsApplyUI(); }, delay || 180);
 }
 
+// ===== PELINDUNG ISIAN FORM saat penyegaran tampilan =====
+// Saat rsApplyUI me-render ulang halaman, nilai yang sedang diketik user di
+// form badan halaman (bukan modal) JUGA harus selamat — disimpan sebelum
+// render dan dipulihkan sesudahnya (dicocokkan lewat tanda tangan field).
+function _rsFieldSig(el) {
+  return (el.tagName || '') + '|' + (el.type || '') + '|' + (el.name || '') + '|' + (el.placeholder || '') + '|' + (el.id || '');
+}
+function _rsIsValueField(el) {
+  const t = el.type || '';
+  return t !== 'file' && t !== 'checkbox' && t !== 'radio' && t !== 'button' && t !== 'submit' && t !== 'hidden';
+}
+function _rsCaptureFormValues() {
+  try {
+    const root = document.getElementById('main-content');
+    if (!root) return [];
+    const out = [];
+    root.querySelectorAll('input, textarea, select').forEach(function(el) {
+      if (!_rsIsValueField(el)) return;
+      out.push({ sig: _rsFieldSig(el), value: el.value });
+    });
+    return out;
+  } catch (e) { return []; }
+}
+function _rsRestoreFormValues(saved) {
+  try {
+    if (!saved || !saved.length) return;
+    const root = document.getElementById('main-content');
+    if (!root) return;
+    const used = new Array(saved.length).fill(false);
+    root.querySelectorAll('input, textarea, select').forEach(function(el) {
+      if (!_rsIsValueField(el)) return;
+      const sig = _rsFieldSig(el);
+      for (let i = 0; i < saved.length; i++) {
+        if (used[i] || saved[i].sig !== sig) continue;
+        used[i] = true;
+        if (el.value !== saved[i].value) {
+          el.value = saved[i].value;
+          try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) { /* abaikan */ }
+          try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) { /* abaikan */ }
+        }
+        break;
+      }
+    });
+  } catch (e) { /* abaikan */ }
+}
+
 // Terapkan data db terkini ke seluruh tampilan yang sedang terlihat
 function rsApplyUI() {
   try {
@@ -644,16 +690,34 @@ function rsApplyUI() {
     if (document.hidden || rsUiBusy()) { _rsPendingUI = true; rsRetryLater(); return; } // tunda bila modal terbuka / user sedang mengetik
     _rsPendingUI = false; // refresh berhasil — reset penanda tertunda
     if (!session) { renderLanding(); lucide.createIcons(); return; }
-    // Pengaman sesi: akun hilang dari data terbaru → logout bersih (bukan shell kosong)
+    // Pengaman sesi: akun hilang dari data terbaru → COBA PULIHKAN DULU (storage utama,
+    // lalu backup lokal) — baru logout bila akun benar-benar tidak ada di mana pun.
+    // Ini mencegah logout paksa/"tampilan awal" akibat db sempat tertukar sesaat.
     if (!getCurrentUser()) {
-      session = null; saveSession();
-      renderLanding(); lucide.createIcons();
-      showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
-      return;
+      try { rsReloadFromStorage(); } catch (e) { /* abaikan */ }
+      if (!getCurrentUser()) {
+        try {
+          const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
+          if (bak && session.userId && bak.users.some(function(u) { return u.id === session.userId; })) {
+            db = bak; _dbFreshSeed = false;
+            try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota */ }
+            rsNoteLocalWrite();
+            console.warn('[SYNC] Sesi diselamatkan dari backup lokal');
+          }
+        } catch (e) { /* abaikan */ }
+      }
+      if (!getCurrentUser()) {
+        session = null; saveSession();
+        renderLanding(); lucide.createIcons();
+        showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
+        return;
+      }
     }
+    const _savedForm = _rsCaptureFormValues(); // simpan isian form badan halaman
     renderTopBar();
     renderSidebar();
     renderMainContent();
+    _rsRestoreFormValues(_savedForm);          // pulihkan isian — ketikan tidak hilang
     applyRoleVisibility();
     lucide.createIcons();
   } catch (e) { console.warn('[SYNC] Penyegaran tampilan gagal:', e && e.message); }
@@ -727,12 +791,38 @@ function rsStartRealtimeSync() {
 
 /* ============================================================
    TOMBOL "SINKRON" — bilah atas (Superadmin / Guru / Tendik)
-   Menampilkan data terbaru dari database (lokal + Cloud + Backup
-   RTDB) SAAT DIMINTA pengguna, tanpa mengubah halaman aktif.
+   Menarik data TERKINI langsung dari server Cloud + Backup RTDB
+   SAAT DIMINTA pengguna, menggabungkannya anti-hilang dengan data
+   lokal, lalu menampilkannya tanpa mengubah halaman aktif.
    Sinkronisasi data ke cloud/backup tetap berjalan realtime di
    latar belakang; yang dihilangkan hanyalah render ulang otomatis
    agar halaman tidak ter-reset dan isian form tidak hilang.
    ============================================================ */
+
+// Tarik snapshot TERKINI langsung dari server Cloud Firestore (bukan hanya
+// buffer listener yang mungkin basi) → digabung via handleCloudSnapshot.
+// done(ok) dipanggil sekali — juga dilindungi timeout pengaman 8 detik.
+function pullCloudNow(done) {
+  let called = false;
+  const finish = function(ok) { if (!called) { called = true; if (done) done(ok); } };
+  const guard = setTimeout(function() { finish(false); }, 8000);
+  try {
+    if (!isCloudConnected() || !firebaseFS) { clearTimeout(guard); finish(false); return; }
+    firebaseFS.collection(CLOUD_FS_COL).get().then(function(snap) {
+      const docs = {};
+      snap.forEach(function(d) { docs[d.id] = d.data(); });
+      cloudSnapshotBuffer = docs;
+      try { handleCloudSnapshot(); } catch (e) { /* abaikan */ }
+      clearTimeout(guard);
+      finish(true);
+    }).catch(function(err) {
+      console.warn('[SINKRON] Tarik data cloud gagal:', err && (err.code || err.message));
+      clearTimeout(guard);
+      finish(false);
+    });
+  } catch (e) { clearTimeout(guard); finish(false); }
+}
+
 var _syncBusy = false;
 function syncDatabaseNow() {
   if (_syncBusy) return;
@@ -744,33 +834,40 @@ function syncDatabaseNow() {
     let ok = true, errMsg = '';
     try {
       try { rsAutosaveCheck(); } catch (e) {}                                             // 1) simpan perubahan memori yang belum tersimpan
-      try { if (cloudSnapshotBuffer) handleCloudSnapshot(); } catch (e) {}                // 2) tarik snapshot Cloud (berlaku anti-revert)
+      try { if (cloudSnapshotBuffer) handleCloudSnapshot(); } catch (e) {}                // 2) proses snapshot Cloud yang sudah diterima
       try { if (rtdbSnapshotBuffer) processRtdbSnapshot(); } catch (e) {}                 // 3) tarik backup RTDB bila Cloud terputus
       try { rsReloadFromStorage(); } catch (e) {}                                         // 4) baca ulang data dari tab lain
       try { if (isCloudConnected() && cloudPendingPush) saveToCloud(true); } catch (e) {} // 5) kirim sisa antrean lokal yang belum terkirim
       try { if (isRtdbActive() && rtdbPendingPush) saveToRTDB(true); } catch (e) {}
-      _rsNewDataAvail = false;
-      if (document.getElementById('live-room-overlay')) {
-        _rsPendingUI = true; // jangan render di tengah sesi Live Class — diterapkan saat keluar ruangan
-      } else {
-        rsApplyUI();                                                                      // 6) tampilkan data terbaru, halaman aktif dipertahankan
-      }
     } catch (e) {
       ok = false; errMsg = (e && e.message) || String(e);
       console.warn('[SINKRON] Gagal:', errMsg);
-    } finally {
+    }
+    if (!ok) {
+      _syncBusy = false;
+      const b0 = document.getElementById('btn-sync-db');
+      if (b0) b0.classList.remove('sync-spin');
+      showToast('Sinkronisasi gagal', errMsg || 'Coba lagi', 'error');
+      return;
+    }
+    // 6) Tarik data TERKINI langsung dari server cloud (merge anti-hilang), lalu tampilkan
+    pullCloudNow(function(pulled) {
       _syncBusy = false;
       const b = document.getElementById('btn-sync-db');
       if (b) b.classList.remove('sync-spin');
-      updateSyncIndicator();
-      if (ok) {
-        if (_rsPendingUI) showToast('Sinkronisasi selesai', 'Tampilan akan diperbarui otomatis setelah Anda selesai mengisi form', 'info');
-        else showToast('Sinkronisasi selesai', 'Data terbaru dari database telah ditampilkan', 'success');
-      } else {
-        showToast('Sinkronisasi gagal', errMsg || 'Coba lagi', 'error');
-      }
+      try {
+        _rsNewDataAvail = false;
+        if (document.getElementById('live-room-overlay')) {
+          _rsPendingUI = true; // jangan render di tengah sesi Live Class — diterapkan saat keluar ruangan
+          showToast('Sinkronisasi selesai', 'Tampilan akan diperbarui otomatis setelah Anda keluar dari Live Class', 'info');
+        } else {
+          rsApplyUI(); // tampilkan data terbaru, halaman aktif dipertahankan
+          showToast('Sinkronisasi selesai', pulled ? 'Data terbaru dari database telah digabungkan & ditampilkan' : 'Data lokal & backup telah disinkronkan (cloud tidak terjangkau)', pulled ? 'success' : 'warning');
+        }
+        updateSyncIndicator();
+      } catch (e) { console.warn('[SINKRON] Penyegaran gagal:', e && e.message); }
       if (window.lucide) lucide.createIcons();
-    }
+    });
   }, 120);
 }
 
@@ -882,19 +979,106 @@ function stableStringify(value) {
   return '{' + Object.keys(value).sort().map(function(k) { return JSON.stringify(k) + ':' + stableStringify(value[k]); }).join(',') + '}';
 }
 
-// Adopsi data dari cloud: isi ulang field array yang kosong (kadang tidak
-// tersimpan di cloud) agar halaman tidak menemui undefined
+// ===== MERGE ANTI-HILANG (perbaikan "data tiba-tiba hilang") =====
+// Masalah lama: snapshot cloud/backup yang datang MENIMPA seluruh db lokal.
+// Akibatnya tugas guru / pengumpulan siswa bisa hilang bila perangkat lain
+// mengirim data lama, atau halaman kembali ke tampilan awal bila snapshot
+// tidak lengkap. Kini data masuk DIGABUNG (union), tidak ada record dari
+// kedua sisi yang hilang:
+//  - record hanya ada di lokal  → dipertahankan (tugas guru aman)
+//  - record hanya ada di cloud  → ditambahkan (tugas siswa terdeteksi)
+//  - record ada di kedua sisi   → menang versi dengan timestamp terbaru;
+//                                 seri → versi lokal dipertahankan
+var _REC_TS_KEYS = ['updatedAt', 'submittedAt', 'gradedAt', 'timestamp', 'date', 'createdAt'];
+function _recTs(r) {
+  if (!r || typeof r !== 'object') return 0;
+  let best = 0;
+  for (let i = 0; i < _REC_TS_KEYS.length; i++) {
+    const v = r[_REC_TS_KEYS[i]];
+    if (v === undefined || v === null || v === '') continue;
+    let t = (typeof v === 'number') ? v : Date.parse(v);
+    if (isNaN(t)) t = 0;
+    if (t > best) best = t;
+  }
+  return best;
+}
+function _recKey(r) {
+  if (!r || typeof r !== 'object') return null;
+  const id = (r.id !== undefined && r.id !== null && r.id !== '') ? r.id : null;
+  return id === null ? null : String(id);
+}
+function mergeArrayAntiLoss(localArr, inArr) {
+  const local = Array.isArray(localArr) ? localArr : [];
+  const incoming = Array.isArray(inArr) ? inArr : [];
+  if (!incoming.length) return local.slice(); // snapshot tanpa isi → lokal utuh (anti kosong)
+  const idx = new Map();
+  local.forEach(function(r, i) { const k = _recKey(r); if (k !== null && !idx.has(k)) idx.set(k, i); });
+  const out = local.slice();
+  incoming.forEach(function(r) {
+    const k = _recKey(r);
+    if (k === null) {
+      // record tanpa id: tambah hanya bila belum ada yang identik
+      const s = stableStringify(r);
+      const dup = out.some(function(x) { return stableStringify(x) === s; });
+      if (!dup) { out.push(r); }
+      return;
+    }
+    const i = idx.get(k);
+    if (i === undefined) { idx.set(k, out.length); out.push(r); return; } // baru dari perangkat lain
+    const cur = out[i];
+    if (stableStringify(cur) === stableStringify(r)) return; // identik
+    if (_recTs(r) > _recTs(cur)) { out[i] = r; }             // versi lebih baru menang
+    // versi sama/lebih lama → pertahankan lokal (anti revert)
+  });
+  return out;
+}
+
+// Adopsi data dari cloud/backup: DIGABUNG dengan data lokal (bukan menimpa),
+// lalu simpan. Isi ulang field array yang kosong agar halaman tidak menemui
+// undefined. Mengembalikan true bila ada perubahan yang perlu disebarkan.
 function adoptCloudData(data) {
   if (!data || typeof data !== 'object') return false;
+  // PENGAMAN WAJIB: data yang tidak sah (users kosong/hilang) tidak boleh
+  // menyentuh db — inilah penyebab "kembali ke tampilan awal tanpa database"
+  if (!isValidDatabase(data)) {
+    console.warn('[SYNC] Data masuk tidak sah (users kosong/struktur rusak) — adopsi dibatalkan, data lokal aman');
+    return false;
+  }
   _dbFreshSeed = false; // data nyata (cloud/backup) telah diterima — bukan lagi seed bawaan
+  let changed = false;
   Object.keys(db).forEach(function(k) {
-    if (Array.isArray(db[k]) && (data[k] === undefined || data[k] === null)) data[k] = [];
+    if (Array.isArray(db[k])) {
+      const merged = mergeArrayAntiLoss(db[k], data[k]);
+      if (stableStringify(merged) !== stableStringify(db[k])) { db[k] = merged; changed = true; }
+      return;
+    }
+    if (k === 'schoolProfile' && data[k] && typeof data[k] === 'object') {
+      const mergedP = Object.assign({}, db[k] || {});
+      let pChanged = false;
+      Object.keys(data[k]).forEach(function(pk) {
+        if (pk === 'facilities') {
+          const m = mergeArrayAntiLoss(mergedP.facilities, data[k][pk]);
+          if (stableStringify(m) !== stableStringify(mergedP.facilities)) { mergedP.facilities = m; pChanged = true; }
+          return;
+        }
+        if (data[k][pk] !== undefined && data[k][pk] !== null && stableStringify(data[k][pk]) !== stableStringify(mergedP[pk])) { mergedP[pk] = data[k][pk]; pChanged = true; }
+      });
+      if (pChanged) { db[k] = mergedP; changed = true; }
+      return;
+    }
+    // nilai tunggal/object lain: ambil dari cloud bila ada dan berbeda
+    if (data[k] !== undefined && data[k] !== null && stableStringify(data[k]) !== stableStringify(db[k])) { db[k] = data[k]; changed = true; }
   });
-  if (!Array.isArray(data.presentations)) data.presentations = [];
-  db = data;
-  localStorage.setItem(DB_KEY, JSON.stringify(db));
-  rsNoteLocalWrite(); // sinkron dengan penanda realtime sync
-  return true;
+  // key yang hanya ada di data masuk (fitur baru dari versi aplikasi lain)
+  Object.keys(data).forEach(function(k) {
+    if (db[k] === undefined && data[k] !== undefined && data[k] !== null) { db[k] = data[k]; changed = true; }
+  });
+  if (!Array.isArray(db.presentations)) db.presentations = [];
+  if (changed) {
+    try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
+    rsNoteLocalWrite(); // sinkron dengan penanda realtime sync
+  }
+  return changed;
 }
 
 function initFirebase() {
@@ -933,6 +1117,8 @@ function handleCloudSnapshot() {
     // Cloud benar-benar kosong (dikonfirmasi listener server) — bila data lokal masih seed bawaan,
     // kirim sebagai data awal; ini satu-satunya kondisi seed boleh menulis ke cloud
     if (_dbFreshSeed && cloudServerConfirmed) { _dbFreshSeed = false; saveToCloud(true); }
+    // Cloud kosong tetapi lokal berisi data sekolah asli → isi ulang cloud (pemulihan cloud terhapus)
+    else if (cloudServerConfirmed && session && getCurrentUser && getCurrentUser()) { saveToCloud(true); }
     return;
   }
   const metaMs = Date.parse(meta.updatedAt) || 0;
@@ -945,6 +1131,12 @@ function handleCloudSnapshot() {
   let data;
   try { data = JSON.parse(json); } catch (e) {
     console.warn('[Firebase] Data cloud tidak dapat dibaca:', e.message);
+    return;
+  }
+  // PENGAMAN: struktur tidak sah (users kosong/hilang) → buang, jangan sampai
+  // menggantikan data sekolah yang utuh (penyebab "tampilan awal tanpa database")
+  if (!isValidDatabase(data)) {
+    console.warn('[Firebase] Snapshot cloud tidak sah — diabaikan (data lokal dipertahankan)');
     return;
   }
   // ===== ANTI-REVERT: jangan biarkan snapshot cloud yang LAMA menimpa perubahan lokal yang lebih baru =====
@@ -960,15 +1152,14 @@ function handleCloudSnapshot() {
     cloudSnapshotBuffer = docs;
     return;
   }
-  Object.keys(db).forEach(function(k) {
-    if (Array.isArray(db[k]) && (data[k] === undefined || data[k] === null)) data[k] = [];
-  });
-  if (!Array.isArray(data.presentations)) data.presentations = [];
   if (stableStringify(data) === stableStringify(db)) { _lastCloudMetaMs = metaMs; return; } // tulisan sendiri / tidak ada perubahan
   _dbFreshSeed = false;      // cloud ternyata berisi data asli — adopsi, seed bawaan ditinggalkan
-  adoptCloudData(data);
+  const changed = adoptCloudData(data); // MERGE anti-hilang: record lokal & cloud tidak ada yang hilang
   _lastCloudMetaMs = metaMs; // catat meta cloud yang sudah diterima
-  if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
+  if (changed) {
+    saveDB(); // sebarkan hasil gabungan ke localStorage + cloud + RTDB — perangkat lain yang datanya lama ikut pulih
+    if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
+  }
 }
 
 function ensureFirebaseApp(config) {
@@ -1146,6 +1337,9 @@ function saveToCloud(immediate) {
     const total = Math.max(1, Math.ceil(json.length / CLOUD_FS_CHUNK));
     const col = firebaseFS.collection(CLOUD_FS_COL);
     const batch = firebaseFS.batch();
+    // CATATAN: potongan chunk di ATAS total baru TIDAK dihapus — sisanya adalah
+    // "chunk yatim" sisa versi database lama yang lebih besar, dipakai sebagai
+    // sumber pemulihan data oleh fitur "Pulihkan Data Hilang".
     for (let i = 0; i < total; i++) {
       batch.set(col.doc('chunk_' + i), { i: i, data: json.substring(i * CLOUD_FS_CHUNK, (i + 1) * CLOUD_FS_CHUNK) });
     }
@@ -1417,9 +1611,12 @@ function processRtdbSnapshot() {
   const cloudDownLong = !isCloudConnected() && cloudDownSince !== null && (Date.now() - cloudDownSince > 8000);
   if (cloudDownLong) {
     _dbFreshSeed = false;
-    adoptCloudData(parsed.data);
+    const changed = adoptCloudData(parsed.data); // MERGE anti-hilang: data lokal & backup digabung
     _lastRtdbMetaMs = metaMs;
-    if (session) rsNotifyNewData('Backup RTDB'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
+    if (changed) {
+      saveDB(); // sebarkan hasil gabungan (localStorage + cloud saat pulih + RTDB)
+      if (session) rsNotifyNewData('Backup RTDB'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
+    }
   }
 }
 
@@ -1478,7 +1675,7 @@ function backupNowRTDB() {
 
 // Pulihkan paksa data dari backup RTDB (tombol manual)
 function restoreFromRTDB() {
-  confirmDialog('Pulihkan dari Backup RTDB', 'Data saat ini akan DIGANTI dengan isi terakhir node "' + RTDB_PATH + '" di Realtime Database. Melanjutkan?', function() {
+  confirmDialog('Pulihkan dari Backup RTDB', 'Isi backup akan DIGABUNGKAN dengan data saat ini — record yang hilang ditambahkan kembali, data saat ini tidak terhapus. Melanjutkan?', function() {
     if (!firebaseRTDB || !rtdbUrlInUse) {
       showToast('RTDB tidak tersedia', rtdbError || 'Realtime Database belum tersambung', 'error');
       return;
@@ -1501,12 +1698,12 @@ function restoreFromRTDB() {
 /* ============================================================
    RIWAYAT VERSI BACKUP (RTDB History)
    Setiap backup penting disimpan sebagai VERSI TERPISAH di node
-   "sija_backup_hist/<waktu>" (maks. 8 versi terakhir). Dengan ini
+   "sija_backup_hist/<waktu>" (maks. 24 versi terakhir). Dengan ini
    data lama selalu bisa dikembalikan — data tidak akan hilang
    kecuali dihapus lewat perintah hapus yang eksplisit.
    ============================================================ */
 const RTDB_HIST_PATH = 'sija_backup_hist';
-const RTDB_HIST_MAX = 8;
+const RTDB_HIST_MAX = 24;
 const RTDB_HIST_MIN_MS = 5 * 60 * 1000; // jeda minimal antar versi otomatis (5 menit)
 let rtdbHistLastAt = 0;      // waktu versi otomatis terakhir ditulis
 let rtdbHistVersions = [];   // cache daftar versi untuk UI
@@ -1610,7 +1807,7 @@ function restoreRtdbHist(key) {
     showToast('RTDB tidak tersedia', rtdbError || 'Realtime Database belum tersambung', 'error');
     return;
   }
-  confirmDialog('Pulihkan Versi Backup', 'Semua data saat ini akan DIGANTI dengan isi versi cadangan dari riwayat backup online. Kondisi data saat ini disimpan dulu sebagai versi baru sehingga tetap bisa dikembalikan. Melanjutkan?', function() {
+  confirmDialog('Pulihkan Versi Backup', 'Isi versi cadangan akan DIGABUNGKAN dengan data saat ini — record yang hilang ditambahkan kembali, data saat ini tidak terhapus. Kondisi saat ini juga disimpan dulu sebagai versi baru sehingga tetap bisa dikembalikan. Melanjutkan?', function() {
     firebaseRTDB.ref(RTDB_HIST_PATH + '/' + key).once('value').then(function(snap) {
       const parsed = parseRtdbBackup(snap.val());
       if (!parsed.ok) {
@@ -1631,6 +1828,241 @@ function retryRtdb() {
   resetRtdbState();
   initRTDB(activeCloudConfig || EMBEDDED_FIREBASE_CONFIG);
   showToast('Menyambungkan ulang...', 'Menghubungi Realtime Database', 'info');
+}
+
+/* ============================================================
+   PEMULIHAN DATA HILANG — "Penugasan siswa mengumpulkan kosong"
+   Memindai SEMUA sumber cadangan yang dapat dijangkau, lalu
+   MENAMBAHKAN record yang hilang (dicocokkan lewat id) ke
+   database saat ini. Data saat ini TIDAK ditimpa — merge
+   anti-hilang: record lokal tidak pernah terhapus.
+   Sumber yang dipindai:
+   1) Cloud Firestore  — potongan (chunk) YATIM sisa versi
+      database LAMA yang lebih besar (data pra-kehilangan)
+   2) Cloud Firestore  — versi berjalan saat ini
+   3) Backup RTDB      — node "sija_backup"
+   4) Riwayat backup   — node "sija_backup_hist" (semua versi)
+   5) Backup lokal     — "sija_db_bak_v1" di browser ini
+   ============================================================ */
+var _ID_PREFIX_COLL = {
+  usr: 'users', tch: 'teachers', tnd: 'tendiks', std: 'students', cls: 'classes',
+  crs: 'courses', mtr: 'materials', asg: 'assignments', sub: 'submissions',
+  grd: 'grades', att: 'attendances', ann: 'announcements', nws: 'news',
+  log: 'logs', lvc: 'liveClasses', prs: 'presentations'
+};
+var _RECOVER_ID_RE = /\{[^{}]{0,80}"id":"[a-z]{3}_[A-Za-z0-9]*"/g;
+
+// Cari akhir objek JSON seimbang mulai posisi `start`
+// (peduli string & escape) — -1 bila objek terpotong di batas fragment
+function _balancedJsonEnd(text, start) {
+  let depth = 0, inStr = false, esc = false;
+  for (let j = start; j < text.length; j++) {
+    const ch = text[j];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+    } else {
+      if (ch === '"') inStr = true;
+      else if (ch === '{' || ch === '[') depth++;
+      else if (ch === '}' || ch === ']') { depth--; if (depth === 0) return j; }
+    }
+  }
+  return -1;
+}
+
+// Selamatkan record-record JSON utuh dari potongan JSON terputus (chunk yatim)
+function salvageRecordsFromFragment(text, sink) {
+  if (!text || typeof text !== 'string' || text.length < 10) return 0;
+  let found = 0;
+  _RECOVER_ID_RE.lastIndex = 0;
+  let m;
+  while ((m = _RECOVER_ID_RE.exec(text)) !== null) {
+    const start = m.index;
+    const end = _balancedJsonEnd(text, start);
+    if (end === -1) continue; // objek terpotong — tidak dapat diselamatkan
+    try {
+      const obj = JSON.parse(text.slice(start, end + 1));
+      if (obj && typeof obj === 'object' && obj.id) {
+        const idStr = String(obj.id);
+        const coll = _ID_PREFIX_COLL[idStr.split('_')[0]];
+        if (coll) {
+          if (!sink[coll]) sink[coll] = {};
+          if (!sink[coll][idStr]) { sink[coll][idStr] = obj; found++; }
+        }
+      }
+    } catch (e) { /* objek rusak — lewati */ }
+  }
+  return found;
+}
+
+// Masukkan seluruh record satu versi cadangan ke sink kandidat
+function _versionToSink(val, sink) {
+  const parsed = parseRtdbBackup(val);
+  if (!parsed.ok) return false;
+  Object.keys(parsed.data).forEach(function(k) {
+    if (!Array.isArray(parsed.data[k])) return;
+    if (!sink[k]) sink[k] = {};
+    parsed.data[k].forEach(function(r) {
+      if (r && r.id !== undefined && r.id !== null) {
+        const key = String(r.id);
+        if (!sink[k][key]) sink[k][key] = r;
+      }
+    });
+  });
+  return true;
+}
+
+var _recoverBusy = false;
+function runRecoveryUI() {
+  if (_recoverBusy) return;
+  const btnEl = document.getElementById('btn-recover-data');
+  if (btnEl) { btnEl.disabled = true; btnEl.style.opacity = '0.6'; }
+  _recoverBusy = true;
+  showToast('Pemulihan dimulai', 'Memindai cloud, backup online, riwayat versi & backup lokal...', 'info');
+  const t0 = Date.now();
+  recoverMissingData().then(function(rep) {
+    _recoverBusy = false;
+    if (btnEl) { btnEl.disabled = false; btnEl.style.opacity = ''; }
+    showRecoveryReport(rep, Date.now() - t0);
+  }).catch(function(err) {
+    _recoverBusy = false;
+    if (btnEl) { btnEl.disabled = false; btnEl.style.opacity = ''; }
+    console.warn('[PEMULIHAN] Gagal:', err && (err.message || err));
+    showToast('Pemulihan gagal', (err && (err.message || err.code)) || 'Terjadi kesalahan saat memindai sumber cadangan', 'error');
+  });
+}
+
+function recoverMissingData() {
+  const sink = {};            // { koleksi: { id: record } } kandidat dari semua sumber
+  const info = { orphanChunks: 0, salvaged: 0, sources: [] };
+  const jobs = [];
+  // 1+2) Cloud Firestore: versi berjalan + potongan yatim sisa database lama
+  if (isCloudConnected() && firebaseFS) {
+    jobs.push(firebaseFS.collection(CLOUD_FS_COL).get().then(function(snap) {
+      const docs = {}; let meta = null;
+      snap.forEach(function(d) { docs[d.id] = d.data(); });
+      meta = docs['meta'] || null;
+      const total = (meta && meta.total) ? meta.total : 0;
+      let sumber = 'Firestore (versi berjalan)';
+      if (total > 0) {
+        const val = { meta: meta };
+        for (let i = 0; i < total; i++) val['chunk_' + i] = docs['chunk_' + i];
+        if (_versionToSink(val, sink)) info.sources.push(sumber);
+      }
+      // Potongan yatim: index >= total → fragmen versi lama → selamatkan record utuh
+      Object.keys(docs).forEach(function(docId) {
+        const m = /^chunk_(\d+)$/.exec(docId);
+        if (!m) return;
+        const idx = parseInt(m[1], 10);
+        if (idx >= total && docs[docId] && typeof docs[docId].data === 'string') {
+          info.orphanChunks++;
+          info.salvaged += salvageRecordsFromFragment(docs[docId].data, sink);
+        }
+      });
+      if (info.orphanChunks > 0) info.sources.push('Firestore chunk yatim (' + info.orphanChunks + ' potongan, ' + info.salvaged + ' record diselamatkan)');
+    }).catch(function() { /* cloud tidak terjangkau — lanjut sumber lain */ }));
+  }
+  // 3) Backup RTDB berjalan
+  if (firebaseRTDB) {
+    jobs.push(firebaseRTDB.ref(RTDB_PATH).once('value').then(function(s) {
+      if (s.val() && _versionToSink(s.val(), sink)) info.sources.push('Backup RTDB');
+    }).catch(function() { /* abaikan */ }));
+    // 4) Riwayat backup — SEMUA versi
+    jobs.push(firebaseRTDB.ref(RTDB_HIST_PATH).once('value').then(function(s) {
+      const val = s.val() || {};
+      let n = 0;
+      Object.keys(val).forEach(function(k) { if (_versionToSink(val[k], sink)) n++; });
+      if (n > 0) info.sources.push('Riwayat backup (' + n + ' versi)');
+    }).catch(function() { /* abaikan */ }));
+  }
+  // 5) Backup lokal browser ini
+  jobs.push(Promise.resolve().then(function() {
+    const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
+    if (bak) {
+      const val = { meta: { updatedAt: new Date().toISOString(), total: 1 }, chunk_0: { data: JSON.stringify(bak) } };
+      if (_versionToSink(val, sink)) info.sources.push('Backup lokal browser');
+    }
+  }));
+  return Promise.all(jobs).then(function() {
+    // ===== Gabungkan kandidat ke db — hanya MENAMBAHKAN/MEMBAHARUI, tidak menghapus =====
+    const recovered = {};
+    Object.keys(sink).forEach(function(coll) {
+      if (!Array.isArray(db[coll])) db[coll] = [];
+      const kandidat = Object.keys(sink[coll]).map(function(id) { return sink[coll][id]; });
+      if (!kandidat.length) return;
+      const beforeJson = stableStringify(db[coll]);
+      const beforeCount = db[coll].length;
+      const merged = mergeArrayAntiLoss(db[coll], kandidat);
+      if (stableStringify(merged) !== beforeJson) {
+        db[coll] = merged;
+        const added = merged.length - beforeCount;
+        let updated = 0;
+        // hitung record sama-id yang isinya berubah (versi lebih baru menang)
+        const oldById = {};
+        JSON.parse(beforeJson).forEach(function(r) { if (r && r.id !== undefined) oldById[String(r.id)] = r; });
+        merged.forEach(function(r) {
+          const id = (r && r.id !== undefined) ? String(r.id) : null;
+          if (id && oldById[id] && stableStringify(oldById[id]) !== stableStringify(r)) updated++;
+        });
+        recovered[coll] = { added: Math.max(0, added), updated: updated };
+      }
+    });
+    // ===== Pulihkan hubungan yang putus =====
+    const rep = { recovered: recovered, relinked: 0, subTanpaTugas: 0, nilaiTanpaSub: 0, info: info };
+    (db.submissions || []).forEach(function(sub) {
+      if (sub && sub.assignmentId && !db.assignments.some(function(a) { return a.id === sub.assignmentId; })) {
+        // tugas pemilik submission hilang (mis. tugas dibuat ulang dengan id baru) →
+        // hubungkan ke tugas berjudul sama bila judulnya unik
+        const judul = String(sub.assignmentTitle || sub._title || '').trim().toLowerCase();
+        let target = null;
+        if (judul) {
+          const match = db.assignments.filter(function(a) { return String(a.title || '').trim().toLowerCase() === judul; });
+          if (match.length === 1) target = match[0];
+        }
+        if (target) { sub.assignmentId = target.id; rep.relinked++; }
+        else rep.subTanpaTugas++;
+      }
+    });
+    (db.grades || []).forEach(function(g) {
+      if (g && g.submissionId && !db.submissions.some(function(s) { return s.id === g.submissionId; })) rep.nilaiTanpaSub++;
+    });
+    const adaPerubahan = Object.keys(recovered).length > 0 || rep.relinked > 0;
+    if (adaPerubahan) { saveDB(); } // sebarkan hasil pemulihan ke localStorage + cloud + RTDB + riwayat
+    return rep;
+  });
+}
+
+function showRecoveryReport(rep, durasiMs) {
+  const rows = Object.keys(rep.recovered).map(function(coll) {
+    const LABEL = { users: 'Pengguna', teachers: 'Guru', tendiks: 'Tendik', students: 'Siswa', classes: 'Kelas', courses: 'Mata Pelajaran', materials: 'Materi', assignments: 'Tugas', submissions: 'Pengumpulan Siswa', grades: 'Nilai', attendances: 'Absensi', announcements: 'Pengumuman', news: 'Berita', logs: 'Log', liveClasses: 'Live Class', presentations: 'Presentasi' };
+    const r = rep.recovered[coll];
+    return '<tr><td class="py-1.5 pr-3 font-medium">' + (LABEL[coll] || coll) + '</td><td class="py-1.5 pr-3 text-emerald-700 font-semibold">' + r.added + ' ditambahkan</td><td class="py-1.5 text-gray-500">' + (r.updated ? r.updated + ' diperbarui' : '-') + '</td></tr>';
+  }).join('');
+  const sumber = rep.info.sources.length ? rep.info.sources.map(function(s) { return '<li>' + s + '</li>'; }).join('') : '<li>Tidak ada sumber yang dapat dijangkau</li>';
+  const adaHasil = Object.keys(rep.recovered).length > 0;
+  const body = `
+    <div class="space-y-3">
+      <div class="p-3 rounded-lg ${adaHasil ? 'bg-emerald-50 border border-emerald-200' : 'bg-amber-50 border border-amber-200'}">
+        <p class="text-sm font-semibold ${adaHasil ? 'text-emerald-900' : 'text-amber-900'}">${adaHasil ? 'Data hilang berhasil dipulihkan!' : 'Tidak ditemukan record tambahan yang bisa dipulihkan'}</p>
+        <p class="text-xs ${adaHasil ? 'text-emerald-700' : 'text-amber-700'} mt-1">Pemindaian selesai dalam ${(durasiMs / 1000).toFixed(1)} detik. Sumber terbaca: <ul class="list-disc ml-4 mt-1">${sumber}</ul></p>
+      </div>
+      ${adaHasil ? `<table class="w-full text-sm"><tbody>${rows}</tbody></table>` : ''}
+      ${(rep.relinked || rep.subTanpaTugas || rep.nilaiTanpaSub) ? `
+        <div class="p-3 rounded-lg bg-blue-50 border border-blue-200 text-xs text-blue-800">
+          <p class="font-semibold mb-1">Hubungan data:</p>
+          ${rep.relinked ? '<p>• ' + rep.relinked + ' pengumpulan siswa berhasil dihubungkan kembali ke tugasnya</p>' : ''}
+          ${rep.subTanpaTugas ? '<p>• ' + rep.subTanpaTugas + ' pengumpulan siswa yatim (tugas aslinya tidak ada di mana pun — tampil di daftar tugas berjudul sama bila dibuat ulang)</p>' : ''}
+          ${rep.nilaiTanpaSub ? '<p>• ' + rep.nilaiTanpaSub + ' record nilai tanpa pengumpulan induknya</p>' : ''}
+        </div>` : ''}
+      <div class="p-3 rounded-lg bg-gray-50 border border-gray-200 text-xs text-gray-600">
+        <p class="font-semibold mb-1">Agar data lama kembali lengkap, lakukan juga:</p>
+        <p>1. Buka website ini di <b>semua browser/perangkat yang pernah dipakai sebelum kejadian</b> (komputer lab, HP guru/siswa) TANPA menghapus data browser — data utuh di perangkat tersebut akan otomatis tergabung ke cloud.</p>
+        <p>2. Periksa file <b>sma-jayaloka-database-*.json</b> di folder Download — bila pernah Export, salin ke perangkat ini lalu klik Import Database.</p>
+        <p>3. Klik tombol ini lagi setelah perangkat lain selesai tersinkron.</p>
+      </div>
+    </div>`;
+  showModal('Pemulihan Data Hilang', body, btn('Tutup', 'closeModal()', { variant: 'outline' }), 'max-w-xl');
 }
 
 function saveRtdbUrlOverride() {
@@ -5088,6 +5520,23 @@ window.ADMIN_PAGES = {
             <div class="p-3 rounded-lg bg-red-50 border border-red-200">
               <p class="text-xs text-red-600"><i data-lucide="alert-triangle" style="font-size: 14px; display: inline;"></i> <strong>Peringatan:</strong> Import akan mengganti seluruh data saat ini. Pastikan file JSON berasal dari backup yang terpercaya.</p>
             </div>
+          </div>`
+        )}
+
+        ${dataCard('Pemulihan Data Hilang', 'Kembalikan record yang hilang dari semua sumber cadangan', 'life-buoy',
+          `<div class="space-y-3">
+            <div class="p-3 rounded-lg bg-teal-50 border border-teal-200">
+              <p class="text-xs text-teal-700"><i data-lucide="info" style="font-size: 14px; display: inline;"></i> <strong>Aman digunakan:</strong> pemindaian <b>menambahkan kembali</b> record yang hilang (tugas, pengumpulan siswa, nilai, materi, dll.) dari potongan cloud lama, backup RTDB, riwayat versi, dan backup lokal. Data saat ini <b>tidak ditimpa dan tidak terhapus</b>.</p>
+            </div>
+            <div class="grid grid-cols-3 gap-2 text-center">
+              <div class="p-2 rounded-lg border"><p class="text-lg font-bold text-emerald-600">${db.assignments.length}</p><p class="text-[10px] text-gray-500">Tugas</p></div>
+              <div class="p-2 rounded-lg border"><p class="text-lg font-bold text-emerald-600">${db.submissions.length}</p><p class="text-[10px] text-gray-500">Pengumpulan</p></div>
+              <div class="p-2 rounded-lg border"><p class="text-lg font-bold text-emerald-600">${db.grades.length}</p><p class="text-[10px] text-gray-500">Nilai</p></div>
+            </div>
+            <button id="btn-recover-data" onclick="runRecoveryUI()" class="w-full px-4 py-3 bg-teal-600 hover:bg-teal-700 text-white rounded-md text-sm font-medium flex items-center justify-center gap-2">
+              <i data-lucide="search" style="font-size: 16px;"></i> Pindai & Pulihkan Data Hilang
+            </button>
+            <p class="text-[11px] text-gray-500">Bila hasil pemindaian belum menemukan data yang hilang, buka juga website ini di browser/perangkat lama yang pernah dipakai sebelum kejadian — data utuh di perangkat tersebut akan tergabung otomatis ke cloud.</p>
           </div>`
         )}
       </div>
@@ -8708,6 +9157,7 @@ function submitAssignment(assignmentId) {
   const existing = db.submissions.find(s => s.assignmentId === assignmentId && s.studentId === student.id);
   const subData = {
     content, linkUrl, fileData, fileName, submissionType,
+    assignmentTitle: (a?.title || '').slice(0, 200), // jejak judul tugas — dipakai pemulihan bila hubungan putus
     status: 'DIKUMPULKAN', submittedAt: now()
   };
   if (existing) {
