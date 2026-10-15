@@ -554,6 +554,8 @@ function loadDB() {
   }
   // Migrasi ringan: pastikan field baru tersedia untuk database lama
   if (db && !Array.isArray(db.presentations)) db.presentations = [];
+  // Migrasi tombstone (Task 11): catatan penghapusan permanen untuk database lama
+  if (db && !Array.isArray(db.tombstones)) db.tombstones = [];
   // Migrasi akun Kepala Sekolah (role KEPSEK) — dibuat/dinaikkan otomatis bila belum ada
   if (db && ensureKepsekAccount()) { try { saveDB(); } catch (e) { /* abaikan */ } }
   if (recovered) {
@@ -627,10 +629,27 @@ function updateSyncIndicator() {
 }
 
 // Info senyap: data baru diterima dari latar belakang (TANPA render ulang — aman untuk form)
+// KECUALI halaman LIVE (Penilaian/Tugas/Nilai/Monitor LMS) — di sana perubahan submission,
+// nilai, atau penghapusan data HARUS tampil secara realtime sesuai kebutuhan guru & siswa.
+var _RS_LIVE_PAGES = ['penilaian', 'tugas', 'nilai', 'monitoring-lms'];
+function rsPageWantsLiveRefresh() {
+  try {
+    if (typeof uiState === 'undefined' || !uiState || !uiState.currentPage) return false;
+    return _RS_LIVE_PAGES.indexOf(uiState.currentPage) !== -1;
+  } catch (e) { return false; }
+}
 function rsNotifyNewData(source) {
   _rsNewDataAvail = true;
   updateSyncIndicator();
   if (!session) return;
+  // ===== REALTIME: halaman live di-refresh otomatis (rsApplyUI melindungi isian form
+  // & menunda bila modal terbuka/user sedang mengetik, jadi aman) =====
+  if (rsPageWantsLiveRefresh() && !document.hidden && !document.getElementById('live-room-overlay')) {
+    _rsNewDataAvail = false;
+    updateSyncIndicator();
+    rsScheduleUI(250); // debounce kecil — sekejap setelah data diterima, halaman menampilkan yang terbaru
+    return;
+  }
   const t = Date.now();
   if (t - _rsNotifyAt < 20000) return; // maksimal satu info per 20 detik
   _rsNotifyAt = t;
@@ -753,6 +772,8 @@ function rsApplyUI() {
     _rsRestoreFormValues(_savedForm);          // pulihkan isian — ketikan tidak hilang
     applyRoleVisibility();
     lucide.createIcons();
+    // Tampilan kini menampilkan data terbaru — indikator "data baru" padam
+    if (_rsNewDataAvail) { _rsNewDataAvail = false; updateSyncIndicator(); }
   } catch (e) { console.warn('[SYNC] Penyegaran tampilan gagal:', e && e.message); }
 }
 
@@ -764,6 +785,30 @@ function rsReloadFromStorage() {
   _rsLastSeenJson = raw;
   const parsed = parseDbJson(raw);
   if (!parsed) return false;                   // rusak — biarkan watchdog yang memulihkan
+  // ===== PENGAMAN TOMBSTONE: penulis storage bisa jadi tab/perangkat dengan data basi =====
+  // Catatan penghapusan yang KITA ketahui digabungkan (union) ke data masuk, lalu record yang
+  // sudah dihapus permanen dibuang — data terhapus tidak muncul lagi walau ditulis ulang tab basi.
+  let resurrectBlocked = 0;
+  try {
+    const localT = (db && Array.isArray(db.tombstones)) ? db.tombstones : [];
+    if (localT.length > 0) {
+      const mergedT = mergeTombstones(localT, Array.isArray(parsed.tombstones) ? parsed.tombstones : []);
+      parsed.tombstones = mergedT;
+      const set = new Set(mergedT.map(function(t) { return t.key; }));
+      if (set.size) {
+        Object.keys(parsed).forEach(function(k) {
+          if (k === 'tombstones' || !Array.isArray(parsed[k])) return;
+          const before = parsed[k].length;
+          parsed[k] = parsed[k].filter(function(r) {
+            const rid = r && r.id !== undefined && r.id !== null && r.id !== '' ? String(r.id) : null;
+            return !(rid !== null && set.has(tombKey(k, rid)));
+          });
+          resurrectBlocked += (before - parsed[k].length);
+        });
+        if (resurrectBlocked > 0) console.log('[SYNC] ' + resurrectBlocked + ' record terhapus dibuang dari tulisan tab lain (tombstone)');
+      }
+    }
+  } catch (e) { /* abaikan — pengaman jangan pernah menggagalkan adopsi */ }
   db = parsed;
   _dbFreshSeed = false; // data dari tab/proses lain adalah data nyata — bukan lagi seed bawaan
   rsNotifyNewData('tab lain');
@@ -1040,22 +1085,119 @@ function _recKey(r) {
   const id = (r.id !== undefined && r.id !== null && r.id !== '') ? r.id : null;
   return id === null ? null : String(id);
 }
-function mergeArrayAntiLoss(localArr, inArr) {
+
+/* ============================================================
+   TOMBSTONE — CATATAN PENGHAPUSAN PERMANEN (Task 11)
+   Setiap kali data dihapus lewat perintah hapus (tugas, materi,
+   pengumuman, user, dsb.), id-nya dicatat di db.tombstones lalu
+   ikut tersinkron ke cloud/backup/tab lain. Dengan begitu:
+   1) Data yang sudah dihapus TIDAK BISA muncul kembali dari
+      snapshot basi perangkat/tab lain (dibuang saat merge);
+   2) Penghapusan menyebar satu arah ke semua perangkat —
+      data tidak muncul lagi karena memang sudah dihapus.
+   ============================================================ */
+var TOMBSTONE_MAX = 4000; // batas catatan penghapusan yang disimpan (terbaru yang dipertahankan)
+
+function tombKey(col, id) { return col + ':' + String(id); }
+
+// Catat satu penghapusan (idempoten — panggil SEBELUM record dibuang dari db)
+function recordTombstone(col, id) {
+  if (!id && id !== 0) return;
+  if (!Array.isArray(db.tombstones)) db.tombstones = [];
+  const key = tombKey(col, id);
+  if (db.tombstones.some(function(t) { return t && t.key === key; })) return;
+  db.tombstones.push({ id: 'tmb_' + key, key: key, col: String(col), targetId: String(id), at: now() });
+  if (db.tombstones.length > TOMBSTONE_MAX) {
+    db.tombstones.sort(function(a, b) { return (b.at || '').localeCompare(a.at || ''); });
+    db.tombstones = db.tombstones.slice(0, TOMBSTONE_MAX);
+  }
+}
+
+// Himpunan kunci yang sudah dihapus permanen
+function _tombSet() {
+  const s = new Set();
+  (Array.isArray(db.tombstones) ? db.tombstones : []).forEach(function(t) {
+    if (t && t.key) s.add(t.key);
+    else if (t && t.targetId !== undefined && t.col) s.add(tombKey(t.col, t.targetId));
+  });
+  return s;
+}
+
+// Buang semua record yang ada di catatan penghapusan dari seluruh koleksi
+function applyTombstones(target) {
+  const root = target || db;
+  const set = _tombSet();
+  if (!set.size) return 0;
+  let removed = 0;
+  Object.keys(root).forEach(function(k) {
+    if (k === 'tombstones' || !Array.isArray(root[k])) return;
+    const filtered = root[k].filter(function(r) {
+      const rid = r && r.id !== undefined && r.id !== null && r.id !== '' ? String(r.id) : null;
+      if (rid !== null && set.has(tombKey(k, rid))) { removed++; return false; }
+      return true;
+    });
+    if (filtered.length !== root[k].length) root[k] = filtered;
+  });
+  return removed;
+}
+
+// Gabungkan catatan penghapusan dari dua sumber (union by key — waktu terlama menang agar penghapusan tetap hidup)
+function mergeTombstones(localArr, inArr) {
+  let out = (Array.isArray(localArr) ? localArr : []).filter(function(t) { return t && t.key; }).slice();
+  const idx = new Map();
+  out.forEach(function(t, i) { idx.set(t.key, i); });
+  (Array.isArray(inArr) ? inArr : []).forEach(function(t) {
+    if (!t || !t.key || !t.col || t.targetId === undefined) return;
+    const i = idx.get(t.key);
+    if (i === undefined) { idx.set(t.key, out.length); out.push({ id: t.id || ('tmb_' + t.key), key: t.key, col: t.col, targetId: t.targetId, at: t.at || now() }); return; }
+    if ((t.at || '') < (out[i].at || '')) out[i] = t; // catatan lebih awal menang (penghapusan paling awal tetap tercatat)
+  });
+  out.sort(function(a, b) { return (a.at || '').localeCompare(b.at || ''); });
+  if (out.length > TOMBSTONE_MAX) out = out.slice(out.length - TOMBSTONE_MAX); // simpan yang terbaru
+  return out;
+}
+
+function mergeArrayAntiLoss(localArr, inArr, colName) {
   const local = Array.isArray(localArr) ? localArr : [];
   const incoming = Array.isArray(inArr) ? inArr : [];
-  if (!incoming.length) return local.slice(); // snapshot tanpa isi → lokal utuh (anti kosong)
+  if (!incoming.length) {
+    // Tidak ada data masuk: buang record demo lokal yang tak dikenal cloud (mencegah demo tersebar)
+    if (colName && colName !== 'tombstones') return local.filter(function(r) { return !(r && r._seed); });
+    return local.slice();
+  }
+  // TOMBSTONE: record yang sudah dihapus permanen tidak boleh dihidupkan ulang oleh snapshot basi
+  let tomb = null;
+  if (colName && colName !== 'tombstones') {
+    const set = _tombSet();
+    if (set.size) tomb = set;
+  }
   const idx = new Map();
   local.forEach(function(r, i) { const k = _recKey(r); if (k !== null && !idx.has(k)) idx.set(k, i); });
-  const out = local.slice();
+  // ===== FILTER DATA DEMO (_seed) =====
+  // 1) Record demo lokal yang TIDAK dikenal sumber luar → buang dari hasil (demo tidak menyebar)
+  // 2) Record demo dari luar yang belum ada lokal → tidak diadopsi (database asli tidak ternodai)
+  // Record ASLI (tanpa tanda _seed) sepenuhnya mengikuti aturan anti-hilang seperti biasa.
+  const inIds = new Set();
+  incoming.forEach(function(r) { const k = _recKey(r); if (k !== null) inIds.add(k); });
+  const out = local.filter(function(r) {
+    if (r && r._seed) { const k = _recKey(r); return k !== null && inIds.has(k); }
+    return true;
+  });
+  // indeks dibangun ulang setelah penyaringan lokal
+  idx.clear();
+  out.forEach(function(r, i) { const k = _recKey(r); if (k !== null && !idx.has(k)) idx.set(k, i); });
   incoming.forEach(function(r) {
     const k = _recKey(r);
     if (k === null) {
+      if (r && r._seed) return; // demo tanpa id — buang
       // record tanpa id: tambah hanya bila belum ada yang identik
       const s = stableStringify(r);
       const dup = out.some(function(x) { return stableStringify(x) === s; });
       if (!dup) { out.push(r); }
       return;
     }
+    if (r && r._seed && !idx.has(k)) return; // demo baru dari luar — jangan adopsi
+    if (tomb && tomb.has(tombKey(colName, k))) return; // sudah dihapus permanen — jangan hidupkan lagi
     const i = idx.get(k);
     if (i === undefined) { idx.set(k, out.length); out.push(r); return; } // baru dari perangkat lain
     const cur = out[i];
@@ -1080,8 +1222,9 @@ function adoptCloudData(data) {
   _dbFreshSeed = false; // data nyata (cloud/backup) telah diterima — bukan lagi seed bawaan
   let changed = false;
   Object.keys(db).forEach(function(k) {
+    if (k === 'tombstones') return; // catatan penghapusan digabung khusus di bawah
     if (Array.isArray(db[k])) {
-      const merged = mergeArrayAntiLoss(db[k], data[k]);
+      const merged = mergeArrayAntiLoss(db[k], data[k], k);
       if (stableStringify(merged) !== stableStringify(db[k])) { db[k] = merged; changed = true; }
       return;
     }
@@ -1107,6 +1250,11 @@ function adoptCloudData(data) {
     if (db[k] === undefined && data[k] !== undefined && data[k] !== null) { db[k] = data[k]; changed = true; }
   });
   if (!Array.isArray(db.presentations)) db.presentations = [];
+  // ===== TOMBSTONE: gabungkan catatan penghapusan lalu terapkan secara permanen =====
+  if (!Array.isArray(db.tombstones)) db.tombstones = [];
+  const mergedT = mergeTombstones(db.tombstones, data.tombstones || []);
+  if (stableStringify(mergedT) !== stableStringify(db.tombstones)) { db.tombstones = mergedT; changed = true; }
+  if (applyTombstones()) changed = true; // record yang sudah dihapus permanen dibuang dari hasil gabungan
   // Migrasi akun Kepala Sekolah ikut digabung agar semua perangkat mendapat akun pengawas
   if (ensureKepsekAccount()) changed = true;
   if (changed) {
@@ -1968,6 +2116,261 @@ function runRecoveryUI() {
   });
 }
 
+/* ============================================================
+   PEMBERSIH DATA DEMO DUPLIKAT (Task 11)
+   Setiap browser baru yang membuka situs menjalankan data bawaan
+   (sekolah demo). Sebelum ada penanda _seed, run demo lama ikut
+   tergabung ke cloud sehingga users & data demo membanjiri
+   database. Alat ini MENDETEKSI run demo duplikat (gugus record
+   bawaan yang dibuat bersamaan setelah tanggal batas) dan
+   menghapusnya PERMANEN lewat sistem tombstone — data asli
+   sekolah (baseline sebelum tanggal batas) tidak disentuh.
+   ============================================================ */
+var _DEMO_RUN_EMAILS = [
+  'admin@smanejayaloka.sch.id', 'kepsek@smanejayaloka.sch.id',
+  'siti.guru@smanejayaloka.sch.id', 'ahmad.guru@smanejayaloka.sch.id',
+  'dewi.guru@smanejayaloka.sch.id', 'hendra.guru@smanejayaloka.sch.id',
+  'ratna.guru@smanejayaloka.sch.id', 'joko.guru@smanejayaloka.sch.id',
+  'sutrisno.tendik@smanejayaloka.sch.id', 'marlina.tendik@smanejayaloka.sch.id',
+  'budi.tendik@smanejayaloka.sch.id'
+];
+var _DEMO_CLEAN_COLS = ['users', 'teachers', 'tendiks', 'students', 'classes', 'courses', 'materials', 'assignments', 'submissions', 'grades', 'attendances', 'announcements', 'news', 'liveClasses', 'presentations'];
+
+function _tsMs(v) { const t = (typeof v === 'number') ? v : Date.parse(v); return isNaN(t) ? 0 : t; }
+
+function detectDemoRuns(cutoffMs) {
+  const centers = [];
+  (db.users || []).forEach(function(u) {
+    if (!u || !u.createdAt) return;
+    const ms = _tsMs(u.createdAt);
+    if (ms <= cutoffMs) return;
+    if (_DEMO_RUN_EMAILS.indexOf((u.email || '').toLowerCase()) === -1) return;
+    centers.push(ms);
+  });
+  centers.sort(function(a, b) { return a - b; });
+  const runs = [];
+  centers.forEach(function(ms) {
+    const last = runs[runs.length - 1];
+    if (last && ms - last.center < 5000) return; // satu run = pusat yang berdekatan
+    runs.push({ center: ms });
+  });
+  const out = [];
+  runs.forEach(function(run) {
+    let sig = 0;
+    (db.users || []).forEach(function(u) {
+      if (!u || !u.createdAt) return;
+      const ms = _tsMs(u.createdAt);
+      if (ms > cutoffMs && Math.abs(ms - run.center) <= 5000 && _DEMO_RUN_EMAILS.indexOf((u.email || '').toLowerCase()) !== -1) sig++;
+    });
+    if (sig < 5) return; // bukan pola run demo (kurang dari 5 akun bawaan dalam jendela waktu)
+    const cols = {};
+    let total = 0;
+    _DEMO_CLEAN_COLS.forEach(function(col) {
+      const recs = (db[col] || []).filter(function(r) {
+        if (!r || !r.createdAt) return false;
+        const ms = _tsMs(r.createdAt);
+        return ms > cutoffMs && Math.abs(ms - run.center) <= 5000;
+      });
+      if (recs.length) { cols[col] = recs.length; total += recs.length; }
+    });
+    if (total > 0) out.push({ center: run.center, sig: sig, cols: cols, total: total });
+  });
+  return out;
+}
+
+function deleteDemoRun(centerMs) {
+  const cutoffMs = _demoCutoffMs();
+  const run = detectDemoRuns(cutoffMs).find(function(r) { return r.center === centerMs; });
+  if (!run) { showToast('Tidak ditemukan', 'Run demo sudah tidak ada / sudah dihapus', 'info'); return; }
+  const d = new Date(centerMs);
+  confirmDialog('Hapus Run Data Demo Ini?', 'Seluruh <strong>' + run.total + ' record</strong> demo yang dibuat bersamaan pada ' +
+    d.toLocaleString('id-ID') + ' akan dihapus PERMANEN dari database & cloud (tidak muncul lagi). Data asli sekolah di luar gugus ini tidak tersentuh.', function() {
+    let removed = 0;
+    _DEMO_CLEAN_COLS.forEach(function(col) {
+      (db[col] || []).slice().forEach(function(r) {
+        if (!r || !r.createdAt) return;
+        const ms = _tsMs(r.createdAt);
+        if (ms > cutoffMs && Math.abs(ms - centerMs) <= 5000) {
+          recordTombstone(col, r.id);
+          db[col] = db[col].filter(function(x) { return x !== r; });
+          removed++;
+        }
+      });
+    });
+    db.logs.push({ id: uid('log'), userId: (getCurrentUser() || {}).id, action: 'BERSIHKAN DATA DEMO', detail: removed + ' record demo duplikat dihapus permanen (pusat ' + d.toISOString() + ')', createdAt: now() });
+    saveDB();
+    showToast('Data demo dibersihkan', removed + ' record duplikat dihapus permanen & tersinkron ke semua perangkat', 'success');
+    refreshMainContent();
+  }, 'Ya, Hapus Permanen');
+}
+
+function _demoCutoffMs() {
+  const el = document.getElementById('demo-cutoff');
+  const v = el && el.value ? el.value : '2026-10-13T00:00';
+  const t = new Date(v).getTime();
+  return isNaN(t) ? Date.parse('2026-10-13T00:00:00') : t;
+}
+
+/* Deteksi duplikat data siswa: record siswa dengan NIS sama lebih dari satu.
+   Record TERHUBUNG (dirujuk pengumpulan/nilai/absensi/punya akun user) dipertahankan;
+   duplikat TAK TERHUBUNG aman dihapus permanen. */
+function _studentRefCount(stdId) {
+  let n = 0;
+  n += db.submissions.filter(function(s) { return s.studentId === stdId; }).length;
+  n += db.grades.filter(function(g) { return g.studentId === stdId; }).length;
+  n += (db.attendances || []).filter(function(a) { return a.studentId === stdId; }).length;
+  if (db.users.some(function(u) { return u.id === (db.students.find(function(s) { return s.id === stdId; }) || {}).userId; })) n += 1;
+  return n;
+}
+
+function detectDuplicateStudents() {
+  const groups = new Map();
+  db.students.forEach(function(s) {
+    const key = String(s.nis || s.nisn || ('nama:' + (s.name || ''))).trim();
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(s);
+  });
+  const out = [];
+  groups.forEach(function(list, key) {
+    if (list.length < 2) return;
+    const withRefs = list.filter(function(s) { return _studentRefCount(s.id) > 0; });
+    const orphan = list.filter(function(s) { return _studentRefCount(s.id) === 0; });
+    out.push({ key: key, name: (list[0].name || ''), total: list.length, keep: withRefs.length, orphanIds: orphan.map(function(s) { return s.id; }) });
+  });
+  out.sort(function(a, b) { return b.orphanIds.length - a.orphanIds.length; });
+  return out;
+}
+
+function deleteOrphanStudentDupes(key) {
+  const group = detectDuplicateStudents().find(function(g) { return g.key === key; });
+  if (!group || !group.orphanIds.length) { showToast('Tidak ada yang perlu dihapus', 'Semua duplikat pada kelompok ini terhubung data', 'info'); return; }
+  confirmDialog('Hapus Duplikat Siswa Tak Terhubung?', 'Kelompok <strong>' + group.name + '</strong> (NIS ' + group.key + ') memiliki ' + group.total +
+    ' record duplikat. <strong>' + group.keep + ' record terhubung</strong> (punya pengumpulan/nilai/absensi/akun) DIPERTAHANKAN, sedangkan <strong>' + group.orphanIds.length +
+    ' duplikat tak terhubung</strong> akan dihapus PERMANEN (tombstone — tidak muncul lagi di semua perangkat).', function() {
+    let removed = 0;
+    group.orphanIds.forEach(function(id) {
+      recordTombstone('students', id);
+      db.students = db.students.filter(function(s) { return s.id !== id; });
+      removed++;
+    });
+    db.logs.push({ id: uid('log'), userId: (getCurrentUser() || {}).id, action: 'BERSIHKAN DUPLIKAT SISWA', detail: removed + ' duplikat tak terhubung dihapus permanen (NIS ' + key + ')', createdAt: now() });
+    saveDB();
+    showToast('Duplikat siswa dibersihkan', removed + ' record dihapus permanen & tersinkron', 'success');
+    refreshMainContent();
+  }, 'Ya, Hapus Permanen');
+}
+
+/* Deteksi duplikat GURU/TENDIK: record dengan NIP sama lebih dari satu.
+   Record TERHUBUNG (dirujuk mapel/akun user) dipertahankan; duplikat tak terhubung aman dihapus. */
+function _staffRefCount(col, rec) {
+  let n = 0;
+  if (col === 'teachers') n += db.courses.filter(function(c) { return c.teacherId === rec.id; }).length;
+  if (rec.userId && db.users.some(function(u) { return u.id === rec.userId; })) n += 1;
+  return n;
+}
+
+function detectDuplicateStaff() {
+  const out = [];
+  [['teachers', 'Guru'], ['tendiks', 'Tendik']].forEach(function(pair) {
+    const col = pair[0], label = pair[1];
+    const groups = new Map();
+    (db[col] || []).forEach(function(t) {
+      const key = String(t.nip || t.email || ('nama:' + (t.name || ''))).trim();
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t);
+    });
+    groups.forEach(function(list, key) {
+      if (list.length < 2) return;
+      const keep = list.filter(function(t) { return _staffRefCount(col, t) > 0; }).length;
+      const orphanIds = list.filter(function(t) { return _staffRefCount(col, t) === 0; }).map(function(t) { return t.id; });
+      out.push({ col: col, label: label, key: key, name: (list[0].name || ''), total: list.length, keep: keep, orphanIds: orphanIds });
+    });
+  });
+  out.sort(function(a, b) { return b.orphanIds.length - a.orphanIds.length; });
+  return out;
+}
+
+function deleteOrphanStaffDupes(col, key) {
+  const group = detectDuplicateStaff().find(function(g) { return g.col === col && g.key === key; });
+  if (!group || !group.orphanIds.length) { showToast('Tidak ada yang perlu dihapus', 'Semua duplikat pada kelompok ini terhubung data', 'info'); return; }
+  confirmDialog('Hapus Duplikat ' + group.label + ' Tak Terhubung?', 'Kelompok <strong>' + group.name + '</strong> (NIP ' + group.key + ') memiliki ' + group.total +
+    ' record duplikat. <strong>' + group.keep + ' record terhubung</strong> (mengampu mapel / punya akun) DIPERTAHANKAN, sedangkan <strong>' + group.orphanIds.length +
+    ' duplikat tak terhubung</strong> akan dihapus PERMANEN (tombstone).', function() {
+    let removed = 0;
+    group.orphanIds.forEach(function(id) {
+      recordTombstone(col, id);
+      db[col] = db[col].filter(function(t) { return t.id !== id; });
+      removed++;
+    });
+    db.logs.push({ id: uid('log'), userId: (getCurrentUser() || {}).id, action: 'BERSIHKAN DUPLIKAT STAF', detail: removed + ' duplikat ' + group.label + ' tak terhubung dihapus permanen (NIP ' + key + ')', createdAt: now() });
+    saveDB();
+    showToast('Duplikat ' + group.label + ' dibersihkan', removed + ' record dihapus permanen & tersinkron', 'success');
+    refreshMainContent();
+  }, 'Ya, Hapus Permanen');
+}
+
+function scanDemoRunsUI() {
+  const cutoffMs = _demoCutoffMs();
+  const runs = detectDemoRuns(cutoffMs);
+  const cutoffLabel = new Date(cutoffMs).toLocaleString('id-ID');
+  let body = `
+    <div class="p-3 rounded-lg bg-amber-50 border border-amber-200 mb-3">
+      <p class="text-xs text-amber-700"><i data-lucide="info" style="font-size: 14px; display: inline;"></i>
+      <strong>Cara kerja:</strong> alat ini mencari gugus data demo bawaan (akun & record contoh yang dibuat serentak oleh browser baru)
+      yang dibuat <b>setelah</b> tanggal batas <b>${cutoffLabel}</b>, lalu menghapusnya permanen lewat tombstone — tersinkron ke semua perangkat & cloud.
+      Data asli sekolah sebelum tanggal batas <b>tidak disentuh</b>. Perkecil tanggal batas bila ada data asli yang dibuat setelahnya.</p>
+    </div>
+    <div class="mb-3">
+      <label class="block text-xs font-medium text-gray-600 mb-1">Tanggal batas (data sebelum tanggal ini dipertahankan)</label>
+      <input type="datetime-local" id="demo-cutoff" value="${document.getElementById('demo-cutoff')?.value || '2026-10-13T00:00'}" class="px-3 py-2 border rounded-md text-sm w-full">
+    </div>
+  `;
+  if (!runs.length) {
+    body += '<div class="p-4 rounded-lg bg-emerald-50 border border-emerald-200 text-center"><i data-lucide="check-circle" class="text-emerald-500 mx-auto mb-2" style="font-size:28px;"></i><p class="text-sm font-medium text-emerald-700">Tidak ditemukan run data demo duplikat</p><p class="text-xs text-gray-500 mt-1">Database bersih — tidak ada gugus data bawaan setelah tanggal batas.</p></div>';
+  } else {
+    body += '<div class="space-y-2">' + runs.map(function(r) {
+      const det = Object.keys(r.cols).map(function(k) { return k + ': ' + r.cols[k]; }).join(' • ');
+      return '<div class="p-3 rounded-lg border bg-white">' +
+        '<div class="flex items-center justify-between gap-2 flex-wrap"><div>' +
+        '<p class="text-sm font-semibold text-gray-800">' + new Date(r.center).toLocaleString('id-ID') + '</p>' +
+        '<p class="text-xs text-gray-500">' + r.total + ' record (' + r.sig + ' akun bawaan) — ' + det + '</p>' +
+        '</div>' +
+        '<button onclick="deleteDemoRun(' + r.center + ')" class="px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white rounded-md text-xs font-medium flex-shrink-0">Hapus Permanen</button>' +
+        '</div></div>';
+    }).join('') + '</div>';
+  }
+  // ===== SEKSI DUPLIKAT SISWA (record siswa lama tidak punya createdAt — dideteksi lewat NIS kembar) =====
+  const dupes = detectDuplicateStudents();
+  if (dupes.length) {
+    const totalOrphan = dupes.reduce(function(n, g) { return n + g.orphanIds.length; }, 0);
+    body += '<h4 class="text-sm font-bold text-gray-800 mt-4 mb-2 flex items-center gap-1"><i data-lucide="copy" class="text-rose-500" style="font-size:15px;"></i> Duplikat Data Siswa (' + dupes.length + ' kelompok, ' + totalOrphan + ' duplikat tak terhubung)</h4>' +
+      '<p class="text-[11px] text-gray-500 mb-2">Record siswa dengan NIS sama muncul lebih dari satu (akibat run demo lama). Yang <b>terhubung</b> pengumpulan/nilai/absensi/akun dipertahankan — duplikat <b>tak terhubung</b> aman dihapus permanen.</p>' +
+      '<div class="space-y-2 max-h-56 overflow-y-auto">' + dupes.map(function(g) {
+        return '<div class="p-2.5 rounded-lg border bg-white flex items-center justify-between gap-2 flex-wrap">' +
+          '<div><p class="text-xs font-semibold text-gray-800">' + g.name + ' — NIS ' + g.key + '</p>' +
+          '<p class="text-[11px] text-gray-500">' + g.total + ' record: ' + g.keep + ' terhubung (dipertahankan) • ' + g.orphanIds.length + ' tak terhubung</p></div>' +
+          (g.orphanIds.length ? '<button onclick="deleteOrphanStudentDupes(\'' + g.key + '\')" class="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded-md text-[11px] font-medium flex-shrink-0">Hapus ' + g.orphanIds.length + ' Duplikat</button>' : '<span class="text-[11px] text-emerald-600 font-medium flex-shrink-0">Semua terhubung</span>') +
+          '</div>';
+      }).join('') + '</div>';
+  }
+  // ===== SEKSI DUPLIKAT GURU / TENDIK (NIP kembar akibat run demo lama) =====
+  const staffDupes = detectDuplicateStaff();
+  if (staffDupes.length) {
+    const totalStaffOrphan = staffDupes.reduce(function(n, g) { return n + g.orphanIds.length; }, 0);
+    body += '<h4 class="text-sm font-bold text-gray-800 mt-4 mb-2 flex items-center gap-1"><i data-lucide="copy" class="text-rose-500" style="font-size:15px;"></i> Duplikat Guru / Tendik (' + staffDupes.length + ' kelompok, ' + totalStaffOrphan + ' duplikat tak terhubung)</h4>' +
+      '<div class="space-y-2 max-h-56 overflow-y-auto">' + staffDupes.map(function(g) {
+        return '<div class="p-2.5 rounded-lg border bg-white flex items-center justify-between gap-2 flex-wrap">' +
+          '<div><p class="text-xs font-semibold text-gray-800">' + g.name + ' — ' + g.label + ', NIP ' + g.key + '</p>' +
+          '<p class="text-[11px] text-gray-500">' + g.total + ' record: ' + g.keep + ' terhubung (dipertahankan) • ' + g.orphanIds.length + ' tak terhubung</p></div>' +
+          (g.orphanIds.length ? '<button onclick="deleteOrphanStaffDupes(\'' + g.col + '\',\'' + g.key + '\')" class="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded-md text-[11px] font-medium flex-shrink-0">Hapus ' + g.orphanIds.length + ' Duplikat</button>' : '<span class="text-[11px] text-emerald-600 font-medium flex-shrink-0">Semua terhubung</span>') +
+          '</div>';
+      }).join('') + '</div>';
+  }
+  showModal('Pembersih Data Demo Duplikat', body,
+    btn('Tutup', 'closeModal()', { variant: 'outline' }) + btn('Pindai Ulang', 'scanDemoRunsUI()', { icon: 'refresh-cw' }),
+    'max-w-xl');
+}
+
 function recoverMissingData() {
   const sink = {};            // { koleksi: { id: record } } kandidat dari semua sumber
   const info = { orphanChunks: 0, salvaged: 0, sources: [] };
@@ -2588,7 +2991,8 @@ function seedDatabase() {
     },
     users: [], teachers: [], tendiks: [], students: [],
     classes: [], courses: [], materials: [], assignments: [],
-    submissions: [], grades: [], attendances: [], announcements: [], news: [], logs: [], liveClasses: [], presentations: []
+    submissions: [], grades: [], attendances: [], announcements: [], news: [], logs: [], liveClasses: [], presentations: [],
+    tombstones: [] // catatan penghapusan permanen — cegah data terhapus muncul lagi dari snapshot basi
   };
 
   // Super Admin
@@ -2710,7 +3114,7 @@ function seedDatabase() {
       id: uid('std'), userId, nis, nisn: '00' + String(12345001 + i), name, email, gender,
       parentName: 'Orang Tua ' + name.split(' ')[0],
       parentPhone: '08' + Math.floor(1000000000 + Math.random() * 9000000000),
-      classId: db.classes[classAssign[i]].id, status: 'AKTIF'
+      classId: db.classes[classAssign[i]].id, status: 'AKTIF', createdAt: now()
     });
   });
 
@@ -2815,6 +3219,15 @@ function seedDatabase() {
       id: uid('nws'), title: n.title, excerpt: n.excerpt, content: n.content,
       category: 'BERITA', publishedAt: now(), authorId: adminId, isPublished: true, createdAt: now()
     });
+  });
+
+  // ===== PENANDA DATA DEMO (Task 11) =====
+  // Semua record bawaan pabrik diberi tanda _seed:true. Merge anti-hilang memakai
+  // tanda ini agar data demo TIDAK PERNAH menyebar ke cloud/database asli ketika
+  // browser baru membuka situs (penyebab users & data demo membanjiri database),
+  // sementara record asli buatan pengguna tetap terlindungi penuh anti-hilang.
+  Object.keys(db).forEach(function(k) {
+    if (Array.isArray(db[k])) db[k].forEach(function(r) { if (r && typeof r === 'object' && !r._seed) r._seed = true; });
   });
 
   return db;
@@ -3553,7 +3966,7 @@ function buildMonitorLmsHTML() {
   const orphanAsgs = db.assignments.filter(a => !db.courses.some(c => c.id === a.courseId));
   const orphanSubs = db.submissions.filter(s => !db.assignments.some(a => a.id === s.assignmentId));
   const subsNoStudent = db.submissions.filter(s => !db.students.some(st => st.id === s.studentId));
-  const lmsActions = ['SUBMIT TUGAS', 'GABUNG LIVE CLASS', 'TAMBAH MAPEL', 'UPDATE MAPEL', 'HAPUS MAPEL', 'TAMBAH MATERI', 'UPDATE MATERI'];
+  const lmsActions = ['SUBMIT TUGAS', 'GABUNG LIVE CLASS', 'TAMBAH MAPEL', 'UPDATE MAPEL', 'HAPUS MAPEL', 'TAMBAH MATERI', 'UPDATE MATERI', 'TAMBAH BEBAN MENGAJAR', 'UPDATE BEBAN MENGAJAR'];
   const recentLogs = db.logs.filter(l => lmsActions.includes(l.action)).slice(-14).reverse();
 
   const perCourse = courses.map(c => {
@@ -5676,6 +6089,22 @@ window.ADMIN_PAGES = {
             <p class="text-[11px] text-gray-500">Bila hasil pemindaian belum menemukan data yang hilang, buka juga website ini di browser/perangkat lama yang pernah dipakai sebelum kejadian — data utuh di perangkat tersebut akan tergabung otomatis ke cloud.</p>
           </div>`
         )}
+
+        ${dataCard('Pembersih Data Demo Duplikat', 'Hapus permanen gugus data bawaan yang menumpuk di database', 'eraser',
+          `<div class="space-y-3">
+            <div class="p-3 rounded-lg bg-rose-50 border border-rose-200">
+              <p class="text-xs text-rose-700"><i data-lucide="alert-triangle" style="font-size: 14px; display: inline;"></i> <strong>Untuk apa:</strong> setiap browser baru yang membuka situs pernah menambahkan satu set data contoh (akun demo, siswa & tugas contoh) ke database. Alat ini mendeteksi gugus data contoh tersebut dan menghapusnya <b>permanen</b> (tersinkron ke semua perangkat & cloud). Data asli sekolah sebelum tanggal batas tidak disentuh.</p>
+            </div>
+            <div class="grid grid-cols-3 gap-2 text-center">
+              <div class="p-2 rounded-lg border"><p class="text-lg font-bold text-gray-700">${db.users.length}</p><p class="text-[10px] text-gray-500">Users</p></div>
+              <div class="p-2 rounded-lg border"><p class="text-lg font-bold text-gray-700">${db.students.length}</p><p class="text-[10px] text-gray-500">Siswa</p></div>
+              <div class="p-2 rounded-lg border"><p class="text-lg font-bold text-gray-700">${(db.tombstones || []).length}</p><p class="text-[10px] text-gray-500">Catatan Hapus</p></div>
+            </div>
+            <button onclick="scanDemoRunsUI()" class="w-full px-4 py-3 bg-rose-600 hover:bg-rose-700 text-white rounded-md text-sm font-medium flex items-center justify-center gap-2">
+              <i data-lucide="eraser" style="font-size: 16px;"></i> Pindai Data Demo Duplikat
+            </button>
+          </div>`
+        )}
       </div>
 
       <div class="bg-white rounded-2xl border-0 shadow-md p-6">
@@ -6227,10 +6656,10 @@ function saveUser(e, userId) {
     Object.assign(u, { name, email, gender, phone, birthPlace, birthDate, address });
     if (password) u.password = password;
     if (role === 'SISWA') { u.nis = idnum; if (nisn) u.nisn = nisn; } else u.nip = idnum;
-    // Bersihkan data role lama jika role akun diubah
-    if (role !== 'GURU') db.teachers = db.teachers.filter(t => t.userId !== userId);
-    if (role !== 'TENDIK') db.tendiks = db.tendiks.filter(t => t.userId !== userId);
-    if (role !== 'SISWA') db.students = db.students.filter(s => s.userId !== userId);
+    // Bersihkan data role lama jika role akun diubah (dicatat tombstone agar tak bangkit dari snapshot basi)
+    if (role !== 'GURU') { db.teachers.filter(t => t.userId === userId).forEach(t => recordTombstone('teachers', t.id)); db.teachers = db.teachers.filter(t => t.userId !== userId); }
+    if (role !== 'TENDIK') { db.tendiks.filter(t => t.userId === userId).forEach(t => recordTombstone('tendiks', t.id)); db.tendiks = db.tendiks.filter(t => t.userId !== userId); }
+    if (role !== 'SISWA') { db.students.filter(s => s.userId === userId).forEach(s => recordTombstone('students', s.id)); db.students = db.students.filter(s => s.userId !== userId); }
   } else {
     if (db.users.find(u => u.email === email)) {
       showToast('Email sudah terdaftar', 'Gunakan email lain untuk akun baru ini', 'error');
@@ -6277,6 +6706,10 @@ function saveUser(e, userId) {
 function deleteUser(id) {
   const u = db.users.find(x => x.id === id);
   confirmDialog('Hapus User', 'Yakin ingin menghapus <strong>' + u.name + '</strong>? Tindakan ini tidak dapat dibatalkan.', () => {
+    recordTombstone('users', id);
+    db.teachers.filter(t => t.userId === id).forEach(t => recordTombstone('teachers', t.id));
+    db.tendiks.filter(t => t.userId === id).forEach(t => recordTombstone('tendiks', t.id));
+    db.students.filter(s => s.userId === id).forEach(s => recordTombstone('students', s.id));
     db.users = db.users.filter(x => x.id !== id);
     db.teachers = db.teachers.filter(t => t.userId !== id);
     db.tendiks = db.tendiks.filter(t => t.userId !== id);
@@ -6680,6 +7113,128 @@ function saveKelas(e, classId) {
   refreshMainContent();
 }
 
+/* ============ BEBAN MENGAJAR SELF-SERVICE (Guru: tambah sendiri mapel yang diampu + kelas yang diajar) ============ */
+function _guruSelfTeacher() {
+  const user = getCurrentUser();
+  if (!user) return null;
+  return db.teachers.find(t => t.userId === user.id) || null;
+}
+
+function openGuruMapelForm(courseId) {
+  const teacher = _guruSelfTeacher();
+  if (!teacher) { showToast('Profil guru tidak ditemukan', 'Akun Anda belum terhubung ke data guru. Hubungi Super Admin untuk menautkannya.', 'error'); return; }
+  if (!db.classes.length) { showToast('Belum ada kelas', 'Belum ada kelas di database. Hubungi Super Admin untuk membuat kelas terlebih dahulu.', 'warning'); return; }
+  const c = courseId ? db.courses.find(x => x.id === courseId) : null;
+  if (courseId && (!c || c.teacherId !== teacher.id)) { showToast('Tidak diizinkan', 'Anda hanya dapat mengubah beban mengajar milik Anda sendiri', 'error'); return; }
+  const body = `
+    <form id="guru-mapel-form" onsubmit="saveGuruMapel(event, '${courseId || ''}')" class="space-y-4">
+      <div class="p-3 rounded-lg bg-emerald-50 border border-emerald-100 text-xs text-emerald-800 flex items-start gap-2">
+        <i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i>
+        <span>Beban mengajar akan tercatat atas nama <b>${teacher.name}</b>${teacher.subject ? ' (mapel utama: ' + teacher.subject + ')' : ''}. Pilih satu atau beberapa kelas sekaligus — Super Admin dapat memeriksa serta menyesuaikannya di menu Kelas &amp; Mapel.</span>
+      </div>
+      <div class="grid grid-cols-3 gap-3">
+        ${field('Kode', inputText('gmf-code', c?.code || '', { placeholder: 'MAT', required: true }))}
+        <div class="col-span-2">${field('Nama Mata Pelajaran', inputText('gmf-name', c?.name || teacher.subject || '', { placeholder: 'Matematika', required: true }))}</div>
+      </div>
+      ${c
+        ? field('Kelas yang Diajar', selectField('gmf-class', db.classes.map(cl => ({ value: cl.id, label: cl.name })), c.classId))
+        : `<div><label class="block text-sm font-medium mb-1">Kelas yang Diajar <span class="text-red-500">*</span> <span class="text-xs font-normal text-gray-400">(boleh pilih lebih dari satu)</span></label>
+           <div class="max-h-44 overflow-y-auto border rounded-md p-2 grid grid-cols-1 sm:grid-cols-2 gap-1">
+             ${db.classes.map(cl => `<label class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer text-sm"><input type="checkbox" class="gmf-cls rounded" value="${cl.id}"><span>${cl.name}</span></label>`).join('')}
+           </div></div>`}
+      ${field('Jadwal Mengajar', inputText('gmf-schedule', c?.schedule || '', { placeholder: 'Senin 08:00-09:30' }))}
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        ${field('Semester', selectField('gmf-semester', [{ value: 'GANJIL', label: 'Ganjil' }, { value: 'GENAP', label: 'Genap' }], c?.semester || 'GANJIL'))}
+        ${field('Tahun Ajaran', inputText('gmf-year', c?.academicYear || '2025/2026', { placeholder: '2025/2026' }))}
+      </div>
+      <div id="gmf-hint"></div>
+    </form>
+  `;
+  showModal(courseId ? 'Edit Beban Mengajar' : 'Tambah Beban Mengajar', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + btn('Simpan', "submitForm('guru-mapel-form')"));
+  setTimeout(() => {
+    document.querySelectorAll('.gmf-cls').forEach(el => el.addEventListener('change', updateGuruMapelHint));
+    ['gmf-name', 'gmf-code', 'gmf-class'].forEach(idf => {
+      const el = document.getElementById(idf);
+      if (el) { el.addEventListener('change', updateGuruMapelHint); el.addEventListener('input', updateGuruMapelHint); }
+    });
+    updateGuruMapelHint();
+  }, 60);
+}
+
+/* Info dinamis form beban mengajar guru: ringkasan beban saat ini + deteksi duplikat + saran kode */
+function updateGuruMapelHint() {
+  const box = document.getElementById('gmf-hint');
+  const form = document.getElementById('guru-mapel-form');
+  if (!box || !form) return;
+  const teacher = _guruSelfTeacher();
+  if (!teacher) { box.innerHTML = ''; return; }
+  const name = (document.getElementById('gmf-name')?.value || '').trim();
+  const m = /saveGuruMapel\(event, '([^']*)'\)/.exec(form.getAttribute('onsubmit') || '');
+  const editId = m ? m[1] : '';
+  const load = getTeacherTeachingLoad(teacher.id);
+  const others = db.courses.filter(x => x.id !== editId);
+  const classIds = editId
+    ? (document.getElementById('gmf-class')?.value ? [document.getElementById('gmf-class').value] : [])
+    : Array.from(document.querySelectorAll('.gmf-cls:checked')).map(x => x.value);
+  let html = '<div class="text-xs space-y-1 p-3 rounded-lg bg-gray-50 border border-gray-100">';
+  html += '<p>Saat ini Anda mengampu <span class="font-medium">' + load.totalCourses + '</span> kelas / <span class="font-medium' + (load.isMultiSubject ? ' text-emerald-600' : '') + '">' + load.distinctSubjects.length + '</span> mata pelajaran' + (load.totalCourses ? ' (' + load.distinctSubjects.join(', ') + ')' : '') + '.</p>';
+  const dups = [];
+  classIds.forEach(cid => {
+    const cls = db.classes.find(x => x.id === cid);
+    const dup = name ? others.find(x => x.classId === cid && (x.name || '').trim().toLowerCase() === name.toLowerCase()) : null;
+    if (dup) dups.push('<span class="text-red-600 font-medium">&quot;' + dup.name + '&quot; sudah ada di kelas ' + (cls?.name || '-') + ' (diajar ' + (db.teachers.find(x => x.id === dup.teacherId)?.name || '-') + ') — akan dilewati</span>');
+  });
+  if (dups.length) html += '<p>' + dups.join('<br>') + '</p>';
+  else if (!editId && classIds.length) html += '<p class="text-emerald-600">' + classIds.length + ' kelas dipilih: ' + classIds.map(cid => (db.classes.find(x => x.id === cid) || {}).name || '-').join(', ') + '.</p>';
+  html += '</div>';
+  box.innerHTML = html;
+  /* Saran kode otomatis bila kolom kode masih kosong */
+  const codeEl = document.getElementById('gmf-code');
+  if (codeEl && !codeEl.value && name.length >= 3) codeEl.placeholder = (name.replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase()) || 'MAT';
+}
+
+function saveGuruMapel(e, courseId) {
+  e.preventDefault();
+  const teacher = _guruSelfTeacher();
+  if (!teacher) { showToast('Profil guru tidak ditemukan', 'Akun Anda belum terhubung ke data guru. Hubungi Super Admin.', 'error'); return; }
+  const name = (document.getElementById('gmf-name').value || '').trim();
+  const code = (document.getElementById('gmf-code').value || '').trim().toUpperCase();
+  const schedule = (document.getElementById('gmf-schedule').value || '').trim();
+  const semester = document.getElementById('gmf-semester').value;
+  const academicYear = (document.getElementById('gmf-year').value || '').trim();
+  if (!name || !code) { showToast('Data belum lengkap', 'Nama dan kode mata pelajaran wajib diisi', 'error'); return; }
+  const user = getCurrentUser();
+  if (courseId) {
+    const cur = db.courses.find(x => x.id === courseId);
+    if (!cur || cur.teacherId !== teacher.id) { showToast('Tidak diizinkan', 'Anda hanya dapat mengubah beban mengajar milik Anda sendiri', 'error'); return; }
+    const classId = (document.getElementById('gmf-class') || {}).value || cur.classId;
+    const cls = db.classes.find(x => x.id === classId);
+    const dup = db.courses.find(x => x.id !== courseId && x.classId === classId && (x.name || '').trim().toLowerCase() === name.toLowerCase());
+    if (dup) { showToast('Mapel sudah ada', name + ' sudah diajar di kelas ' + (cls?.name || '-') + ' oleh ' + ((db.teachers.find(x => x.id === dup.teacherId) || {}).name || '-'), 'error'); return; }
+    Object.assign(cur, { name, code, classId, schedule, semester, academicYear, updatedAt: now() });
+    db.logs.push({ id: uid('log'), userId: user?.id, action: 'UPDATE BEBAN MENGAJAR', detail: teacher.name + ' memperbarui beban mengajarnya: ' + name + ' (' + code + ') kelas ' + (cls?.name || '-'), createdAt: now() });
+    showToast('Beban mengajar diperbarui', name + ' • Kelas ' + (cls?.name || '-'), 'success');
+  } else {
+    const checked = Array.from(document.querySelectorAll('.gmf-cls:checked')).map(x => x.value);
+    if (!checked.length) { showToast('Kelas belum dipilih', 'Pilih minimal satu kelas yang Anda ajari mata pelajaran ini', 'error'); return; }
+    const added = [], skipped = [];
+    checked.forEach(classId => {
+      const cls = db.classes.find(x => x.id === classId);
+      const dup = db.courses.find(x => x.classId === classId && (x.name || '').trim().toLowerCase() === name.toLowerCase());
+      if (dup) { skipped.push(cls?.name || classId); return; }
+      db.courses.push({ id: uid('crs'), name, code, teacherId: teacher.id, classId, schedule, semester, academicYear, description: 'Mata pelajaran ' + name, createdAt: now(), updatedAt: now() });
+      added.push(cls?.name || classId);
+    });
+    if (!added.length) { showToast('Tidak ada yang ditambahkan', name + ' sudah diajar di kelas yang Anda pilih: ' + skipped.join(', '), 'warning'); return; }
+    db.logs.push({ id: uid('log'), userId: user?.id, action: 'TAMBAH BEBAN MENGAJAR', detail: teacher.name + ' menambah beban mengajarnya: ' + name + ' (' + code + ') di kelas ' + added.join(', ') + (skipped.length ? ' — dilewati (sudah ada): ' + skipped.join(', ') : ''), createdAt: now() });
+    showToast('Beban mengajar ditambahkan', name + ' (' + code + ') di ' + added.length + ' kelas: ' + added.join(', ') + (skipped.length ? ' • ' + skipped.length + ' kelas dilewati' : ''), 'success');
+  }
+  saveDB();
+  closeModal();
+  refreshMainContent();
+}
+
 /* ============ MAPEL & GURU PENGAMPU FORM (Super Admin: Kelas & Mapel) ============ */
 function openMapelForm(courseId, presetClassId) {
   const c = courseId ? db.courses.find(x => x.id === courseId) : null;
@@ -6776,9 +7331,16 @@ function saveMapel(e, courseId) {
 function deleteMapel(courseId) {
   const c = db.courses.find(x => x.id === courseId);
   if (!c) return;
+  /* Guru hanya boleh menghapus beban mengajar miliknya sendiri; Super Admin/Tendik bebas */
+  const _uDel = getCurrentUser();
+  if (_uDel && _uDel.role === 'GURU') {
+    const _tDel = db.teachers.find(t => t.userId === _uDel.id);
+    if (!_tDel || c.teacherId !== _tDel.id) { showToast('Tidak diizinkan', 'Anda hanya dapat menghapus beban mengajar milik Anda sendiri', 'error'); return; }
+  }
   const cls = db.classes.find(x => x.id === c.classId);
   const t = db.teachers.find(x => x.id === c.teacherId);
   confirmDialog('Hapus Mata Pelajaran', 'Yakin ingin menghapus <strong>' + c.name + '</strong> (Kelas ' + (cls?.name || '-') + ', guru ' + (t?.name || '-') + ')? Materi, tugas, dan nilai terkait mapel ini tidak ikut terhapus.', () => {
+    recordTombstone('courses', courseId);
     db.courses = db.courses.filter(x => x.id !== courseId);
     const user = getCurrentUser();
     db.logs.push({ id: uid('log'), userId: user?.id, action: 'HAPUS MAPEL', detail: 'Hapus mapel ' + c.name + ' dari kelas ' + (cls?.name || '-'), createdAt: now() });
@@ -7090,6 +7652,7 @@ function saveAnnouncement(e, id) {
 
 function deleteAnnouncement(id) {
   confirmDialog('Hapus Pengumuman', 'Yakin ingin menghapus pengumuman ini?', () => {
+    recordTombstone('announcements', id);
     db.announcements = db.announcements.filter(a => a.id !== id);
     saveDB();
     showToast('Pengumuman dihapus', '', 'success');
@@ -7138,6 +7701,7 @@ function saveNews(e, id) {
 
 function deleteNews(id) {
   confirmDialog('Hapus Berita', 'Yakin ingin menghapus berita ini?', () => {
+    recordTombstone('news', id);
     db.news = db.news.filter(n => n.id !== id);
     saveDB();
     showToast('Berita dihapus', '', 'success');
@@ -7498,7 +8062,7 @@ window.GURU_PAGES = {
       </div>
       <div class="grid lg:grid-cols-2 gap-6">
         ${dataCard('Mata Pelajaran Saya', 'Kelas yang Anda ampu', 'book-open',
-          courses.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Belum ada mata pelajaran</p>' :
+          courses.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Belum ada mata pelajaran — klik tombol Tambah untuk mengisi beban mengajar Anda</p>' :
           '<div class="space-y-2">' + courses.map(c => {
             const cls = db.classes.find(cl => cl.id === c.classId);
             return `<div class="flex items-center justify-between p-3 rounded-lg border bg-white hover:bg-gray-50">
@@ -7508,7 +8072,8 @@ window.GURU_PAGES = {
               </div>
               ${badge(c.code, 'outline')}
             </div>`;
-          }).join('') + '</div>'
+          }).join('') + '</div>',
+          btn('Tambah', 'openGuruMapelForm()', { icon: 'book-plus', size: 'sm' })
         )}
         ${dataCard('Tugas Perlu Dinilai', 'Pengumpulan yang menunggu penilaian', 'alert-circle',
           ungradedList.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Tidak ada tugas yang perlu dinilai</p>' :
@@ -7534,13 +8099,19 @@ window.GURU_PAGES = {
     const teacher = db.teachers.find(t => t.userId === user.id);
     const courses = db.courses.filter(c => c.teacherId === teacher?.id);
     const load = getTeacherTeachingLoad(teacher?.id);
-    return pageHeader('Mata Pelajaran Saya', 'Daftar mata pelajaran yang Anda ampu',
-      courses.length ? btn('Cetak Beban Mengajar', 'printBebanMengajarPDF(\'' + (teacher?.id || '') + '\')', { icon: 'printer' }) : ''
+    const headerBtns =
+      (courses.length ? btn('Cetak Beban Mengajar', 'printBebanMengajarPDF(\'' + (teacher?.id || '') + '\')', { icon: 'printer', variant: 'outline' }) : '') +
+      btn('Tambah Beban Mengajar', 'openGuruMapelForm()', { icon: 'book-plus' });
+    return pageHeader('Mata Pelajaran Saya', 'Kelola beban pelajaran yang Anda ampu dan kelas yang Anda ajarkan',
+      headerBtns
     ) + `
+      <div class="mb-4 p-3 rounded-xl bg-blue-50 border border-blue-200 text-xs text-blue-800 flex items-start gap-2"><i data-lucide="info" style="font-size:16px; margin-top:1px; flex-shrink:0;"></i><span>Anda dapat <b>menambahkan sendiri</b> beban pelajaran yang Anda ampu beserta kelas yang Anda ajarkan — pilih satu atau beberapa kelas sekaligus. Data langsung tersinkron ke database dan dapat diperiksa Super Admin di menu Kelas &amp; Mapel.</span></div>
       ${load.isMultiSubject ? `<div class="mb-4 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-start gap-2"><i data-lucide="briefcase" style="font-size:16px; margin-top:1px; flex-shrink:0;"></i><span><b>Beban mengajar multi mapel:</b> Anda mengampu ${load.distinctSubjects.length} mata pelajaran berbeda (${load.distinctSubjects.join(', ')}) di ${load.totalCourses} kelas — total ${load.totalJp} JP/minggu.</span></div>` : ''}
+      ${courses.length === 0 ? emptyState('Belum ada beban mengajar', 'Anda belum memiliki mata pelajaran. Klik tombol "Tambah Beban Mengajar" untuk menambahkan mapel yang Anda ampu beserta kelas yang diajar.', 'book-open') : `
       <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
         ${courses.map(c => {
           const cls = db.classes.find(cl => cl.id === c.classId);
+          const nStudents = db.students.filter(s => s.classId === c.classId).length;
           return `<div class="bg-white rounded-2xl border-0 shadow-md hover:shadow-lg transition-shadow p-5">
             <div class="flex items-start justify-between mb-3">
               <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center"><i data-lucide="book-open" class="text-white" style="font-size: 24px;"></i></div>
@@ -7549,13 +8120,17 @@ window.GURU_PAGES = {
             <h3 class="font-bold text-base mb-1">${c.name}</h3>
             <p class="text-xs text-gray-500 mb-3">${c.description || ''}</p>
             <div class="space-y-1 text-xs">
-              <div class="flex items-center gap-2"><i data-lucide="users" style="font-size: 12px;"></i><span>Kelas: ${cls?.name || '-'}</span></div>
-              <div class="flex items-center gap-2"><i data-lucide="clock" style="font-size: 12px;"></i><span>${c.schedule || '-'}</span></div>
+              <div class="flex items-center gap-2"><i data-lucide="users" style="font-size: 12px;"></i><span>Kelas: ${cls?.name || '-'} (${nStudents} siswa)</span></div>
+              <div class="flex items-center gap-2"><i data-lucide="clock" style="font-size: 12px;"></i><span>${c.schedule || 'Jadwal belum diatur'}</span></div>
               <div class="flex items-center gap-2"><i data-lucide="calendar" style="font-size: 12px;"></i><span>Smt: ${c.semester} ${c.academicYear}</span></div>
+            </div>
+            <div class="flex items-center gap-2 mt-3 pt-3 border-t border-gray-100">
+              <button onclick="openGuruMapelForm('${c.id}')" class="flex-1 px-3 py-1.5 text-xs border border-emerald-200 text-emerald-700 hover:bg-emerald-50 rounded-md flex items-center justify-center gap-1"><i data-lucide="edit" style="font-size: 12px;"></i> Edit</button>
+              <button onclick="deleteMapel('${c.id}')" class="flex-1 px-3 py-1.5 text-xs border border-red-200 text-red-600 hover:bg-red-50 rounded-md flex items-center justify-center gap-1"><i data-lucide="trash-2" style="font-size: 12px;"></i> Hapus</button>
             </div>
           </div>`;
         }).join('')}
-      </div>
+      </div>`}
     `;
   },
 
@@ -8070,6 +8645,7 @@ function saveMaterial(e, id) {
 
 function deleteMaterial(id) {
   confirmDialog('Hapus Materi', 'Yakin ingin menghapus materi ini?', () => {
+    recordTombstone('materials', id);
     db.materials = db.materials.filter(m => m.id !== id);
     saveDB();
     showToast('Materi dihapus', '', 'success');
@@ -8171,8 +8747,13 @@ function saveAssignment(e, id) {
 }
 
 function deleteAssignment(id) {
-  confirmDialog('Hapus Tugas', 'Yakin ingin menghapus tugas ini?', () => {
+  confirmDialog('Hapus Tugas', 'Yakin ingin menghapus tugas ini? <strong>Seluruh pengumpulan dan nilai siswa</strong> untuk tugas ini juga ikut dihapus permanen dari database.', () => {
+    recordTombstone('assignments', id);
+    db.submissions.filter(s => s.assignmentId === id).forEach(s => recordTombstone('submissions', s.id));
+    db.grades.filter(g => g.assignmentId === id).forEach(g => recordTombstone('grades', g.id));
     db.assignments = db.assignments.filter(a => a.id !== id);
+    db.submissions = db.submissions.filter(s => s.assignmentId !== id);
+    db.grades = db.grades.filter(g => g.assignmentId !== id);
     saveDB();
     showToast('Tugas dihapus', '', 'success');
     refreshMainContent();
@@ -8725,7 +9306,7 @@ window.KEPSEK_PAGES = {
     const liveCount = { live: 0, upcoming: 0, past: 0 };
     (db.liveClasses || []).forEach(lc => { const s = liveClassStatus(lc); liveCount[s] = (liveCount[s] || 0) + 1; });
     const liveNow = (db.liveClasses || []).filter(lc => liveClassStatus(lc) === 'live');
-    const lmsActions = ['SUBMIT TUGAS', 'GABUNG LIVE CLASS', 'TAMBAH MAPEL', 'UPDATE MAPEL', 'HAPUS MAPEL', 'TAMBAH MATERI', 'UPDATE MATERI'];
+    const lmsActions = ['SUBMIT TUGAS', 'GABUNG LIVE CLASS', 'TAMBAH MAPEL', 'UPDATE MAPEL', 'HAPUS MAPEL', 'TAMBAH MATERI', 'UPDATE MATERI', 'TAMBAH BEBAN MENGAJAR', 'UPDATE BEBAN MENGAJAR'];
     const recentLogs = db.logs.filter(l => lmsActions.includes(l.action)).slice(-8).reverse();
     const recentSubs = db.submissions.slice().sort((a, b) => (b.submittedAt || b.createdAt || '').localeCompare(a.submittedAt || a.createdAt || '')).slice(0, 6);
 
@@ -9824,6 +10405,7 @@ function saveLiveClass(e, id) {
 
 function deleteLiveClass(id) {
   confirmDialog('Hapus Live Class', 'Yakin ingin menghapus jadwal live class ini?', () => {
+    recordTombstone('liveClasses', id);
     db.liveClasses = db.liveClasses.filter(lc => lc.id !== id);
     saveDB();
     showToast('Live Class dihapus', '', 'success');
@@ -10088,6 +10670,7 @@ function deletePresentasi(id) {
   const p = db.presentations.find(x => x.id === id);
   if (!p) return;
   confirmDialog('Hapus Presentasi', 'Yakin ingin menghapus presentasi <strong>' + p.title + '</strong>? Siswa kelas tersebut tidak akan melihatnya lagi.', () => {
+    recordTombstone('presentations', id);
     db.presentations = db.presentations.filter(x => x.id !== id);
     const user = getCurrentUser();
     db.logs.push({ id: uid('log'), userId: user.id, action: 'HAPUS PRESENTASI', detail: 'Hapus presentasi "' + p.title + '"', createdAt: now() });
