@@ -102,9 +102,37 @@
     .boot-skip:hover { color: #ffffff; }
     .boot-foot { margin-top: 16px; font-size: 11px; color: rgba(255,255,255,0.45); }
     body.booting { overflow: hidden; }
+    /* ===== GERBANG FULL ONLINE (Task 16) ===== */
+    #online-gate { position: fixed; inset: 0; z-index: 10000; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #064e3b 0%, #065f46 45%, #0e7490 100%); transition: opacity 0.45s ease; }
+    #online-gate.gate-hidden { opacity: 0; pointer-events: none; }
+    #online-gate.gate-show { opacity: 1; }
+    #online-gate .gate-card { text-align: center; color: #fff; padding: 28px 30px; max-width: 430px; }
+    #online-gate .gate-icon { width: 64px; height: 64px; margin: 0 auto 14px; border-radius: 9999px; background: rgba(110,231,183,0.15); border: 2px solid rgba(110,231,183,0.4); display: flex; align-items: center; justify-content: center; }
+    #online-gate .gate-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+    #online-gate .gate-detail { font-size: 13px; line-height: 1.6; color: rgba(255,255,255,0.75); }
+    #online-gate .gate-retry { margin-top: 16px; display: inline-flex; align-items: center; gap: 7px; padding: 9px 18px; border-radius: 12px; background: #10b981; color: #fff; font-size: 13px; font-weight: 600; border: none; cursor: pointer; }
+    #online-gate .gate-retry:hover { background: #059669; }
+    #online-gate .gate-spin { width: 34px; height: 34px; margin: 0 auto 12px; border: 3px solid rgba(110,231,183,0.25); border-top-color: #6ee7b7; border-radius: 9999px; animation: bootPulse 0.9s linear infinite; animation-name: gateSpin; }
+    @keyframes gateSpin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body class="antialiased text-gray-900 booting">
+
+<!-- ============ GERBANG FULL ONLINE — aplikasi hanya bisa dipakai saat terhubung server cloud ============ -->
+<div id="online-gate" class="gate-hidden" role="status" aria-live="polite">
+  <div class="gate-card">
+    <div class="gate-icon">
+      <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#6ee7b7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+    </div>
+    <div class="gate-spin" id="online-gate-spinner"></div>
+    <div class="gate-title" id="online-gate-title">Menghubungkan ke Server...</div>
+    <div class="gate-detail" id="online-gate-detail">Aplikasi sekolah berjalan FULL ONLINE — data hanya tersimpan di server cloud, bukan di browser. Menunggu database sekolah terbaca...</div>
+    <button type="button" class="gate-retry" id="online-gate-retry" onclick="reconnectDatabaseNow()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+      Sambungkan Ulang Sekarang
+    </button>
+  </div>
+</div>
 
 <!-- ============ BOOT LOADER — tampil sampai database benar-benar terhubung & data terbaca ============ -->
 <div id="boot-loader" role="status" aria-live="polite" aria-label="Memuat sistem">
@@ -124,21 +152,23 @@
       <div class="boot-step" id="boot-step-4"><span class="boot-dot"></span><span>Menyiapkan tampilan</span></div>
     </div>
     <div class="boot-bar"><div class="boot-bar-inner" id="boot-bar"></div></div>
-    <button type="button" class="boot-skip" id="boot-skip-btn" onclick="bootSkipNow()">Lanjutkan tanpa menunggu &rarr;</button>
-    <div class="boot-foot">Halaman akan terbuka otomatis setelah database terhubung dan data terbaca</div>
+    <button type="button" class="boot-skip" id="boot-skip-btn" onclick="bootSkipNow()">Muat Ulang Halaman &rarr;</button>
+    <div class="boot-foot">Halaman terbuka otomatis setelah database cloud terbaca — aplikasi berjalan FULL ONLINE</div>
   </div>
 </div>
 <script>
-/* Failsafe mandiri: apa pun yang terjadi (script gagal, CDN mati, error tak terduga),
-   layar pemuatan TIDAK BOLEH mengunci halaman selamanya — buka paksa setelah 22 detik */
+/* Failsafe FULL ONLINE: bila setelah 22 detik database cloud belum juga terbaca
+   (internet mati / server tak terjangkau), beralih ke GERBANG ONLINE yang
+   menawarkan tombol sambung-ulang — aplikasi TIDAK dibuka tanpa data cloud. */
 (function() {
   setTimeout(function() {
+    try { if (typeof db !== 'undefined' && db) return; } catch (e) { /* db belum ada */ }
     var el = document.getElementById('boot-loader');
-    document.body && document.body.classList.remove('booting');
     if (el && el.parentNode) {
       el.classList.add('boot-hide');
       setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 700);
     }
+    try { if (typeof showOnlineGate === 'function') showOnlineGate('connect'); } catch (e) { /* abaikan */ }
   }, 22000);
 })();
 </script>
@@ -148,7 +178,7 @@
   <div id="db-status-banner-inner" class="bg-red-600 text-white text-xs sm:text-sm">
     <div class="max-w-7xl mx-auto px-3 sm:px-4 py-2 flex items-center justify-center gap-2 flex-wrap text-center leading-snug">
       <i id="db-status-icon-banner" data-lucide="cloud-off" style="font-size: 16px;" class="flex-shrink-0"></i>
-      <span id="db-status-text" class="font-medium">Database tidak terhubung — data tersimpan aman di perangkat ini.</span>
+      <span id="db-status-text" class="font-medium">Database cloud tidak terhubung — aplikasi FULL ONLINE menyambung ulang otomatis.</span>
       <button id="db-status-retry-btn" onclick="reconnectDatabaseNow()" class="ml-1 px-2.5 py-1 rounded-md bg-white/20 hover:bg-white/30 border border-white/40 text-xs font-semibold flex items-center gap-1.5 flex-shrink-0">
         <i data-lucide="refresh-cw" style="font-size: 12px;"></i> Sambungkan Ulang
       </button>
@@ -301,12 +331,12 @@
             <div id="login-form-panel">
               <form id="login-form" onsubmit="handleLogin(event)" class="space-y-4">
                 <div>
-                  <label class="block text-sm font-medium mb-1">NIP / NISN / Username</label>
+                  <label class="block text-sm font-medium mb-1">NIP / NIS / Username</label>
                   <div class="relative">
                     <i data-lucide="user" class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" style="font-size: 16px;"></i>
-                    <input id="login-email" type="text" required placeholder="NIP / NISN / Username" class="w-full pl-9 pr-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm">
+                    <input id="login-email" type="text" required placeholder="NIP / NIS / Username" class="w-full pl-9 pr-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm">
                   </div>
-                  <p class="text-[10px] text-gray-400 mt-1">Guru & Tendik: NIP | Siswa: NISN</p>
+                  <p class="text-[10px] text-gray-400 mt-1">Guru &amp; Tendik: NIP | Siswa: NIS</p>
                 </div>
                 <div>
                   <label class="block text-sm font-medium mb-1">Password</label>
@@ -485,8 +515,31 @@ const UI_KEY = 'sija_ui_v1';
 let db = null;
 let session = null;
 let uiState = { currentPage: 'dashboard', sidebarOpen: false };
-let lastBakAt = 0;          // waktu terakhir menulis cadangan lokal
+let lastBakAt = 0;          // (tidak dipakai lagi — FULL ONLINE: database tidak disimpan lokal)
 let lastSaveErrToastAt = 0; // debounce toast error penyimpanan
+
+/* ============================================================
+   FULL ONLINE MODE (Task 16)
+   Aplikasi berjalan 100% ONLINE: Cloud Firestore adalah SATU-SATUNYA
+   sumber data. Database TIDAK disimpan di localStorage browser lagi —
+   semua perubahan langsung dikirim ke cloud dan tampil realtime di
+   SEMUA browser yang online. Akibatnya:
+   - Data lama/basi di browser tidak pernah menimpa data sekolah lagi
+     (penyebab "data berubah sendiri & akun demo kembali muncul").
+   - Bila koneksi ke server terputus, aplikasi MENUNGGU sambung ulang
+     (layar penghubung) — tidak ada lagi mode offline lokal.
+   ============================================================ */
+var _legacySwept = false;
+function sweepLegacyLocalDb() {
+  if (_legacySwept) return;
+  _legacySwept = true;
+  try {
+    const had = localStorage.getItem(DB_KEY) || localStorage.getItem(DB_BAK_KEY);
+    localStorage.removeItem(DB_KEY);
+    localStorage.removeItem(DB_BAK_KEY);
+    if (had) console.log('[FULL-ONLINE] Sisa database lokal lama dihapus — aplikasi kini 100% online (data hanya di cloud)');
+  } catch (e) { /* abaikan */ }
+}
 
 const ROLE_LABELS = { SUPER_ADMIN: 'Super Admin', GURU: 'Guru', TENDIK: 'Tenaga Kependidikan', SISWA: 'Siswa', KEPSEK: 'Kepala Sekolah' };
 const ROLE_COLORS = { SUPER_ADMIN: 'from-red-500 to-rose-600', GURU: 'from-emerald-500 to-teal-600', TENDIK: 'from-amber-500 to-orange-600', SISWA: 'from-indigo-500 to-blue-600', KEPSEK: 'from-violet-500 to-purple-600' };
@@ -519,92 +572,34 @@ function ensureKepsekAccount() {
   keps.forEach(u => {
     if (u.role !== 'KEPSEK') { u.role = 'KEPSEK'; changed = true; }
     if (!u.position) { u.position = 'Kepala Sekolah'; changed = true; }
-    if (u.password !== 'kepsek123') { u.password = 'kepsek123'; changed = true; }
     if (!u.isActive) { u.isActive = true; changed = true; }
   });
-  if (keps.length === 0) {
-    db.users.push({
-      id: uid('usr'), email: 'kepsek@smanejayaloka.sch.id', password: 'kepsek123',
-      name: db.schoolProfile?.principalName || 'Kepala Sekolah', role: 'KEPSEK',
-      nip: db.schoolProfile?.principalNip || '196805151994121002',
-      position: 'Kepala Sekolah', gender: 'L', isActive: true, createdAt: now()
-    });
-    changed = true;
-  }
+  // FULL ONLINE (Task 16): akun Kepala Sekolah TIDAK lagi dibuat otomatis.
+  // Pembuatan otomatis dulu menyebabkan akun duplikat muncul kembali di
+  // perangkat yang datanya tertinggal. Pengelolaan akun kini lewat Manajemen User.
   return changed;
 }
 
 function loadDB() {
-  let recovered = false;
-  const main = parseDbJson(localStorage.getItem(DB_KEY));
-  if (main) {
-    if (db && isValidDatabase(db) && !db.__seed) {
-      // db di memori valid & mungkin LEBIH BARU dari storage (penulisan tertunda / kuota
-      // sempat penuh) — JANGAN ditimpa mentah-mentah: gabungkan anti-hilang agar
-      // perubahan yang belum tersimpan tidak terbuang (penyebab "data tiba-tiba berubah")
-      adoptCloudData(main);
-    } else {
-      db = main;
-    }
-  } else {
-    // Database utama rusak / tidak terbaca — pulihkan dari cadangan lokal
-    const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
-    if (bak) {
-      if (db && isValidDatabase(db) && !db.__seed) {
-        adoptCloudData(bak); // gabung anti-hilang — data memori tidak hilang
-      } else {
-        db = bak;
-        recovered = true;
-      }
-      try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
-    }
+  // ===== FULL ONLINE (Task 16): browser TIDAK menyimpan database =====
+  // Sisa database lokal dari versi lama dihapus (sumber polusi data basi).
+  // Database hanya dibaca dari Cloud Firestore: handleCloudSnapshot() akan
+  // membangun `db` begitu data server tiba, lalu tampilan dibuka.
+  sweepLegacyLocalDb();
+  if (db) {
+    if (!Array.isArray(db.presentations)) db.presentations = [];
+    if (!Array.isArray(db.tombstones)) db.tombstones = [];
+    // Migrasi akun Kepala Sekolah (role KEPSEK) — hanya penyetelan role, tanpa membuat akun
+    if (ensureKepsekAccount()) { try { saveDB(); } catch (e) { /* abaikan */ } }
   }
-  if (!db) {
-    db = seedDatabase();
-    _dbFreshSeed = true; // data masih bawaan pabrik (browser baru/localStorage bersih) — JANGAN kirim ke cloud sebelum yakin cloud memang kosong, agar data asli sekolah tidak tertimpa
-    // DATA CONTOH tidak boleh menyebar: saat online, seed TIDAK ditulis ke penyimpanan
-    // (tab lain/reload tidak akan mengadopsinya sebagai "database" — penyebab data
-    // sekolah terganti data contoh). Seed hanya disimpan bila perangkat memang offline
-    // atau cloud dimatikan sengaja, karena saat itu tidak ada sumber pemulihan lain.
-    const offlineOnly = (typeof isCloudDisabled === 'function' && isCloudDisabled()) || !navigator.onLine;
-    if (offlineOnly) {
-      try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
-    }
-  }
-  // Migrasi ringan: pastikan field baru tersedia untuk database lama
-  if (db && !Array.isArray(db.presentations)) db.presentations = [];
-  // Migrasi tombstone (Task 11): catatan penghapusan permanen untuk database lama
-  if (db && !Array.isArray(db.tombstones)) db.tombstones = [];
-  // Migrasi akun Kepala Sekolah (role KEPSEK) — dibuat/dinaikkan otomatis bila belum ada
-  if (db && ensureKepsekAccount()) { try { saveDB(); } catch (e) { /* abaikan */ } }
-  if (recovered) {
-    console.warn('[DB] Database utama tidak terbaca — data dipulihkan dari backup lokal');
-    setTimeout(function() {
-      showToast('Database dipulihkan', 'Data utama rusak/tidak terbaca — berhasil dipulihkan dari backup lokal.', 'warning');
-    }, 1200);
-  }
-  // Init cloud sync jika ada config
+  // Init cloud sync jika ada config — data akan tiba via listener realtime
   initFirebase();
 }
 function saveDB() {
-  try {
-    const json = JSON.stringify(db);
-    _dbLocalDirtyAt = Date.now(); // catat: data lokal baru saja berubah (anti-revert cloud)
-    // Cadangan lokal: simpan salinan maksimal sekali per 60 detik agar hemat kuota & tetap cepat
-    const t = Date.now();
-    if (t - lastBakAt > 60000) {
-      try { localStorage.setItem(DB_BAK_KEY, json); lastBakAt = t; } catch (e) { /* abaikan */ }
-    }
-    localStorage.setItem(DB_KEY, json);
-  } catch (e) {
-    console.error('[DB] Gagal menyimpan ke localStorage:', e);
-    const t = Date.now();
-    if (t - lastSaveErrToastAt > 30000) {
-      lastSaveErrToastAt = t;
-      showToast('Penyimpanan Browser Bermasalah', 'Perubahan tidak dapat disimpan (kuota penuh / penyimpanan dibatasi). Export database sebagai cadangan.', 'error');
-    }
-  }
-  saveToCloud(); // sync ke cloud jika terhubung (atau antre bila terputus)
+  // ===== FULL ONLINE (Task 16): perubahan langsung ke CLOUD, bukan browser =====
+  if (!db || !isValidDatabase(db)) return;
+  _dbLocalDirtyAt = Date.now(); // catat: data baru saja berubah (anti-revert cloud)
+  saveToCloud(); // kirim ke cloud (otomatis antre bila koneksi sedang terputus)
   saveToRTDB();  // backup ke Realtime Database — salinan cadangan online kedua
   rsNoteLocalWrite(); // tandai isi database terakhir yang diketahui tab ini (realtime sync)
   // CATATAN: tampilan TIDAK di-refresh otomatis lagi. Setiap aksi pengguna (tambah/edit/hapus)
@@ -645,7 +640,6 @@ var _rsTickStarted = false;  // guard agar mesin sinkron hanya berjalan sekali
 var _rsToastSyncAt = 0;      // throttle toast info sinkron antar tab
 var _rsRetryTimer = null;    // timer percobaan-ulang refresh saat UI sedang dipakai user
 var _dbLocalDirtyAt = 0;     // ms terakhir kali data lokal berubah (penanda anti-revert cloud)
-var _dbFreshSeed = false;    // data lokal masih seed bawaan browser baru — push ke cloud ditahan sampai yakin cloud kosong
 var _lastCloudMetaMs = 0;    // waktu meta cloud terbaru yang pernah dilihat tab ini (anti snapshot basi)
 var _lastRtdbMetaMs = 0;     // waktu meta backup RTDB terbaru yang pernah dilihat tab ini
 var _cloudPushInFlight = false; // push batch ke Firestore sedang berjalan (belum dikonfirmasi server)
@@ -676,10 +670,12 @@ function rsNotifyNewData(source) {
   if (!session) return;
   // ===== REALTIME: halaman live di-refresh otomatis (rsApplyUI melindungi isian form
   // & menunda bila modal terbuka/user sedang mengetik, jadi aman) =====
-  if (rsPageWantsLiveRefresh() && !document.hidden && !document.getElementById('live-room-overlay')) {
+  // FULL ONLINE: bila tab sedang tidak terlihat, rsScheduleUI menandai penyegaran
+  // TERTUNDA — diterapkan otomatis begitu tab terlihat kembali / detak 4 dtk.
+  if (rsPageWantsLiveRefresh() && !document.getElementById('live-room-overlay')) {
     _rsNewDataAvail = false;
     updateSyncIndicator();
-    rsScheduleUI(250); // debounce kecil — sekejap setelah data diterima, halaman menampilkan yang terbaru
+    rsScheduleUI(250); // debounce kecil — halaman live menampilkan yang terbaru sekejap
     return;
   }
   const t = Date.now();
@@ -688,8 +684,9 @@ function rsNotifyNewData(source) {
   showToast('Data terbaru tersedia', 'Perubahan dari ' + source + ' sudah diterima. Klik tombol "Sinkron" di bagian atas untuk menampilkannya — isian yang sedang Anda kerjakan tidak hilang.', 'info');
 }
 
-function rsReadStorage() { try { return localStorage.getItem(DB_KEY); } catch (e) { return null; } }
-function rsNoteLocalWrite() { _rsLastSeenJson = rsReadStorage(); }
+// FULL ONLINE: tidak ada lagi database di localStorage — pelacak "isi terakhir"
+// bekerja penuh di memori (dipakai untuk deteksi perubahan antar adopsi cloud)
+function rsNoteLocalWrite() { try { _rsLastSeenJson = stableStringify(db); } catch (e) { _rsLastSeenJson = null; } }
 
 // UI sedang dipakai user? (modal/confirm terbuka, atau sedang mengetik/memilih di input) —
 // selama ini JANGAN me-render ulang agar form tidak ter-reset dan klik menu tidak hilang
@@ -770,33 +767,23 @@ function _rsRestoreFormValues(saved) {
 // Terapkan data db terkini ke seluruh tampilan yang sedang terlihat
 function rsApplyUI() {
   try {
+    if (!db) { showOnlineGate('connect'); return; } // FULL ONLINE: tunggu data cloud tiba
     if (document.getElementById('live-room-overlay')) { _rsPendingUI = true; return; } // jangan ganggu sesi Live Class
     if (document.hidden || rsUiBusy()) { _rsPendingUI = true; rsRetryLater(); return; } // tunda bila modal terbuka / user sedang mengetik
     _rsPendingUI = false; // refresh berhasil — reset penanda tertunda
     if (!session && rsRescueSession()) { applyRoleVisibility(); } // sesi dipulihkan dari salinan cadangan
     if (!session) { renderLanding(); lucide.createIcons(); return; }
-    // Pengaman sesi: akun hilang dari data terbaru → COBA PULIHKAN DULU (storage utama,
-    // lalu backup lokal) — baru logout bila akun benar-benar tidak ada di mana pun.
-    // Ini mencegah logout paksa/"tampilan awal" akibat db sempat tertukar sesaat.
+    // Pengaman sesi: akun hilang dari data terbaru (cloud) → coba pulihkan sesi dari
+    // salinan cadangan; logout HANYA bila akun benar-benar tidak ada di database cloud.
+    // FULL ONLINE: tidak ada lagi penyelamatan dari localStorage (sumber data basi).
     if (!getCurrentUser()) {
-      try { rsReloadFromStorage(); } catch (e) { /* abaikan */ }
-      if (!getCurrentUser()) {
-        try {
-          const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
-          if (bak && session.userId && bak.users.some(function(u) { return u.id === session.userId; })) {
-            db = bak; _dbFreshSeed = false;
-            try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota */ }
-            rsNoteLocalWrite();
-            console.warn('[SYNC] Sesi diselamatkan dari backup lokal');
-          }
-        } catch (e) { /* abaikan */ }
-      }
-      if (!getCurrentUser()) {
-        session = null; saveSession();
-        renderLanding(); lucide.createIcons();
-        showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
-        return;
-      }
+      try { rsRescueSession(); } catch (e) { /* abaikan */ }
+    }
+    if (!getCurrentUser()) {
+      session = null; saveSession();
+      renderLanding(); lucide.createIcons();
+      showToast('Sesi berakhir', 'Akun tidak ditemukan pada data terbaru. Silakan masuk kembali.', 'warning');
+      return;
     }
     const _savedForm = _rsCaptureFormValues(); // simpan isian form badan halaman
     renderTopBar();
@@ -810,58 +797,10 @@ function rsApplyUI() {
   } catch (e) { console.warn('[SYNC] Penyegaran tampilan gagal:', e && e.message); }
 }
 
-// Baca ulang database dari localStorage (perubahan tab lain / proses luar) —
-// diadopsi SENYAP tanpa render ulang; tampilan diperbarui lewat tombol "Sinkron"
-function rsReloadFromStorage() {
-  const raw = rsReadStorage();
-  if (raw === _rsLastSeenJson) return false;   // tidak ada perubahan baru
-  _rsLastSeenJson = raw;
-  const parsed = parseDbJson(raw);
-  if (!parsed) return false;                   // rusak — biarkan watchdog yang memulihkan
-  // ===== PENGAMAN TOMBSTONE: penulis storage bisa jadi tab/perangkat dengan data basi =====
-  // Catatan penghapusan yang KITA ketahui digabungkan (union) ke data masuk, lalu record yang
-  // sudah dihapus permanen dibuang — data terhapus tidak muncul lagi walau ditulis ulang tab basi.
-  let resurrectBlocked = 0;
-  try {
-    const localT = (db && Array.isArray(db.tombstones)) ? db.tombstones : [];
-    if (localT.length > 0) {
-      const mergedT = mergeTombstones(localT, Array.isArray(parsed.tombstones) ? parsed.tombstones : []);
-      parsed.tombstones = mergedT;
-      const set = new Set(mergedT.map(function(t) { return t.key; }));
-      if (set.size) {
-        Object.keys(parsed).forEach(function(k) {
-          if (k === 'tombstones' || !Array.isArray(parsed[k])) return;
-          const before = parsed[k].length;
-          parsed[k] = parsed[k].filter(function(r) {
-            const rid = r && r.id !== undefined && r.id !== null && r.id !== '' ? String(r.id) : null;
-            return !(rid !== null && set.has(tombKey(k, rid)));
-          });
-          resurrectBlocked += (before - parsed[k].length);
-        });
-        if (resurrectBlocked > 0) console.log('[SYNC] ' + resurrectBlocked + ' record terhapus dibuang dari tulisan tab lain (tombstone)');
-      }
-    }
-  } catch (e) { /* abaikan — pengaman jangan pernah menggagalkan adopsi */ }
-  // ===== PENGAMAN ANTI-SEED: tulisan tab lain berisi DATA CONTOH tidak boleh menggantikan database asli =====
-  if (parsed.__seed) { console.log('[SYNC] Tulisan tab lain berisi data contoh — diabaikan'); return false; }
-  // ===== MERGE ANTI-HILANG (bukan penimpaan!): record milik tab ini tidak akan hilang
-  // walau tab lain menulis data yang lebih lama. Bila tab ini masih menampilkan data
-  // contoh (seed), data asli dari tab lain menggantikan penuh. =====
-  const mergedChanged = adoptCloudData(parsed);
-  if (mergedChanged) rsNotifyNewData('tab lain');
-  return mergedChanged;
-}
-
-// Jaring pengaman: perubahan db di memori yang belum tersimpan → simpan otomatis
-function rsAutosaveCheck() {
-  if (!db || _dbFreshSeed || db.__seed) return; // data contoh tidak di-autosave saat online (agar tidak menyebar)
-  let json;
-  try { json = JSON.stringify(db); } catch (e) { return; }
-  const raw = rsReadStorage();
-  if (json === raw) return;                 // memori & storage sinkron
-  if (raw === _rsLastSeenJson) saveDB();    // memori berubah, storage belum → simpan sekarang
-  else rsReloadFromStorage();               // storage berubah dari luar → ikuti data terbaru
-}
+// FULL ONLINE (Task 16): rsReloadFromStorage & rsAutosaveCheck DIHAPUS.
+// Database tidak pernah disimpan/dibaca dari localStorage lagi — semua perubahan
+// antar tab & antar perangkat mengalir lewat listener realtime Cloud Firestore
+// (onSnapshot) yang aktif di setiap tab, sehingga tidak ada lagi jalur data basi.
 
 // Sinkronkan sesi bila tab lain login/logout
 function rsReloadSessionFromStorage() {
@@ -880,28 +819,36 @@ function rsStartRealtimeSync() {
   _rsTickStarted = true;
   rsNoteLocalWrite();
 
-  // 1) Tab lain mengubah database / sesi → baca ulang & tampilkan seketika
+  // 1) Tab lain login/logout → ikutkan sesi (data LMS mengalir via cloud, bukan storage)
   window.addEventListener('storage', function(e) {
-    if (e.key === DB_KEY) rsReloadFromStorage();
-    else if (e.key === SESSION_KEY) rsReloadSessionFromStorage();
-    else if (e.key === null) { rsReloadFromStorage(); rsReloadSessionFromStorage(); }
+    if (e.key === SESSION_KEY) rsReloadSessionFromStorage();
+    else if (e.key === null) rsReloadSessionFromStorage();
   });
 
-  // 2) Tab kembali terlihat / fokus → pastikan DATA paling baru (adopsi senyap,
-  //    tanpa render ulang — tampilan mengikuti lewat tombol "Sinkron" / pindah halaman)
+  // 2) Tab kembali terlihat / fokus → sesi dicek + penyegaran tertunda diterapkan;
+  //    DATA selalu terbaru otomatis lewat listener realtime Cloud Firestore
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) return;
-    rsReloadFromStorage();
+    updateOnlineGate();
+    if (_rsPendingUI && !rsUiBusy()) { try { rsApplyUI(); } catch (e) { /* abaikan */ } }
   });
-  window.addEventListener('focus', function() { rsReloadFromStorage(); });
-  window.addEventListener('pageshow', function() { rsReloadFromStorage(); });
+  window.addEventListener('focus', function() {
+    updateOnlineGate();
+    if (_rsPendingUI && !rsUiBusy()) { try { rsApplyUI(); } catch (e) { /* abaikan */ } }
+  });
+  window.addEventListener('pageshow', function() {
+    updateOnlineGate();
+    if (_rsPendingUI && !rsUiBusy()) { try { rsApplyUI(); } catch (e) { /* abaikan */ } }
+  });
 
-  // 3) Detak rutin 4 detik: autosave jaring pengaman + tangkap perubahan yang terlewat
-  //    + proses-ulang snapshot cloud/RTDB yang ditunda karena ada tulisan lokal yang sedang berjalan
+  // 3) Detak rutin 4 detik: proses-ulang snapshot cloud/RTDB yang ditunda karena ada
+  //    tulisan lokal yang sedang berjalan + jaga gerbang koneksi FULL ONLINE
+  //    + flush penyegaran tertunda (jaring pengaman bila event fokus/visibility terlewat)
   setInterval(function() {
-    rsAutosaveCheck();
     if (cloudSnapshotBuffer) { try { handleCloudSnapshot(); } catch (e) { /* abaikan */ } }
     if (rtdbSnapshotBuffer) { try { processRtdbSnapshot(); } catch (e) { /* abaikan */ } }
+    onlineGateTick();
+    if (_rsPendingUI && !document.hidden && !rsUiBusy()) { try { rsApplyUI(); } catch (e) { /* abaikan */ } }
   }, 4000);
 }
 
@@ -949,11 +896,9 @@ function syncDatabaseNow() {
   setTimeout(function() { // jeda singkat agar ikon berputar sempat terlihat
     let ok = true, errMsg = '';
     try {
-      try { rsAutosaveCheck(); } catch (e) {}                                             // 1) simpan perubahan memori yang belum tersimpan
-      try { if (cloudSnapshotBuffer) handleCloudSnapshot(); } catch (e) {}                // 2) proses snapshot Cloud yang sudah diterima
-      try { if (rtdbSnapshotBuffer) processRtdbSnapshot(); } catch (e) {}                 // 3) tarik backup RTDB bila Cloud terputus
-      try { rsReloadFromStorage(); } catch (e) {}                                         // 4) baca ulang data dari tab lain
-      try { if (isCloudConnected() && cloudPendingPush) saveToCloud(true); } catch (e) {} // 5) kirim sisa antrean lokal yang belum terkirim
+      try { if (cloudSnapshotBuffer) handleCloudSnapshot(); } catch (e) {}                // 1) proses snapshot Cloud yang sudah diterima
+      try { if (rtdbSnapshotBuffer) processRtdbSnapshot(); } catch (e) {}                 // 2) proses info backup RTDB (hanya status — backup tidak diadopsi otomatis)
+      try { if (isCloudConnected() && cloudPendingPush) saveToCloud(true); } catch (e) {} // 3) kirim sisa antrean lokal yang belum terkirim
       try { if (isRtdbActive() && rtdbPendingPush) saveToRTDB(true); } catch (e) {}
     } catch (e) {
       ok = false; errMsg = (e && e.message) || String(e);
@@ -1010,14 +955,7 @@ function rsRescueSession() {
     if (!raw) return false;
     const s = JSON.parse(raw);
     if (!s || !s.userId) return false; // penanda logged-out / rusak — jangan pulihkan
-    if (!(db && Array.isArray(db.users) && db.users.some(function(u) { return u.id === s.userId; }))) {
-      const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
-      if (bak && Array.isArray(bak.users) && bak.users.some(function(u) { return u.id === s.userId; })) {
-        db = bak; _dbFreshSeed = false;
-        try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota */ }
-        rsNoteLocalWrite();
-      }
-    }
+    // FULL ONLINE: validasi akun langsung terhadap database cloud di memori
     if (db && Array.isArray(db.users) && db.users.some(function(u) { return u.id === s.userId; })) {
       session = s;
       try { localStorage.setItem(SESSION_KEY, raw); } catch (e) { /* kuota */ }
@@ -1070,6 +1008,7 @@ let firebaseAnalytics = null;
 let cloudPushTimer = null;
 let cloudSnapshotTimer = null;
 let cloudSnapshotBuffer = null;
+let cloudEmptyConfirmed = false; // FULL ONLINE: server terkonfirmasi TANPA data (database cloud kosong)
 // ===== Kesehatan koneksi & sambung-ulang otomatis =====
 let cloudPendingPush = false;      // ada perubahan lokal yang menunggu dikirim saat online
 let cloudDownSince = null;         // sejak kapan cloud terputus (null = terhubung)
@@ -1291,20 +1230,19 @@ function adoptCloudData(data, replaceAll) {
   }
   // PENGAMAN DATA CONTOH: seed dari sumber luar TIDAK PERNAH boleh masuk ke database
   if (data.__seed) { console.warn('[SYNC] Data masuk adalah data contoh — ditolak, data lokal dipertahankan'); return false; }
-  const wasSeed = !!_dbFreshSeed || !!(db && db.__seed);
-  // Bila db lokal masih DATA CONTOH (seed), database asli yang datang MENGGANTIKAN penuh —
-  // jangan digabung, agar record demo tidak bercampur ke database sekolah.
-  if (replaceAll || wasSeed) {
+  const wasSeed = !!(db && db.__seed);
+  // FULL ONLINE: bila database belum ada (baru dibuka) atau masih DATA CONTOH (seed),
+  // data cloud MENGGANTIKAN/MENGISI penuh — jangan digabung, agar record demo tidak
+  // bercampur ke database sekolah.
+  if (!db || replaceAll || wasSeed) {
     db = data;
     delete db.__seed;
-    _dbFreshSeed = false;
     if (!Array.isArray(db.presentations)) db.presentations = [];
     if (!Array.isArray(db.tombstones)) db.tombstones = [];
     applyTombstones();
     ensureKepsekAccount();
-    try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
     rsNoteLocalWrite();
-    console.log('[SYNC] Data asli menggantikan data contoh (seed) — database sekolah dimuat');
+    console.log('[SYNC] Database sekolah dimuat dari cloud (' + (db.users ? db.users.length : 0) + ' pengguna)');
     // Bila sesi belum aktif (storage pernah dibersihkan/di-evict browser), coba pulihkan
     // dari salinan cadangan SEKARANG — database sekolah sudah tersedia di memori.
     try {
@@ -1312,7 +1250,6 @@ function adoptCloudData(data, replaceAll) {
     } catch (e) { /* abaikan */ }
     return true;
   }
-  _dbFreshSeed = false; // data nyata (cloud/backup) telah diterima — bukan lagi seed bawaan
   let changed = false;
   Object.keys(db).forEach(function(k) {
     if (k === 'tombstones') return; // catatan penghapusan digabung khusus di bawah
@@ -1371,7 +1308,6 @@ function adoptCloudData(data, replaceAll) {
   // Migrasi akun Kepala Sekolah ikut digabung agar semua perangkat mendapat akun pengawas
   if (ensureKepsekAccount()) changed = true;
   if (changed) {
-    try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
     rsNoteLocalWrite(); // sinkron dengan penanda realtime sync
   }
   return changed;
@@ -1410,11 +1346,13 @@ function handleCloudSnapshot() {
   cloudSnapshotBuffer = null;
   const meta = docs['meta'];
   if (!meta || !meta.updatedAt || !meta.total) {
-    // Cloud benar-benar kosong (dikonfirmasi listener server) — bila data lokal masih seed bawaan,
-    // kirim sebagai data awal; ini satu-satunya kondisi seed boleh menulis ke cloud
-    if (_dbFreshSeed && cloudServerConfirmed) { _dbFreshSeed = false; saveToCloud(true); }
-    // Cloud kosong tetapi lokal berisi data sekolah asli → isi ulang cloud (pemulihan cloud terhapus)
-    else if (cloudServerConfirmed && session && getCurrentUser && getCurrentUser()) { saveToCloud(true); }
+    // Cloud benar-benar kosong (dikonfirmasi listener server)
+    if (cloudServerConfirmed && session && getCurrentUser && getCurrentUser() && db && isValidDatabase(db)) {
+      saveToCloud(true); // cloud kosong tetapi pengguna asli memegang data → isi ulang cloud (pemulihan cloud terhapus)
+    } else if (cloudServerConfirmed) {
+      cloudEmptyConfirmed = true; // FULL ONLINE: tanpa data cloud aplikasi tidak bisa dipakai — laporkan ke layar boot
+      console.warn('[Firebase] Database cloud KOSONG — hubungi Super Admin (pulihan via backup RTDB)');
+    }
     return;
   }
   const metaMs = Date.parse(meta.updatedAt) || 0;
@@ -1441,16 +1379,16 @@ function handleCloudSnapshot() {
     console.log('[Firebase] Snapshot cloud lebih lama dari yang diterima — diabaikan (anti-revert)');
     return;
   }
-  // 1b) Data lokal masih DATA CONTOH (seed) — database asli dari cloud MENGGANTIKAN
-  //     penuh (bukan digabung) agar data demo tidak bercampur ke database sekolah.
-  if (_dbFreshSeed) {
-    _dbFreshSeed = false;
+  // 1b) FULL ONLINE — PEMUATAN PERTAMA: database belum ada di memori → data cloud
+  //     diadopsi penuh (bukan digabung). Ini satu-satunya sumber data aplikasi.
+  if (!db) {
     _lastCloudMetaMs = metaMs;
+    cloudEmptyConfirmed = false;
     if (adoptCloudData(data, true)) {
-      saveDB();
+      updateOnlineGate(); // sembunyikan layar "menghubungkan" — data sudah siap
       if (session) rsNotifyNewData('perangkat lain');
-      else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — segarkan agar konten cloud langsung tampil
-      console.log('[Firebase] Database asli dimuat dari cloud — data contoh digantikan');
+      else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — konten cloud langsung tampil
+      console.log('[Firebase] Database sekolah dimuat dari cloud — aplikasi siap');
     }
     return;
   }
@@ -1462,11 +1400,10 @@ function handleCloudSnapshot() {
     return;
   }
   if (stableStringify(data) === stableStringify(db)) { _lastCloudMetaMs = metaMs; return; } // tulisan sendiri / tidak ada perubahan
-  _dbFreshSeed = false;      // cloud ternyata berisi data asli — adopsi, seed bawaan ditinggalkan
   const changed = adoptCloudData(data); // MERGE anti-hilang: record lokal & cloud tidak ada yang hilang
   _lastCloudMetaMs = metaMs; // catat meta cloud yang sudah diterima
   if (changed) {
-    saveDB(); // sebarkan hasil gabungan ke localStorage + cloud + RTDB — perangkat lain yang datanya lama ikut pulih
+    saveDB(); // sebarkan hasil gabungan ke cloud + RTDB — perangkat lain yang datanya lama ikut pulih
     if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
     else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka (tanpa sesi) — konten terbaru langsung dirender ulang
   }
@@ -1527,11 +1464,11 @@ function startCloudSync(config) {
         }, 700);
       }, function(err) { handleCloudError(err, true); });
     }
-    // Jika cloud masih kosong (perangkat pertama) — kirim data lokal ke cloud
+    // Cloud kosong: hanya pengguna asli yang sedang memegang data boleh mengisi ulang
+    // (FULL ONLINE — tidak ada lagi seed/data contoh yang dikirim ke cloud)
     firebaseFS.collection(CLOUD_FS_COL).get().then(function(snap) {
-      if (snap.empty) {
-        console.log('[Firebase] Cloud kosong — mengirim data lokal ke cloud');
-        _dbFreshSeed = false; // cloud terbukti kosong — data lokal (termasuk seed) sah dikirim
+      if (snap.empty && db && isValidDatabase(db) && session && getCurrentUser && getCurrentUser()) {
+        console.log('[Firebase] Cloud kosong — mengisi ulang dari data sekolah yang sedang dipegang');
         saveToCloud(true);
       }
       if (cloudAnnounce) {
@@ -1565,7 +1502,7 @@ function handleCloudError(err, killedListener) {
   } else if (code.indexOf('failed-precondition') >= 0 || code.indexOf('not-found') >= 0) {
     cloudConnectError = 'Cloud Firestore belum aktif. Buka Firebase Console → Build → Firestore Database → Create Database, lalu muat ulang halaman.';
   } else if (code.indexOf('unavailable') >= 0 || code.indexOf('network') >= 0 || code.indexOf('timeout') >= 0 || code.indexOf('cancelled') >= 0) {
-    cloudConnectError = 'Server cloud tidak dapat dihubungi (periksa koneksi internet). Data tetap aman di browser ini.';
+    cloudConnectError = 'Server cloud tidak dapat dihubungi (periksa koneksi internet). Aplikasi FULL ONLINE hanya berjalan saat tersambung ke server.';
   } else {
     cloudConnectError = (err && (err.message || err.code)) || 'Koneksi ke cloud database gagal';
   }
@@ -1623,13 +1560,69 @@ function updateCloudStatusUI() {
   updateDbIndicator();
 }
 
+/* ============================================================
+   GERBANG FULL ONLINE (Task 16)
+   Layar penghubung yang MENAHAN penggunaan aplikasi selama
+   koneksi ke server cloud belum siap:
+   - Saat aplikasi baru dibuka : "Menghubungkan ke server..." sampai
+     data sekolah benar-benar dibaca dari Cloud Firestore.
+   - Saat koneksi terputus     : setelah 6 detik terputus, layar
+     menutup aplikasi (FULL ONLINE = tidak ada mode offline lokal).
+   - Saat server terkonfirmasi : gerbang terbuka otomatis.
+   ============================================================ */
+var _gateVisible = false;
+function showOnlineGate(mode) {
+  const gate = document.getElementById('online-gate');
+  if (!gate) return;
+  const t = document.getElementById('online-gate-title');
+  const d = document.getElementById('online-gate-detail');
+  const spin = document.getElementById('online-gate-spinner');
+  const btn = document.getElementById('online-gate-retry');
+  if (t) t.textContent = mode === 'empty' ? 'Database Cloud Kosong' : 'Menghubungkan ke Server...';
+  if (d) d.textContent = mode === 'empty'
+    ? 'Server cloud terjangkau tetapi belum berisi data sekolah. Hubungi Super Admin (pulihan data tersedia di halaman Database & Cloud akun Super Admin).'
+    : 'Aplikasi sekolah berjalan FULL ONLINE — data hanya tersimpan di server cloud, bukan di browser. Menunggu database sekolah terbaca...';
+  if (spin) spin.style.display = mode === 'empty' ? 'none' : '';
+  if (btn) btn.classList.toggle('hidden', mode === 'empty');
+  gate.classList.remove('gate-hidden');
+  gate.classList.add('gate-show');
+  _gateVisible = true;
+}
+function hideOnlineGate() {
+  const gate = document.getElementById('online-gate');
+  if (!gate) return;
+  gate.classList.add('gate-hidden');
+  gate.classList.remove('gate-show');
+  _gateVisible = false;
+}
+// Keputusan tampil/tidaknya gerbang — dipanggil dari semua titik perubahan koneksi
+function updateOnlineGate() {
+  try {
+    // Database siap + server terkonfirmasi + bukan kosong → aplikasi boleh dipakai
+    if (db && isValidDatabase(db) && isCloudConnected() && !cloudEmptyConfirmed) { hideOnlineGate(); return; }
+    if (cloudEmptyConfirmed && cloudServerConfirmed) { showOnlineGate('empty'); return; }
+    // Sudah melewati boot (layar boot tidak ada lagi) & cloud terputus lama → tahan aplikasi
+    if (_bootDone && cloudDownSince !== null && (Date.now() - cloudDownSince > 6000)) {
+      showOnlineGate('connect');
+      const d = document.getElementById('online-gate-detail');
+      if (d) d.textContent = navigator.onLine
+        ? 'Koneksi ke server cloud terputus. Menyambung ulang otomatis — perubahan Anda dalam antrean dan akan dikirim begitu tersambung.'
+        : 'Tidak ada koneksi internet. Aplikasi sekolah berjalan FULL ONLINE — sambungkan internet untuk melanjutkan.';
+    }
+  } catch (e) { /* abaikan */ }
+}
+// Detak rutin (dari mesin sinkron 4 dtk): pastikan gerbang konsisten
+function onlineGateTick() {
+  if (db && isCloudConnected() && _gateVisible) { hideOnlineGate(); return; }
+  updateOnlineGate();
+}
+
 // Kirim seluruh database lokal ke Cloud Firestore (meta + chunk 700KB).
 // Debounce 900ms agar beberapa perubahan cepat digabung jadi satu tulisan.
 // Bila cloud terputus, perubahan ditandai "menunggu" dan otomatis dikirim saat tersambung ulang.
 function saveToCloud(immediate) {
-  // PROTEKSI DATA SEKOLAH: data masih seed bawaan browser baru → JANGAN kirim ke cloud
-  // sampai terbukti cloud kosong (perangkat pertama) atau data asli sudah teradopsi
-  if (_dbFreshSeed || (db && db.__seed)) return;
+  // FULL ONLINE: hanya database sekolah yang sah boleh dikirim (bukan null/data rusak)
+  if (!db || !isValidDatabase(db)) return;
   if (!cloudConnected || !firebaseFS || !cloudServerConfirmed) {
     if (!isCloudDisabled()) cloudPendingPush = true; // antre: kirim begitu koneksi pulih
     return;
@@ -1736,10 +1729,9 @@ function pushToCloudNow() {
     showToast('Cloud belum tersambung', cloudConnectError || 'Tunggu ikon cloud berubah hijau, lalu coba lagi', 'warning');
     return;
   }
-  confirmDialog('Kirim Data ke Cloud', 'Seluruh data di browser ini akan ditulis ke Cloud Firestore dan otomatis tersinkron ke semua browser/perangkat lain. Melanjutkan?', function() {
-    _dbFreshSeed = false; // niat eksplisit pengguna — data lokal sah dikirim
+  confirmDialog('Kirim Data ke Cloud', 'Seluruh data sekolah pada browser ini akan ditulis ke Cloud Firestore dan otomatis tersinkron ke semua browser/perangkat lain. Melanjutkan?', function() {
     saveToCloud(true);
-    showToast('Mengirim ke cloud...', 'Database lokal sedang ditulis ke Cloud Firestore', 'info');
+    showToast('Mengirim ke cloud...', 'Database sekolah sedang ditulis ke Cloud Firestore', 'info');
   }, 'Ya, Kirim', 'emerald');
 }
 
@@ -1906,37 +1898,19 @@ function processRtdbSnapshot() {
   const parsed = parseRtdbBackup(val);
   if (parsed.ok) rtdbLastMeta = parsed.meta;
   updateRtdbStatusUI();
-  if (!parsed.ok) {
-    // Backup RTDB masih kosong — bila data lokal masih seed bawaan, seed sah dikirim sebagai backup awal
-    if (parsed.reason === 'empty' && _dbFreshSeed && isRtdbConnected()) { _dbFreshSeed = false; saveToRTDB(true); }
-    return; // backup masih kosong / belum lengkap
-  }
-  const metaMs = Date.parse(parsed.meta.updatedAt) || 0;
-  // ===== ANTI-REVERT BACKUP: backup lama tidak boleh menimpa perubahan lokal yang lebih baru =====
-  if (metaMs && metaMs < _lastRtdbMetaMs) return; // snapshot backup lebih tua dari yang pernah dilihat
-  if (rtdbPushTimer || rtdbPendingPush || (Date.now() - _dbLocalDirtyAt < 2500)) return; // ada tulisan lokal berjalan — tunggu
-  if (stableStringify(parsed.data) === stableStringify(db)) { _lastRtdbMetaMs = metaMs; return; } // sama dengan lokal — tidak ada yang perlu dipulihkan
-  // RTDB = jalur BACKUP: adopsi otomatis hanya saat Cloud Firestore benar-benar terputus
-  // (sudah lebih dari 8 detik, bukan sekadar jeda awal saat aplikasi baru dibuka)
-  const cloudDownLong = !isCloudConnected() && cloudDownSince !== null && (Date.now() - cloudDownSince > 8000);
-  if (cloudDownLong) {
-    const wasSeed = !!_dbFreshSeed; // bila lokal masih data contoh, backup asli MENGGANTIKAN penuh (bukan digabung)
-    _dbFreshSeed = false;
-    const changed = adoptCloudData(parsed.data, wasSeed); // MERGE anti-hilang: data lokal & backup digabung
-    _lastRtdbMetaMs = metaMs;
-    if (changed) {
-      saveDB(); // sebarkan hasil gabungan (localStorage + cloud saat pulih + RTDB)
-      if (session) rsNotifyNewData('Backup RTDB'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
-      else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — konten terbaru langsung dirender ulang
-    }
-  }
+  // ===== FULL ONLINE (Task 16): RTDB murni BACKUP TERTULIS — TIDAK PERNAH diadopsi otomatis =====
+  // Adopsi otomatis dulu menjadi sumber utama "data berubah sendiri & kembali seperti
+  // semula" (snapshot backup dari perangkat lain bisa lebih tua dari data live).
+  // Sumber data aplikasi HANYA Cloud Firestore realtime. Pemulihan dari backup RTDB
+  // tetap tersedia sebagai aksi EKSPLISIT Super Admin (tombol "Pulihkan dari Backup").
+  return;
 }
 
 // Kirim seluruh database lokal ke node backup RTDB (meta + chunk string).
 // Debounce 1400ms — dikirim sedikit lebih lambat dari Firestore agar jadi lapisan kedua.
 // Bila RTDB belum aktif, perubahan ditandai "menunggu" dan dikirim saat backup tersambung.
 function saveToRTDB(immediate) {
-  if (_dbFreshSeed || (db && db.__seed)) return; // seed bawaan browser baru — jangan timpa backup asli sebelum yakin node kosong
+  if (!db || !isValidDatabase(db)) return; // FULL ONLINE: hanya database sekolah yang sah dibackup
   if (!isRtdbActive() || !firebaseRTDB) {
     if (!isCloudDisabled()) rtdbPendingPush = true; // antre: kirim begitu RTDB tersambung
     return;
@@ -1973,14 +1947,13 @@ function saveToRTDB(immediate) {
   }
 }
 
-// Backup sekarang (tombol manual) — selalu boleh mengirim walau data masih seed (niat eksplisit pengguna)
+// Backup sekarang (tombol manual)
 function backupNowRTDB() {
   if (!isRtdbActive()) {
     showToast('RTDB belum tersambung', rtdbError || 'Sambungkan Realtime Database terlebih dahulu', 'warning');
     return;
   }
   showToast('Mengirim backup...', 'Menulis database ke Realtime Database', 'info');
-  _dbFreshSeed = false;
   saveToRTDB(true);
   writeRtdbHistory(true); // simpan juga sebagai versi riwayat yang dapat dipulihkan
 }
@@ -2729,15 +2702,12 @@ function markCloudConnected() {
   // Kirim perubahan yang tertahan selama offline
   if (cloudPendingPush) {
     cloudPendingPush = false;
-    if (_dbFreshSeed) {
-      console.log('[Firebase] Antrean berisi data seed bawaan — tidak dikirim agar data asli cloud tidak tertimpa');
-    } else {
-      try { saveToCloud(true); } catch (e) { /* dicoba lagi oleh watchdog */ }
-    }
+    try { saveToCloud(true); } catch (e) { /* dicoba lagi oleh watchdog */ }
   }
   if (wasDown) {
     showToast('Database tersambung kembali', 'Sinkronisasi cloud berjalan normal. Perubahan tertahan sedang dikirim.', 'success');
   }
+  updateOnlineGate(); // FULL ONLINE: buka gerbang kembali
   updateCloudStatusUI();
 }
 
@@ -2751,16 +2721,17 @@ function markCloudDisconnected(errMsg) {
       if (!isCloudConnected() && !isCloudDisabled() && cloudDownSince !== null) {
         const noInternet = !navigator.onLine;
         showToast(
-          noInternet ? 'Database Offline' : 'Database Cloud Terputus',
+          noInternet ? 'Koneksi Internet Terputus' : 'Database Cloud Terputus',
           noInternet
-            ? 'Tidak ada koneksi internet. Data tetap tersimpan aman di perangkat ini dan akan disinkronkan saat online.'
-            : (cloudConnectError || 'Koneksi ke server cloud terputus. Data tetap tersimpan aman di perangkat ini.'),
+            ? 'Aplikasi berjalan FULL ONLINE — sambungkan internet untuk melanjutkan. Aplikasi menyambung ulang otomatis.'
+            : 'Koneksi ke server cloud terputus — menyambung ulang otomatis. Aplikasi hanya bisa dipakai saat online.',
           'warning'
         );
       }
     }, 4000);
   }
   if (errMsg) cloudConnectError = errMsg;
+  updateOnlineGate(); // FULL ONLINE: tampilkan layar penghubung bila terputus lama
   updateCloudStatusUI();
 }
 
@@ -2834,9 +2805,8 @@ function updateDbIndicator() {
   const cloudDisabled = isCloudDisabled();
   const connected = isCloudConnected();
   const noInternet = !navigator.onLine;
-  const freshSeed = !!_dbFreshSeed; // browser baru masih menampilkan data contoh (database asli di cloud belum terjangkau)
   const show = !cloudDisabled && !connected;
-  const key = show ? [noInternet ? 'net' : 'db', cloudReconnecting ? 'rc' : 'id', freshSeed ? 'seed' : 'real', cloudConnectError || ''].join('|') : 'hide';
+  const key = show ? [noInternet ? 'net' : 'db', cloudReconnecting ? 'rc' : 'id', 'fullonline', cloudConnectError || ''].join('|') : 'hide';
   if (key === lastBannerKey) return; // tidak berubah — jangan render ulang
   lastBannerKey = key;
 
@@ -2868,23 +2838,13 @@ function updateDbIndicator() {
   } else if (noInternet) {
     if (inner) inner.className = 'bg-red-600 text-white text-xs sm:text-sm';
     if (iconEl) { iconEl.setAttribute('data-lucide', 'wifi-off'); iconEl.className = 'flex-shrink-0'; }
-    if (freshSeed) {
-      msg = 'Tidak ada koneksi internet — menampilkan DATA CONTOH. Database asli sekolah tersimpan aman di cloud.';
-      detail = 'Begitu perangkat terhubung internet, database sekolah akan dimuat otomatis dari cloud';
-    } else {
-      msg = 'Tidak ada koneksi internet — Database OFFLINE. Data tetap tersimpan aman di perangkat ini.';
-      detail = 'Perubahan akan otomatis disinkronkan saat internet tersambung kembali';
-    }
+    msg = 'Tidak ada koneksi internet — aplikasi FULL ONLINE memerlukan internet.';
+    detail = 'Data tersimpan aman di server cloud. Sambungkan internet — aplikasi menyambung ulang otomatis.';
   } else {
     if (inner) inner.className = 'bg-red-600 text-white text-xs sm:text-sm';
     if (iconEl) { iconEl.setAttribute('data-lucide', 'cloud-off'); iconEl.className = 'flex-shrink-0'; }
-    if (freshSeed) {
-      msg = 'Database cloud belum terjangkau — menampilkan DATA CONTOH. Database asli sekolah tersimpan aman di cloud.';
-      detail = 'Aplikasi akan memuat database sekolah otomatis begitu cloud tersambung';
-    } else {
-      msg = 'Database Cloud TERPUTUS — data tetap tersimpan aman di perangkat ini.';
-      detail = cloudConnectError || 'Aplikasi akan menyambung ulang otomatis. Perubahan tidak akan hilang.';
-    }
+    msg = 'Database Cloud TERPUTUS — aplikasi menyambung ulang otomatis.';
+    detail = cloudConnectError || 'Data tersimpan aman di server cloud. Perubahan tertahan dikirim otomatis begitu tersambung.';
   }
   if (textEl) textEl.textContent = msg;
   if (retryBtn) retryBtn.classList.toggle('hidden', cloudReconnecting);
@@ -2936,15 +2896,9 @@ function startDbWatchdog() {
 
   // Pemeriksaan rutin setiap 20 detik
   setInterval(function() {
-    // 1) Pulihkan localStorage bila terhapus saat aplikasi berjalan (anti "database hilang")
-    try {
-      if (db && !_dbFreshSeed && !db.__seed && !localStorage.getItem(DB_KEY)) {
-        localStorage.setItem(DB_KEY, JSON.stringify(db));
-        console.warn('[DB] Penyimpanan lokal hilang — database ditulis ulang otomatis');
-      }
-    } catch (e) { /* kuota penuh dsb. */ }
+    // FULL ONLINE: tidak ada lagi penulisan ulang localStorage — database hanya di cloud
 
-    if (isCloudDisabled() || !navigator.onLine) return;
+    if (isCloudDisabled() || !navigator.onLine) { updateOnlineGate(); return; }
 
     // 2) SDK belum termuat → coba muat ulang
     if (typeof firebase === 'undefined') {
@@ -3006,8 +2960,7 @@ function importDatabase(file) {
         return;
       }
       db = data;
-      _dbFreshSeed = false; // data hasil impor adalah data nyata — wajib terkirim ke cloud/backup
-      saveDB(); // tulis localStorage + cloud + RTDB (tampilan disegarkan di baris berikutnya)
+      saveDB(); // kirim ke cloud + backup RTDB (tampilan disegarkan di baris berikutnya)
       showToast('Database diimpor', 'Data berhasil dipulihkan dari file', 'success');
       if (session) { renderApp(); } else { renderLanding(); }
       lucide.createIcons();
@@ -3057,14 +3010,8 @@ function testFirebaseConnection() {
 }
 
 function disconnectFirebase() {
-  confirmDialog('Putus Cloud Database', 'Yakin ingin memutus koneksi cloud? Data akan tetap tersimpan di browser ini (localStorage), tapi tidak akan tersinkron antar perangkat.', function() {
-    localStorage.removeItem(CLOUD_CONFIG_KEY);
-    disableCloud();
-    resetCloudState();
-    activeCloudConfig = null;
-    showToast('Cloud database diputus', 'Mode penyimpanan: Lokal (browser ini saja). Aktifkan kembali lewat tombol "Gunakan Cloud Bawaan".', 'info');
-    refreshMainContent();
-  }, 'Ya, Putus', 'red');
+  // FULL ONLINE (Task 16): cloud TIDAK boleh dimatikan — satu-satunya penyimpanan data
+  showToast('Tidak dapat memutus cloud', 'Aplikasi berjalan FULL ONLINE — Cloud Firestore adalah satu-satunya tempat penyimpanan data sekolah.', 'warning');
 }
 
 function uid(prefix = 'id') { return prefix + '_' + Math.random().toString(36).slice(2, 11) + Date.now().toString(36).slice(-4); }
@@ -3082,287 +3029,12 @@ function daysUntil(d) { return Math.ceil((new Date(d).getTime() - Date.now()) / 
 function gradeLetter(score) { return score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'E'; }
 
 /* ============================================================
-   SEED DATABASE
+   SEED DATABASE DIHAPUS (Task 16 — FULL ONLINE)
+   Data contoh/akun demo (siswa, guru, tendik, kelas, mapel bawaan)
+   TIDAK ADA LAGI di aplikasi ini. Satu-satunya sumber data adalah
+   Cloud Firestore sekolah. Akun yang dihapus TIDAK PERNAH muncul
+   kembali karena tidak ada lagi mekanisme pembuatan data demo.
    ============================================================ */
-function seedDatabase() {
-  const db = {
-    schoolProfile: {
-      id: 'singleton', name: 'SMA Negeri Jayaloka', npsn: '20500001',
-      address: 'Jl. Pendidikan No. 1, Jayaloka, Kabupaten Musi Banyuasin, Sumatera Selatan',
-      phone: '0713-123456', email: 'info@smanejayaloka.sch.id', website: 'www.smanejayaloka.sch.id',
-      vision: 'Menjadi pusat pendidikan unggulan yang menghasilkan generasi berakhlak mulia, cerdas, mandiri, dan berdaya saing global pada tahun 2030.',
-      mission: '1. Menyelenggarakan pendidikan karakter berbasis nilai religius\n2. Mengembangkan kurikulum yang adaptif terhadap perkembangan zaman\n3. Membekali siswa dengan keterampilan abad 21\n4. Meningkatkan profesionalisme tenaga pendidik\n5. Membangun budaya literasi dan riset\n6. Menguatkan kemitraan dengan masyarakat dan dunia industri',
-      history: 'SMA Negeri Jayaloka didirikan pada tahun 1985 berdasarkan Surat Keputusan Menteri Pendidikan dan Kebudayaan. Berawal dari 3 rombongan belajar, kini SMA Negeri Jayaloka telah berkembang menjadi sekolah unggulan dengan 15 rombongan belajar dan terakreditasi "A". Lokasi sekolah berada di pusat kota Jayaloka dengan luas lahan 2 hektar.',
-      principalName: 'Dr. Bambang Sutrisno, M.Pd.', principalNip: '196805151994121002',
-      accreditation: 'A (Unggul)', foundedYear: 1985,
-      totalStudents: 540, totalTeachers: 35, totalStaff: 12,
-      // Logo sekolah (base64 data URL, kosong = pakai icon default)
-      logo: '',
-      // Hero section (Tampilan Depan)
-      heroTitle: 'SMA Negeri Jayaloka',
-      heroSubtitle: 'Membangun generasi berakhlak mulia, cerdas, mandiri, dan berdaya saing global melalui pendidikan berkualitas.',
-      heroBadge: 'Akreditasi A (Unggul)',
-      heroPrimaryButton: 'Masuk ke Sistem',
-      heroSecondaryButton: 'Tentang Sekolah',
-      heroWelcomeTitle: 'Masuk ke Sistem Informasi Sekolah',
-      heroWelcomeSubtitle: 'Akses portal pembelajaran dan informasi sekolah sesuai peran Anda:',
-      facilities: [
-        { id: 'fac_1', nama: 'Perpustakaan', jumlah: 1, keterangan: '3000 koleksi buku' },
-        { id: 'fac_2', nama: 'Laboratorium IPA', jumlah: 2, keterangan: 'Fisika & Biologi' },
-        { id: 'fac_3', nama: 'Laboratorium Komputer', jumlah: 2, keterangan: '40 unit PC' },
-        { id: 'fac_4', nama: 'Lapangan Olahraga', jumlah: 3, keterangan: 'Basket, Voli, Futsal' },
-        { id: 'fac_5', nama: 'Aula', jumlah: 1, keterangan: 'Kapasitas 500 orang' },
-        { id: 'fac_6', nama: 'Musholla', jumlah: 1, keterangan: 'Kapasitas 200 jamaah' },
-        { id: 'fac_7', nama: 'Kantin Sehat', jumlah: 5, keterangan: '5 stan' },
-        { id: 'fac_8', nama: 'Ruang BK', jumlah: 1, keterangan: 'Layanan konseling' },
-        { id: 'fac_9', nama: 'UKS', jumlah: 1, keterangan: 'Usaha Kesehatan Sekolah' }
-      ]
-    },
-    users: [], teachers: [], tendiks: [], students: [],
-    classes: [], courses: [], materials: [], assignments: [],
-    submissions: [], grades: [], attendances: [], announcements: [], news: [], logs: [], liveClasses: [], presentations: [],
-    tombstones: [] // catatan penghapusan permanen — cegah data terhapus muncul lagi dari snapshot basi
-  };
-
-  // Super Admin
-  const adminId = uid('usr');
-  db.users.push({
-    id: adminId, email: 'admin@smanejayaloka.sch.id', password: 'Smanja123',
-    name: 'Administrator Sistem', role: 'SUPER_ADMIN', nip: '196501011990031001',
-    loginId: 'Superadmin123',
-    phone: '081234567890', address: 'Jl. Pendidikan No. 1, Jayaloka',
-    gender: 'L', isActive: true, createdAt: now()
-  });
-
-  // Kepala Sekolah — role KEPSEK: akun pengawas kegiatan daring belajar-mengajar online
-  const kepsekId = uid('usr');
-  db.users.push({
-    id: kepsekId, email: 'kepsek@smanejayaloka.sch.id', password: 'kepsek123',
-    name: 'Dr. Bambang Sutrisno, M.Pd.', role: 'KEPSEK', nip: '196805151994121002',
-    position: 'Kepala Sekolah',
-    phone: '081234567891', gender: 'L', isActive: true, createdAt: now()
-  });
-  db.teachers.push({
-    id: uid('tch'), userId: kepsekId, nip: '196805151994121002',
-    name: 'Dr. Bambang Sutrisno, M.Pd.', email: 'kepsek@smanejayaloka.sch.id',
-    subject: 'Ekonomi', qualification: 'S2 Pendidikan Ekonomi', status: 'AKTIF'
-  });
-
-  // Guru-guru
-  const teachers = [
-    { name: 'Siti Nurhaliza, S.Pd.', nip: '197503101998032003', subject: 'Matematika', email: 'siti.guru@smanejayaloka.sch.id', gender: 'P' },
-    { name: 'Ahmad Fauzi, S.Pd.', nip: '197811202003101004', subject: 'Bahasa Indonesia', email: 'ahmad.guru@smanejayaloka.sch.id', gender: 'L' },
-    { name: 'Dewi Lestari, M.Si.', nip: '198405152008012005', subject: 'Fisika', email: 'dewi.guru@smanejayaloka.sch.id', gender: 'P' },
-    { name: 'Hendra Wijaya, S.Pd.', nip: '198207202009011006', subject: 'Biologi', email: 'hendra.guru@smanejayaloka.sch.id', gender: 'L' },
-    { name: 'Ratna Sari, S.Pd.', nip: '198508102010012007', subject: 'Bahasa Inggris', email: 'ratna.guru@smanejayaloka.sch.id', gender: 'P' },
-    { name: 'Joko Susilo, S.Pd.', nip: '197901152004011008', subject: 'Sejarah', email: 'joko.guru@smanejayaloka.sch.id', gender: 'L' }
-  ];
-  teachers.forEach(t => {
-    const userId = uid('usr');
-    db.users.push({
-      id: userId, email: t.email, password: 'guru123', name: t.name, role: 'GURU',
-      nip: t.nip, phone: '08' + Math.floor(1000000000 + Math.random() * 9000000000),
-      gender: t.gender, isActive: true, createdAt: now()
-    });
-    db.teachers.push({
-      id: uid('tch'), userId, nip: t.nip, name: t.name, email: t.email,
-      subject: t.subject, qualification: 'S1 Pendidikan', status: 'AKTIF'
-    });
-  });
-
-  // Tendik
-  const tendiks = [
-    { name: 'Sutrisno', nip: '197002101995031001', position: 'Kepala TU', email: 'sutrisno.tendik@smanejayaloka.sch.id' },
-    { name: 'Marlina', nip: '198211152003122002', position: 'Staff Perpustakaan', email: 'marlina.tendik@smanejayaloka.sch.id' },
-    { name: 'Budi Santoso', nip: '198508252008011003', position: 'Laboran IPA', email: 'budi.tendik@smanejayaloka.sch.id' }
-  ];
-  tendiks.forEach(t => {
-    const userId = uid('usr');
-    db.users.push({
-      id: userId, email: t.email, password: 'tendik123', name: t.name, role: 'TENDIK',
-      nip: t.nip, phone: '08' + Math.floor(1000000000 + Math.random() * 9000000000),
-      gender: 'L', isActive: true, createdAt: now()
-    });
-    db.tendiks.push({
-      id: uid('tdk'), userId, nip: t.nip, name: t.name, email: t.email,
-      position: t.position, unit: 'Tenaga Kependidikan', status: 'AKTIF'
-    });
-  });
-
-  // Classes
-  const classes = [
-    { name: 'X-IPA-1', level: 'X', major: 'IPA', room: 'R-101', homeroomIdx: 0 },
-    { name: 'X-IPA-2', level: 'X', major: 'IPA', room: 'R-102', homeroomIdx: 1 },
-    { name: 'XI-IPA-1', level: 'XI', major: 'IPA', room: 'R-201', homeroomIdx: 2 },
-    { name: 'XI-IPS-1', level: 'XI', major: 'IPS', room: 'R-202', homeroomIdx: 3 },
-    { name: 'XII-IPA-1', level: 'XII', major: 'IPA', room: 'R-301', homeroomIdx: 4 }
-  ];
-  classes.forEach(c => {
-    const homeroom = db.teachers[c.homeroomIdx + 1]; // +1 to skip kepsek
-    const classId = uid('cls');
-    db.classes.push({
-      id: classId, name: c.name, level: c.level, major: c.major, room: c.room,
-      capacity: 36, homeroomId: homeroom.id, createdAt: now()
-    });
-  });
-
-  // Courses
-  const subjects = [
-    { name: 'Matematika', code: 'MAT', teacherIdx: 1, classIdx: 0, schedule: 'Senin 08:00-09:30' },
-    { name: 'Bahasa Indonesia', code: 'BIN', teacherIdx: 2, classIdx: 0, schedule: 'Selasa 10:00-11:30' },
-    { name: 'Fisika', code: 'FIS', teacherIdx: 3, classIdx: 2, schedule: 'Rabu 08:00-09:30' },
-    { name: 'Biologi', code: 'BIO', teacherIdx: 4, classIdx: 2, schedule: 'Kamis 10:00-11:30' },
-    { name: 'Bahasa Inggris', code: 'BIG', teacherIdx: 5, classIdx: 0, schedule: 'Jumat 08:00-09:30' },
-    { name: 'Sejarah', code: 'SEJ', teacherIdx: 6, classIdx: 3, schedule: 'Senin 10:00-11:30' }
-  ];
-  subjects.forEach(s => {
-    db.courses.push({
-      id: uid('crs'), name: s.name, code: s.code,
-      teacherId: db.teachers[s.teacherIdx].id, classId: db.classes[s.classIdx].id,
-      description: 'Mata pelajaran ' + s.name, semester: 'GANJIL',
-      academicYear: '2025/2026', schedule: s.schedule, createdAt: now()
-    });
-  });
-
-  // Students
-  const studentNames = ['Andi Pratama', 'Bunga Citra', 'Citra Dewi', 'Dimas Anggara', 'Eka Putri', 'Fajar Ramadhan', 'Gita Lestari', 'Hadi Pranata', 'Indah Permata', 'Joko Anwar', 'Kirana Maharani', 'Lukman Hakim', 'Mega Utami', 'Nanda Pradipta', 'Olivia Sari', 'Putra Andika', 'Qori Ramadhani', 'Rizki Maulana', 'Sari Indah', 'Tono Suprapto'];
-  const classAssign = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4];
-  studentNames.forEach((name, i) => {
-    const nis = '2025' + (1001 + i);
-    const email = 'siswa' + (i + 1) + '@smanejayaloka.sch.id';
-    const gender = i % 2 === 0 ? 'L' : 'P';
-    const userId = uid('usr');
-    db.users.push({
-      id: userId, email, password: 'siswa123', name, role: 'SISWA', nis,
-      nisn: '00' + String(12345001 + i),
-      phone: '08' + Math.floor(1000000000 + Math.random() * 9000000000),
-      gender, birthPlace: 'Jayaloka', birthDate: '2008-0' + ((i % 9) + 1) + '-1' + (i % 9),
-      address: 'Jl. Pelajar No. ' + (i + 1) + ', Jayaloka', isActive: true, createdAt: now()
-    });
-    db.students.push({
-      id: uid('std'), userId, nis, nisn: '00' + String(12345001 + i), name, email, gender,
-      parentName: 'Orang Tua ' + name.split(' ')[0],
-      parentPhone: '08' + Math.floor(1000000000 + Math.random() * 9000000000),
-      classId: db.classes[classAssign[i]].id, status: 'AKTIF', createdAt: now()
-    });
-  });
-
-  // Materials
-  const materials = [
-    { courseCode: 'MAT', title: 'Bab 1: Sistem Persamaan Linear', content: 'Materi tentang SPLDV dan metode penyelesaiannya menggunakan substitusi dan eliminasi.', meetingKe: 1 },
-    { courseCode: 'MAT', title: 'Bab 2: Fungsi Kuadrat', content: 'Konsep fungsi kuadrat, grafik, dan titik puncak. Diskriminan dan akar-akar persamaan kuadrat.', meetingKe: 2 },
-    { courseCode: 'BIN', title: 'Bab 1: Teks Eksposisi', content: 'Definisi, struktur, dan ciri-ciri teks eksposisi. Contoh dan analisis teks.', meetingKe: 1 },
-    { courseCode: 'FIS', title: 'Bab 1: Besaran dan Vektor', content: 'Pengenalan besaran pokok dan turunan, dimensi, serta operasi vektor.', meetingKe: 1 },
-    { courseCode: 'BIO', title: 'Bab 1: Sel sebagai Unit Kehidupan', content: 'Struktur dan fungsi sel, organel sel, serta perbedaan sel prokariotik dan eukariotik.', meetingKe: 1 },
-    { courseCode: 'BIG', title: 'Unit 1: Greeting Card', content: 'Struktur kalimat greeting card, ungkapan formal dan informal, latihan menulis.', meetingKe: 1 }
-  ];
-  materials.forEach(m => {
-    const course = db.courses.find(c => c.code === m.courseCode);
-    if (!course) return;
-    const teacher = db.teachers.find(t => t.id === course.teacherId);
-    if (!teacher) return;
-    db.materials.push({
-      id: uid('mat'), courseId: course.id, title: m.title, content: m.content,
-      description: m.content.slice(0, 100), type: 'MATERI',
-      meetingKe: m.meetingKe, published: true, authorId: teacher.userId,
-      createdAt: now()
-    });
-  });
-
-  // Assignments
-  const assignments = [
-    { courseCode: 'MAT', title: 'Latihan SPLDV', desc: 'Kerjakan 10 soal SPLDV pada buku paket halaman 23-25. Kumpulkan jawaban dalam bentuk PDF.', dueDays: 7, maxScore: 100 },
-    { courseCode: 'MAT', title: 'Tugas Individu Fungsi Kuadrat', desc: 'Analisis grafik fungsi kuadrat y=x^2-4x+3. Tentukan titik potong, sumbu simetri, dan titik puncak.', dueDays: 14, maxScore: 100 },
-    { courseCode: 'BIN', title: 'Esai Teks Eksposisi', desc: 'Tulislah sebuah teks eksposisi dengan tema "Pentingnya Pendidikan" minimal 3 paragraf.', dueDays: 10, maxScore: 100 },
-    { courseCode: 'FIS', title: 'Laporan Praktikum Vektor', desc: 'Buat laporan praktikum penjumlahan vektor dengan metode grafis dan analitis.', dueDays: 5, maxScore: 100 },
-    { courseCode: 'BIO', title: 'Mind Map Struktur Sel', desc: 'Buatlah mind map struktur sel beserta fungsinya. Kumpulkan dalam format gambar.', dueDays: 8, maxScore: 100 },
-    { courseCode: 'BIG', title: 'Greeting Card Project', desc: 'Create 3 different greeting cards for: birthday, graduation, and get well soon.', dueDays: 6, maxScore: 100 }
-  ];
-  assignments.forEach(a => {
-    const course = db.courses.find(c => c.code === a.courseCode);
-    if (!course) return;
-    const teacher = db.teachers.find(t => t.id === course.teacherId);
-    if (!teacher) return;
-    const dueDate = new Date(Date.now() + a.dueDays * 86400000).toISOString();
-    db.assignments.push({
-      id: uid('asg'), courseId: course.id, title: a.title, description: a.desc,
-      type: 'INDIVIDU', maxScore: a.maxScore, dueDate, status: 'AKTIF',
-      authorId: teacher.userId, createdAt: now()
-    });
-  });
-
-  // Sample submission & grade for first student (Andi Pratama)
-  const andiStudent = db.students[0];
-  const andiCourses = db.courses.filter(c => c.classId === andiStudent.classId);
-  const andiAssignments = db.assignments.filter(a => andiCourses.some(c => c.id === a.courseId));
-  andiAssignments.slice(0, 3).forEach((a, i) => {
-    const subId = uid('sub');
-    const score = 75 + Math.floor(Math.random() * 20);
-    const grade = gradeLetter(score);
-    db.submissions.push({
-      id: subId, assignmentId: a.id, studentId: andiStudent.id,
-      content: 'Jawaban sudah saya kerjakan dengan baik. Mohon penilaian dari Bapak/Ibu guru.',
-      status: 'DINILAI', submittedAt: now(), createdAt: now()
-    });
-    db.grades.push({
-      id: uid('grd'), submissionId: subId, studentId: andiStudent.id,
-      courseId: a.courseId, assignmentId: a.id, score, grade,
-      feedback: 'Kerja bagus! Perhatikan kembali bagian ' + (i + 1) + ' untuk pemahaman lebih dalam.',
-      gradedById: adminId, gradedAt: now(), createdAt: now()
-    });
-  });
-
-  // Sample attendance for 10 students
-  const today = new Date(); today.setHours(8, 0, 0, 0);
-  db.students.slice(0, 10).forEach(s => {
-    db.attendances.push({
-      id: uid('att'), studentId: s.id, classId: s.classId, date: today.toISOString(),
-      status: ['HADIR', 'HADIR', 'HADIR', 'HADIR', 'SAKIT'][Math.floor(Math.random() * 5)],
-      note: '', recordedById: adminId, createdAt: now()
-    });
-  });
-
-  // Announcements
-  const anns = [
-    { title: 'Selamat Datang Tahun Ajaran 2025/2026', content: 'Kepala SMA Negeri Jayaloka mengucapkan selamat datang kepada seluruh siswa dan tenaga pendidik untuk tahun ajaran baru 2025/2026. Mari kita jadikan tahun ini sebagai tahun yang produktif dan penuh prestasi.', category: 'UMUM', isPinned: true },
-    { title: 'Jadwal Ujian Tengah Semester', content: 'Ujian tengah semester ganjil akan dilaksanakan pada tanggal 23-27 September 2025. Jadwal lengkap dapat diunduh pada halaman unduhan.', category: 'AKADEMIK', isPinned: true },
-    { title: 'Pendaftaran OSIS Periode 2025/2026', content: 'Dibuka pendaftaran calon pengurus OSIS periode 2025/2026. Formulir dapat diambil di Ruang TU.', category: 'KEGIATAN', isPinned: false },
-    { title: 'Info Beasiswa Prestasi', content: 'Beasiswa prestasi untuk siswa berprestasi akademik dan non-akademik dibuka. Syarat: nilai rata-rata minimal 85.', category: 'BEASISWA', isPinned: false },
-    { title: 'PPDB Tahun Ajaran 2026/2027', content: 'Penerimaan Peserta Didik Baru tahun ajaran 2026/2027 dibuka mulai 1 Januari 2026.', category: 'PPDB', isPinned: false }
-  ];
-  anns.forEach(a => {
-    db.announcements.push({
-      id: uid('ann'), title: a.title, content: a.content, category: a.category,
-      isPinned: a.isPinned, publishedAt: now(), authorId: adminId, createdAt: now()
-    });
-  });
-
-  // News
-  const news = [
-    { title: 'Siswa SMA Negeri Jayaloka Raih Juara 1 Olimpiade Sains', excerpt: 'Tim Olimpiade Sains berhasil meraih juara 1 tingkat provinsi', content: 'SMA Negeri Jayaloka kembali membanggakan dengan diraihkannya juara 1 Olimpiade Sains Nasional tingkat provinsi oleh tim yang terdiri dari 3 siswa kelas XI IPA.' },
-    { title: 'Peringatan HUT ke-40 SMA Negeri Jayaloka', excerpt: 'Serangkaian acara digelar dalam rangka HUT ke-40 sekolah', content: 'Dalam rangka HUT ke-40 SMA Negeri Jayaloka, digelar berbagai acara seperti lomba antar kelas, pentas seni, pameran karya siswa, dan reuni alumni.' },
-    { title: 'Kunjungan Industri ke PT Pertamina', excerpt: 'Siswa kelas XII melakukan kunjungan industri', content: 'Siswa kelas XII IPA melakukan kunjungan industri ke PT Pertamina untuk mempelajari proses produksi minyak dan gas.' }
-  ];
-  news.forEach(n => {
-    db.news.push({
-      id: uid('nws'), title: n.title, excerpt: n.excerpt, content: n.content,
-      category: 'BERITA', publishedAt: now(), authorId: adminId, isPublished: true, createdAt: now()
-    });
-  });
-
-  // ===== PENANDA DATA DEMO (Task 11) =====
-  // Semua record bawaan pabrik diberi tanda _seed:true. Merge anti-hilang memakai
-  // tanda ini agar data demo TIDAK PERNAH menyebar ke cloud/database asli ketika
-  // browser baru membuka situs (penyebab users & data demo membanjiri database),
-  // sementara record asli buatan pengguna tetap terlindungi penuh anti-hilang.
-  Object.keys(db).forEach(function(k) {
-    if (Array.isArray(db[k])) db[k].forEach(function(r) { if (r && typeof r === 'object' && !r._seed) r._seed = true; });
-  });
-  db.__seed = true; // penanda level-database: ini DATA CONTOH — tidak boleh menyebar/menggantikan database asli
-
-  return db;
-}
-
 /* ============================================================
    AUTH HELPERS
    ============================================================ */
@@ -3398,11 +3070,17 @@ function handleLogin(e) {
     if (!user) {
       user = db.users.find(u => (u.role === 'GURU' || u.role === 'TENDIK' || u.role === 'KEPSEK') && u.nip === loginId && u.password === password);
     }
-    // 3. Siswa: login with NISN
+    // 3. Siswa: login dengan NIS (utama) atau NISN (fallback) — Task 17
     if (!user) {
-      const student = db.students.find(s => s.nisn === loginId);
-      if (student) {
-        user = db.users.find(u => u.id === student.userId && u.password === password);
+      const lid = String(loginId).trim();
+      const matchedStudents = db.students.filter(s => String(s.nis || '') === lid || String(s.nisn || '') === lid);
+      for (const st of matchedStudents) {
+        const cand = db.users.find(u => u.id === st.userId && u.password === password);
+        if (cand) { user = cand; break; }
+      }
+      if (!user) {
+        // Akun siswa yang belum memiliki profil students terhubung
+        user = db.users.find(u => u.role === 'SISWA' && String(u.nis || '') === lid && u.password === password);
       }
     }
     // 4. Fallback: try email (backward compatibility)
@@ -3411,7 +3089,7 @@ function handleLogin(e) {
       user = db.users.find(u => u.email === emailLower && u.password === password);
     }
     if (!user) {
-      showToast('Login Gagal', 'NIP/NISN/Username atau password salah', 'error');
+      showToast('Login Gagal', 'NIP/NIS/Username atau password salah', 'error');
       btn.disabled = false;
       btn.innerHTML = '<i data-lucide="log-in" style="font-size: 16px;"></i> Masuk';
       lucide.createIcons();
@@ -3680,22 +3358,17 @@ function scrollToSection(id) {
    APP RENDERING
    ============================================================ */
 function renderApp() {
+  // FULL ONLINE (Task 16): database TIDAK dibaca dari browser — hanya dari cloud.
+  // loadDB memicu initFirebase; data tiba via listener realtime → handleCloudSnapshot
+  // membangun db → boot loader dibuka → renderApp dipanggil ulang dengan data utuh.
   loadDB(); loadSession();
+  if (!db) { showOnlineGate('connect'); return; } // menunggu data dari server cloud
   if (!session) rsRescueSession(); // sesi hilang dari storage (dibersihkan/eviksi) → pulihkan dari cadangan dulu
   loadUIState();
-  // Pengaman sesi: akun pada sesi tidak ditemukan di data terbaru → COBA PULIHKAN DULU
-  // (baca ulang storage, lalu backup lokal) — logout hanya bila akun benar-benar tidak ada
+  // Pengaman sesi: akun pada sesi tidak ditemukan di data cloud terbaru → coba pulihkan
+  // sesi dari salinan cadangan; logout hanya bila akun benar-benar sudah tidak ada.
   if (session && !getCurrentUser()) {
-    try { rsReloadFromStorage(); } catch (e) { /* abaikan */ }
-    if (!getCurrentUser()) {
-      const bak = parseDbJson(localStorage.getItem(DB_BAK_KEY));
-      if (bak && session.userId && bak.users.some(function(u) { return u.id === session.userId; })) {
-        db = bak; _dbFreshSeed = false;
-        try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota */ }
-        rsNoteLocalWrite();
-        console.warn('[APP] Sesi diselamatkan dari backup lokal');
-      }
-    }
+    try { rsRescueSession(); } catch (e) { /* abaikan */ }
   }
   if (session && !getCurrentUser()) {
     session = null; saveSession();
@@ -3772,13 +3445,13 @@ function toggleCloudStatus(e) {
   e.stopPropagation();
   const cfg = activeCloudConfig || EMBEDDED_FIREBASE_CONFIG;
   if (isCloudConnected()) {
-    showToast('Cloud Database: Aktif', 'Data tersinkron real-time via Cloud Firestore (project ' + (cfg.projectId || '-') + ')', 'success');
+    showToast('Cloud Database: Aktif', 'Data tersinkron real-time via Cloud Firestore (project ' + (cfg.projectId || '-') + ') — tampil di semua browser online', 'success');
   } else if (isCloudDisabled()) {
-    showToast('Cloud: Dimatikan', 'Sinkronisasi cloud dimatikan dari halaman Database & Cloud. Data hanya tersimpan di browser ini.', 'info');
+    showToast('Cloud: Dimatikan', 'Aplikasi berjalan FULL ONLINE — aktifkan kembali cloud lewat halaman Database & Cloud.', 'info');
   } else if (cloudConnectError) {
     showToast('Cloud: Butuh Perhatian', cloudConnectError, 'warning');
   } else {
-    showToast('Cloud: Offline', 'Menyambungkan ke server cloud / periksa koneksi internet. Data tetap tersimpan aman di browser ini.', 'info');
+    showToast('Cloud: Menyambungkan...', 'Aplikasi FULL ONLINE — data hanya tersimpan di server cloud, bukan di browser.', 'info');
   }
 }
 
@@ -4253,11 +3926,12 @@ function _bootFinish(reason) {
   }, 600);
 }
 
-// Tombol "Lanjutkan tanpa menunggu" (muncul setelah 10 detik)
+// Tombol "Muat Ulang Halaman" (muncul bila server cloud belum terjangkau 10 detik)
+// FULL ONLINE: aplikasi tidak dibuka tanpa data cloud — muat ulang untuk mencoba lagi.
 function bootSkipNow() {
   if (_bootDone) return;
-  console.log('[BOOT] Dilanjutkan manual oleh pengguna');
-  _bootFinish('Dibuka oleh pengguna — sinkronisasi database tetap berjalan');
+  console.log('[BOOT] Muat ulang diminta pengguna (server cloud belum terjangkau)');
+  try { location.reload(); } catch (e) { /* abaikan */ }
 }
 window.bootSkipNow = bootSkipNow;
 
@@ -4276,19 +3950,18 @@ window.bootSkipNow = bootSkipNow;
     if (_bootDone) return;
     var now = Date.now();
 
-    // LANGKAH 1 — database terbaca (localStorage / pulihan backup / adopsi cloud)
+    // LANGKAH 1 — database sekolah terbaca (FULL ONLINE: hanya dari cloud)
     if (db && isValidDatabase(db)) _bootStep(1, 'ok');
-    else _bootStep(1, db ? 'active' : 'fail');
+    else _bootStep(1, 'active');
 
-    // LANGKAH 2 — koneksi Database Cloud (server dikonfirmasi langsung, bukan cache)
+    // LANGKAH 2 — koneksi Database Cloud (WAJIB — tidak ada lagi fallback lokal)
     if (_bootS2 === null) {
       var cloudDisabled = false;
       try { cloudDisabled = isCloudDisabled(); } catch (e) { /* abaikan */ }
-      if (cloudDisabled) {
-        _bootS2 = 'skip'; // cloud dimatikan sengaja — database lokal dipakai
-      } else if (!navigator.onLine) {
-        _bootS2 = 'skip'; // offline — database lokal dipakai, sinkron nanti
-        _bootStatus('Mode offline — database lokal siap', 'Data akan tersinkron otomatis saat internet tersambung');
+      if (!navigator.onLine) {
+        _bootStatus('Tidak ada koneksi internet', 'Aplikasi FULL ONLINE menunggu internet aktif — menyambung otomatis...');
+      } else if (cloudDisabled) {
+        _bootStatus('Cloud dimatikan', 'Aplikasi berjalan FULL ONLINE — aktifkan cloud untuk melanjutkan');
       } else if (typeof isCloudConnected === 'function' && isCloudConnected()) {
         // Server cloud benar-benar merespons — tunggu data sekolah terbaca dari server
         if (_bootConnectedAt === null) {
@@ -4298,51 +3971,69 @@ window.bootSkipNow = bootSkipNow;
         var snapshotIdle = !cloudSnapshotBuffer && !cloudSnapshotTimer && !_cloudPushInFlight;
         if (_bootSnapshotWaitT0 === null) _bootSnapshotWaitT0 = now;
         var dataRead = snapshotIdle && (now - _bootConnectedAt) >= 1400;
-        var dataWaitCap = (now - _bootSnapshotWaitT0) > 3500; // jangan menunggu data terlalu lama
+        var dataWaitCap = (now - _bootSnapshotWaitT0) > 6000; // jangan menunggu data terlalu lama
         if (dataRead || dataWaitCap) {
           _bootS2 = 'ok';
+          _bootStep(2, 'ok');
         } else {
           _bootStatus('Terhubung ke Database Cloud', 'Membaca data sekolah dari server...');
         }
+      } else if (cloudEmptyConfirmed) {
+        // Server terjangkau tetapi database cloud KOSONG — aplikasi tidak bisa dibuka tanpa data
+        _bootStep(2, 'ok');
+        _bootStep(3, 'fail');
+        _bootStatus('Database cloud kosong', 'Hubungi Super Admin — pemulihan data tersedia di halaman Database & Cloud');
+        var btnE = _bootEl('boot-skip-btn');
+        if (btnE) btnE.style.display = 'inline-block';
+        setTimeout(tick, 600);
+        return;
       } else if (cloudConnectError && !cloudConnected && !cloudListening && !cloudReconnecting) {
-        // Server dipastikan tidak dapat dihubungi (error definitif) — lanjut dengan database lokal
-        _bootS2 = 'skip';
-        _bootStatus('Server cloud belum dapat dihubungi', 'Membuka dengan database lokal — tersinkron otomatis nanti');
+        // Error definitif — tetap MENUNGGU sambung-ulang otomatis (watchdog aktif), tampilkan status
+        _bootStep(2, 'fail');
+        _bootStatus('Server cloud belum dapat dihubungi', 'Aplikasi FULL ONLINE menunggu koneksi — cek internet Anda. Menyambung ulang otomatis...');
+        var btnE2 = _bootEl('boot-skip-btn');
+        if (btnE2) btnE2.style.display = 'inline-block';
+        setTimeout(tick, 800);
+        return;
       } else if (now - _bootT0 > 9000) {
-        // Batas tunggu koneksi 9 detik — jangan biarkan halaman menunggu selamanya
-        _bootS2 = 'skip';
-        _bootStatus('Koneksi server lambat', 'Membuka dengan database lokal — tersinkron otomatis nanti');
+        // Batas tunggu 9 detik — TANPA fallback lokal: tampilkan status gagal + tombol muat ulang,
+        // watchdog tetap mencoba menyambung; begitu tersambung langkah 2 menjadi 'ok' otomatis.
+        _bootStep(2, 'fail');
+        _bootStatus('Koneksi server lambat', 'Aplikasi FULL ONLINE menunggu server — pastikan internet aktif. Menyambung ulang otomatis...');
+        var btnE3 = _bootEl('boot-skip-btn');
+        if (btnE3) btnE3.style.display = 'inline-block';
+        setTimeout(tick, 800);
+        return;
       } else {
         _bootStatus('Menghubungkan ke Database...', 'Menghubungi server database sekolah');
       }
       if (_bootS2 !== null) _bootStep(2, _bootS2);
     }
 
-    // LANGKAH 3 — verifikasi data sekolah terbaca dari database
+    // LANGKAH 3 — verifikasi data sekolah terbaca dari database cloud
     var step2Done = _bootS2 !== null;
     var dataValid = !!(db && isValidDatabase(db));
     if (step2Done && dataValid) {
       if (!_bootEl('boot-step-3').classList.contains('ok')) {
         _bootStep(3, 'ok');
         _bootBar(80);
-        _bootStatus('Data sekolah terbaca dari database', _bootCounts());
+        _bootStatus('Data sekolah terbaca dari database cloud', _bootCounts());
       }
     } else if (step2Done) {
       _bootStep(3, 'fail');
     }
 
-    // LANGKAH 4 — tampilan disiapkan, lalu halaman dibuka
+    // LANGKAH 4 — tampilan disiapkan, lalu halaman dibuka (HANYA dengan data cloud utuh)
     if (step2Done && dataValid) {
       _bootStep(4, 'active');
       _bootBar(92);
       if (now - _bootT0 >= 1800) { _bootFinish(); return; } // tampil minimal 1,8 dtk agar status terbaca
     }
 
-    // Pengaman mutlak: 18 detik — halaman selalu terbuka dengan data yang tersedia
-    if (now - _bootT0 > 18000) { _bootFinish('Dibuka dengan data yang tersedia — sinkronisasi tetap berjalan'); return; }
+    // FULL ONLINE: TIDAK ada lagi buka-paksa tanpa data — halaman menunggu data cloud;
+    // watchdog menyambung ulang otomatis dan tombol "Muat Ulang" selalu tersedia.
 
-    setTimeout(tick, 120);
-  };
+    setTimeout(tick, 120);  };
   setTimeout(tick, 250);
 })();
 </script>
@@ -6587,9 +6278,9 @@ function openUserForm(userId, defaultRole, lockRole) {
         ${field('Email *', inputText('uf-email', user?.email || '', { type: 'email', required: true }))}
         ${field('Password ' + (user ? '(kosongkan jika tidak diubah)' : '*'), inputText('uf-password', '', { type: 'password' }))}
         ${field('Role *' + (lock ? ' <span class="text-xs text-gray-400">(tidak dapat diubah)</span>' : ''), selectField('uf-role', roleOptions, fixedRole))}
-        ${field(user?.role === 'SISWA' ? 'NIS (Nomor Induk Siswa)' : 'NIP', inputText('uf-idnum', user?.role === 'SISWA' ? user?.nis : user?.nip, {}))}
+        ${field(user?.role === 'SISWA' ? 'NIS (Nomor Induk Siswa) *' : 'NIP', inputText('uf-idnum', user?.role === 'SISWA' ? user?.nis : user?.nip, {}))}
         <div id="uf-nisn-field" style="${user?.role === 'SISWA' ? '' : 'display:none'}">
-          ${field('NISN (untuk login siswa) *', inputText('uf-nisn', user?.nisn || (user?.role === 'SISWA' ? '' : ''), { placeholder: '10 digit NISN', required: false }))}
+          ${field('NISN (opsional — login siswa memakai NIS)', inputText('uf-nisn', user?.nisn || (user?.role === 'SISWA' ? '' : ''), { placeholder: '10 digit NISN', required: false }))}
         </div>
         ${field('Jenis Kelamin', selectField('uf-gender', [{ value: 'L', label: 'Laki-laki' }, { value: 'P', label: 'Perempuan' }], user?.gender || 'L'))}
         ${field('Telepon', inputText('uf-phone', user?.phone || ''))}
@@ -6800,6 +6491,8 @@ function saveUser(e, userId) {
   // Validasi dasar
   if (!name || !email) { showToast('Data belum lengkap', 'Nama Lengkap dan Email wajib diisi', 'error'); return; }
   if (!isEdit && !password) { showToast('Password wajib diisi', 'Isi password untuk akun baru', 'error'); return; }
+  // NIS wajib untuk akun Siswa — dipakai untuk login siswa (Task 17)
+  if (role === 'SISWA' && !String(idnum || '').trim()) { showToast('NIS wajib diisi', 'NIS (Nomor Induk Siswa) dipakai siswa untuk login', 'error'); return; }
 
   if (isEdit) {
     const u = db.users.find(x => x.id === userId);
@@ -6954,7 +6647,7 @@ function downloadUserTemplate(role) {
       ['1. Isi data pada sheet "Data Akun" mulai baris kedua (baris contoh boleh dihapus).'],
       ['2. Kolom wajib: Role, Nama Lengkap, dan Email. Password boleh dikosongkan -> memakai default (Siswa: siswa123, Guru: guru123, Tendik: tendik123).'],
       ['3. Isi kolom Role dengan salah satu: Siswa / Guru / Tendik.'],
-      ['4. Siswa: wajib mengisi NIS, disarankan mengisi NISN (dipakai untuk login siswa), dan Kolom Kelas harus sama persis dengan daftar di sheet "Daftar Kelas".'],
+      ['4. Siswa: wajib mengisi NIS (dipakai untuk login siswa), NISN opsional, dan Kolom Kelas harus sama persis dengan daftar di sheet "Daftar Kelas".'],
       ['5. Guru: isi NIP, Mata Pelajaran, dan Kualifikasi. Tendik: isi NIP dan Jabatan.'],
       ['6. Jika Email / NIS / NIP sudah terdaftar, data akun tersebut akan DIPERBARUI sesuai baris ini (tidak dibuat duplikat). Password hanya berubah jika kolom Password diisi.'],
       ['7. Jenis Kelamin diisi L atau P. Tanggal Lahir format YYYY-MM-DD (atau format tanggal Excel biasa).'],
