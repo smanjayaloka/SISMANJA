@@ -5583,6 +5583,7 @@ window.ADMIN_PAGES = {
               <button onclick="openMapelForm(null, '${c.id}')" class="px-3 py-1 text-xs border border-emerald-200 text-emerald-700 hover:bg-emerald-50 rounded-md flex items-center gap-1"><i data-lucide="book-plus" style="font-size: 12px;"></i> Tambah Mapel</button>
               <button onclick="openKenaikanKelas('${c.id}')" class="px-3 py-1 text-xs border border-emerald-200 text-emerald-700 hover:bg-emerald-50 rounded-md flex items-center gap-1"><i data-lucide="trending-up" style="font-size: 12px;"></i> Naik Kelas</button>
               <button onclick="openKelasForm('${c.id}')" class="px-3 py-1 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="edit" style="font-size: 12px;"></i> Edit</button>
+              <button onclick="deleteKelas('${c.id}')" class="px-3 py-1 text-xs border border-red-200 text-red-600 hover:bg-red-50 rounded-md flex items-center gap-1" title="Hapus kelas beserta data terkait"><i data-lucide="trash-2" style="font-size: 12px;"></i> Hapus</button>
             </div>
           </div>`;
         }).join('')}
@@ -7110,6 +7111,164 @@ function saveKelas(e, classId) {
   saveDB();
   closeModal();
   showToast('Kelas disimpan', '', 'success');
+  refreshMainContent();
+}
+
+/* ============ HAPUS KELAS (Super Admin) ============
+   Menghapus kelas beserta seluruh data terkait secara permanen:
+   mapel di kelas itu, materi, tugas, pengumpulan, nilai, presentasi,
+   jadwal live class, dan rekap absensi kelas. Siswa di kelas bisa
+   dipindahkan ke kelas lain ATAU ikut dihapus (akun + datanya).
+   Semua penghapusan dicatat lewat recordTombstone agar tidak
+   dihidupkan kembali oleh merge anti-hilang & tersinkron ke
+   seluruh perangkat. */
+function _deleteKelasImpact(classId) {
+  const courseIds = db.courses.filter(c => c.classId === classId).map(c => c.id);
+  const assignmentIds = db.assignments.filter(a => courseIds.includes(a.courseId)).map(a => a.id);
+  return {
+    students: db.students.filter(s => s.classId === classId),
+    courses: db.courses.filter(c => c.classId === classId),
+    materials: db.materials.filter(m => courseIds.includes(m.courseId)),
+    assignments: db.assignments.filter(a => courseIds.includes(a.courseId)),
+    submissions: db.submissions.filter(s => assignmentIds.includes(s.assignmentId)),
+    grades: db.grades.filter(g => assignmentIds.includes(g.assignmentId) || courseIds.includes(g.courseId)),
+    presentations: (db.presentations || []).filter(p => courseIds.includes(p.courseId)),
+    liveClasses: (db.liveClasses || []).filter(l => l.classId === classId || courseIds.includes(l.courseId)),
+    attendances: (db.attendances || []).filter(a => a.classId === classId)
+  };
+}
+
+function deleteKelas(classId) {
+  const user = getCurrentUser();
+  if (!user || user.role !== 'SUPER_ADMIN') { showToast('Tidak diizinkan', 'Hanya Super Admin yang dapat menghapus kelas', 'error'); return; }
+  const cls = db.classes.find(c => c.id === classId);
+  if (!cls) { showToast('Kelas tidak ditemukan', 'Data kelas mungkin sudah dihapus', 'error'); return; }
+  const imp = _deleteKelasImpact(classId);
+  const otherClasses = db.classes.filter(c => c.id !== classId)
+    .slice().sort((a, b) => String(a.name).localeCompare(String(b.name), 'id', { numeric: true }));
+  const wali = db.teachers.find(t => t.id === cls.homeroomId);
+
+  const impactRows = [
+    ['Siswa di kelas ini', imp.students.length],
+    ['Mata pelajaran', imp.courses.length],
+    ['Materi', imp.materials.length],
+    ['Tugas', imp.assignments.length],
+    ['Pengumpulan tugas siswa', imp.submissions.length],
+    ['Nilai', imp.grades.length],
+    ['Presentasi', imp.presentations.length],
+    ['Jadwal Live Class', imp.liveClasses.length],
+    ['Rekap absensi kelas', imp.attendances.length]
+  ].filter(r => r[1] > 0);
+
+  let studentChoiceHtml = '';
+  if (imp.students.length) {
+    studentChoiceHtml = `
+      <div class="mt-3 p-3 rounded-lg bg-amber-50 border border-amber-200">
+        <p class="text-xs font-semibold text-amber-800 mb-2">Apa yang dilakukan terhadap ${imp.students.length} siswa di kelas ini?</p>
+        ${otherClasses.length ? `
+        <label class="flex items-start gap-2 text-xs text-gray-700 mb-2 cursor-pointer">
+          <input type="radio" name="dk-fate" value="move" checked class="mt-0.5">
+          <span>Pindahkan semua siswa ke kelas lain</span>
+        </label>
+        <div class="ml-5 mb-3">
+          <select id="dk-target" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+            ${otherClasses.map(c => `<option value="${c.id}">${c.name} (Tingkat ${c.level} • ${db.students.filter(s => s.classId === c.id).length} siswa)</option>`).join('')}
+          </select>
+        </div>
+        ` : `<p class="text-xs text-gray-600 mb-3">Belum ada kelas lain, jadi siswa tidak dapat dipindahkan.</p>`}
+        <label class="flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
+          <input type="radio" name="dk-fate" value="delete" class="mt-0.5">
+          <span><span class="text-red-600 font-medium">Hapus juga seluruh siswa kelas ini</span> — akun login siswa, nilai, pengumpulan tugas, dan absensinya ikut dihapus permanen.</span>
+        </label>
+      </div>`;
+  } else {
+    studentChoiceHtml = '<div class="mt-3 p-3 rounded-lg bg-gray-50 border text-xs text-gray-500">Kelas ini tidak memiliki siswa, jadi tidak ada data siswa yang terpengaruh.</div>';
+  }
+
+  const body = `
+    <p class="text-sm text-gray-600">Anda akan menghapus kelas <strong>${cls.name}</strong> (Tingkat ${cls.level} • ${cls.major}${wali ? ' • Wali: ' + wali.name : ''}).</p>
+    <div class="mt-3 p-3 rounded-lg bg-red-50 border border-red-100">
+      <p class="text-xs font-semibold text-red-700 mb-2">Data berikut ikut terhapus permanen bersama kelas ini:</p>
+      ${impactRows.length ? `<ul class="text-xs text-red-600 space-y-0.5 list-disc list-inside">${impactRows.map(r => `<li>${r[0]}: <b>${r[1]}</b></li>`).join('')}</ul>` : '<p class="text-xs text-red-600">Tidak ada data terkait di kelas ini.</p>'}
+    </div>
+    ${studentChoiceHtml}
+    <p class="text-xs text-gray-400 mt-3">Tindakan ini tidak dapat dibatalkan dan akan tersinkron ke semua perangkat — data yang sudah dihapus tidak akan muncul kembali.</p>
+  `;
+  showModal('Hapus Kelas ' + cls.name, body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Ya, Hapus Kelas', "deleteKelasConfirm('" + classId + "')", { variant: 'destructive', icon: 'trash-2' })
+  );
+}
+
+function deleteKelasConfirm(classId) {
+  const user = getCurrentUser();
+  if (!user || user.role !== 'SUPER_ADMIN') { showToast('Tidak diizinkan', 'Hanya Super Admin yang dapat menghapus kelas', 'error'); return; }
+  const cls = db.classes.find(c => c.id === classId);
+  if (!cls) { showToast('Kelas tidak ditemukan', 'Data kelas mungkin sudah dihapus', 'error'); return; }
+
+  const fateEl = document.querySelector('input[name="dk-fate"]:checked');
+  const fate = fateEl ? fateEl.value : 'move';
+  const students = db.students.filter(s => s.classId === classId);
+  let targetName = '';
+
+  if (students.length && fate === 'move') {
+    const targetEl = document.getElementById('dk-target');
+    const target = db.classes.find(c => c.id === (targetEl ? targetEl.value : '') && c.id !== classId);
+    if (!target) { showToast('Kelas tujuan belum dipilih', 'Pilih kelas tujuan pemindahan siswa terlebih dahulu', 'error'); return; }
+    students.forEach(s => { s.classId = target.id; s.updatedAt = now(); });
+    targetName = target.name;
+  }
+
+  const imp = _deleteKelasImpact(classId);
+  const courseIds = imp.courses.map(c => c.id);
+  const assignmentIds = imp.assignments.map(a => a.id);
+  const studentIds = students.map(s => s.id);
+  const studentUserIds = students.map(s => s.userId).filter(Boolean);
+  const deleteStudents = students.length > 0 && fate === 'delete';
+
+  /* 1) Catat tombstone: kelas + kaskade mapel & datanya */
+  recordTombstone('classes', classId);
+  imp.courses.forEach(c => recordTombstone('courses', c.id));
+  imp.materials.forEach(m => recordTombstone('materials', m.id));
+  imp.assignments.forEach(a => recordTombstone('assignments', a.id));
+  imp.submissions.forEach(s => recordTombstone('submissions', s.id));
+  imp.grades.forEach(g => recordTombstone('grades', g.id));
+  imp.presentations.forEach(p => recordTombstone('presentations', p.id));
+  imp.liveClasses.forEach(l => recordTombstone('liveClasses', l.id));
+  imp.attendances.forEach(a => recordTombstone('attendances', a.id));
+
+  /* 2) Bila siswa ikut dihapus: profil siswa + akun login + seluruh data akademiknya */
+  if (deleteStudents) {
+    students.forEach(s => recordTombstone('students', s.id));
+    db.submissions.filter(s => studentIds.includes(s.studentId)).forEach(s => recordTombstone('submissions', s.id));
+    db.grades.filter(g => studentIds.includes(g.studentId)).forEach(g => recordTombstone('grades', g.id));
+    (db.attendances || []).filter(a => studentIds.includes(a.studentId)).forEach(a => recordTombstone('attendances', a.id));
+    studentUserIds.forEach(uidv => recordTombstone('users', uidv));
+  }
+
+  /* 3) Buang record dari database */
+  db.classes = db.classes.filter(c => c.id !== classId);
+  db.courses = db.courses.filter(c => c.classId !== classId);
+  db.materials = db.materials.filter(m => !courseIds.includes(m.courseId));
+  db.assignments = db.assignments.filter(a => !courseIds.includes(a.courseId));
+  db.submissions = db.submissions.filter(s => !assignmentIds.includes(s.assignmentId) && !(deleteStudents && studentIds.includes(s.studentId)));
+  db.grades = db.grades.filter(g => !assignmentIds.includes(g.assignmentId) && !courseIds.includes(g.courseId) && !(deleteStudents && studentIds.includes(g.studentId)));
+  db.presentations = (db.presentations || []).filter(p => !courseIds.includes(p.courseId));
+  db.liveClasses = (db.liveClasses || []).filter(l => l.classId !== classId && !courseIds.includes(l.courseId));
+  db.attendances = (db.attendances || []).filter(a => a.classId !== classId && !(deleteStudents && studentIds.includes(a.studentId)));
+  if (deleteStudents) {
+    db.students = db.students.filter(s => !studentIds.includes(s.id));
+    db.users = db.users.filter(u => !studentUserIds.includes(u.id));
+  }
+
+  /* 4) Catat log, simpan (otomatis sinkron cloud/RTDB/antar-tab), segarkan tampilan */
+  const ringkasSiswa = students.length
+    ? (fate === 'move' ? students.length + ' siswa dipindah ke ' + targetName : students.length + ' siswa ikut dihapus')
+    : 'tanpa siswa';
+  db.logs.push({ id: uid('log'), userId: user.id, action: 'HAPUS KELAS', detail: 'Hapus kelas ' + cls.name + ' — ' + imp.courses.length + ' mapel, ' + ringkasSiswa, createdAt: now() });
+  saveDB();
+  closeModal();
+  showToast('Kelas dihapus', cls.name + ' dihapus dari database' + (students.length && fate === 'move' ? ' • ' + students.length + ' siswa dipindah ke ' + targetName : ''), 'success');
   refreshMainContent();
 }
 
