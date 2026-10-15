@@ -487,9 +487,9 @@ let uiState = { currentPage: 'dashboard', sidebarOpen: false };
 let lastBakAt = 0;          // waktu terakhir menulis cadangan lokal
 let lastSaveErrToastAt = 0; // debounce toast error penyimpanan
 
-const ROLE_LABELS = { SUPER_ADMIN: 'Super Admin', GURU: 'Guru', TENDIK: 'Tenaga Kependidikan', SISWA: 'Siswa' };
-const ROLE_COLORS = { SUPER_ADMIN: 'from-red-500 to-rose-600', GURU: 'from-emerald-500 to-teal-600', TENDIK: 'from-amber-500 to-orange-600', SISWA: 'from-indigo-500 to-blue-600' };
-const ROLE_AVATAR_COLORS = { SUPER_ADMIN: 'bg-red-500', GURU: 'bg-emerald-500', TENDIK: 'bg-amber-500', SISWA: 'bg-indigo-500' };
+const ROLE_LABELS = { SUPER_ADMIN: 'Super Admin', GURU: 'Guru', TENDIK: 'Tenaga Kependidikan', SISWA: 'Siswa', KEPSEK: 'Kepala Sekolah' };
+const ROLE_COLORS = { SUPER_ADMIN: 'from-red-500 to-rose-600', GURU: 'from-emerald-500 to-teal-600', TENDIK: 'from-amber-500 to-orange-600', SISWA: 'from-indigo-500 to-blue-600', KEPSEK: 'from-violet-500 to-purple-600' };
+const ROLE_AVATAR_COLORS = { SUPER_ADMIN: 'bg-red-500', GURU: 'bg-emerald-500', TENDIK: 'bg-amber-500', SISWA: 'bg-indigo-500', KEPSEK: 'bg-violet-500' };
 
 // Validasi struktur database agar data rusak/tidak lengkap tidak dipakai
 function isValidDatabase(obj) {
@@ -500,6 +500,37 @@ function isValidDatabase(obj) {
 function parseDbJson(raw) {
   if (!raw || typeof raw !== 'string') return null;
   try { const d = JSON.parse(raw); return isValidDatabase(d) ? d : null; } catch (e) { return null; }
+}
+
+/* ============================================================
+   AKUN KEPALA SEKOLAH (role KEPSEK) — pengawas kegiatan daring.
+   Migrasi otomatis: pada database lama, akun kepsek@... yang masih
+   ber-role GURU dinaikkan ke KEPSEK + kredensial distandarkan.
+   Bila belum ada sama sekali, akunnya dibuat. Aman dijalankan
+   berulang (idempoten) dan dipanggil setiap data dimuat/di-merge.
+   Login: NIP 196805151994121002 / kepsek123, atau email
+   kepsek@smanejayaloka.sch.id / kepsek123
+   ============================================================ */
+function ensureKepsekAccount() {
+  if (!db || !Array.isArray(db.users)) return false;
+  let changed = false;
+  const keps = db.users.filter(u => (u.email || '').toLowerCase() === 'kepsek@smanejayaloka.sch.id');
+  keps.forEach(u => {
+    if (u.role !== 'KEPSEK') { u.role = 'KEPSEK'; changed = true; }
+    if (!u.position) { u.position = 'Kepala Sekolah'; changed = true; }
+    if (u.password !== 'kepsek123') { u.password = 'kepsek123'; changed = true; }
+    if (!u.isActive) { u.isActive = true; changed = true; }
+  });
+  if (keps.length === 0) {
+    db.users.push({
+      id: uid('usr'), email: 'kepsek@smanejayaloka.sch.id', password: 'kepsek123',
+      name: db.schoolProfile?.principalName || 'Kepala Sekolah', role: 'KEPSEK',
+      nip: db.schoolProfile?.principalNip || '196805151994121002',
+      position: 'Kepala Sekolah', gender: 'L', isActive: true, createdAt: now()
+    });
+    changed = true;
+  }
+  return changed;
 }
 
 function loadDB() {
@@ -523,6 +554,8 @@ function loadDB() {
   }
   // Migrasi ringan: pastikan field baru tersedia untuk database lama
   if (db && !Array.isArray(db.presentations)) db.presentations = [];
+  // Migrasi akun Kepala Sekolah (role KEPSEK) — dibuat/dinaikkan otomatis bila belum ada
+  if (db && ensureKepsekAccount()) { try { saveDB(); } catch (e) { /* abaikan */ } }
   if (recovered) {
     console.warn('[DB] Database utama tidak terbaca — data dipulihkan dari backup lokal');
     setTimeout(function() {
@@ -1074,6 +1107,8 @@ function adoptCloudData(data) {
     if (db[k] === undefined && data[k] !== undefined && data[k] !== null) { db[k] = data[k]; changed = true; }
   });
   if (!Array.isArray(db.presentations)) db.presentations = [];
+  // Migrasi akun Kepala Sekolah ikut digabung agar semua perangkat mendapat akun pengawas
+  if (ensureKepsekAccount()) changed = true;
   if (changed) {
     try { localStorage.setItem(DB_KEY, JSON.stringify(db)); } catch (e) { /* kuota penuh */ }
     rsNoteLocalWrite(); // sinkron dengan penanda realtime sync
@@ -2339,8 +2374,8 @@ function applyRoleVisibility() {
   const user = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
   const isSuper = !!(user && user.role === 'SUPER_ADMIN');
   document.body.classList.toggle('is-superadmin', isSuper);
-  // Tombol "Sinkron" tampil untuk Superadmin, Guru, dan Tendik (bukan Siswa)
-  const isStaff = !!(user && (user.role === 'SUPER_ADMIN' || user.role === 'GURU' || user.role === 'TENDIK'));
+  // Tombol "Sinkron" tampil untuk Superadmin, Guru, Tendik, dan Kepala Sekolah (bukan Siswa)
+  const isStaff = !!(user && (user.role === 'SUPER_ADMIN' || user.role === 'GURU' || user.role === 'TENDIK' || user.role === 'KEPSEK'));
   document.body.classList.toggle('is-staff', isStaff);
 }
 
@@ -2566,11 +2601,12 @@ function seedDatabase() {
     gender: 'L', isActive: true, createdAt: now()
   });
 
-  // Kepala Sekolah (Guru)
+  // Kepala Sekolah — role KEPSEK: akun pengawas kegiatan daring belajar-mengajar online
   const kepsekId = uid('usr');
   db.users.push({
-    id: kepsekId, email: 'kepsek@smanejayaloka.sch.id', password: 'guru123',
-    name: 'Dr. Bambang Sutrisno, M.Pd.', role: 'GURU', nip: '196805151994121002',
+    id: kepsekId, email: 'kepsek@smanejayaloka.sch.id', password: 'kepsek123',
+    name: 'Dr. Bambang Sutrisno, M.Pd.', role: 'KEPSEK', nip: '196805151994121002',
+    position: 'Kepala Sekolah',
     phone: '081234567891', gender: 'L', isActive: true, createdAt: now()
   });
   db.teachers.push({
@@ -2817,7 +2853,7 @@ function handleLogin(e) {
     }
     // 2. Guru & Tendik: login with NIP
     if (!user) {
-      user = db.users.find(u => (u.role === 'GURU' || u.role === 'TENDIK') && u.nip === loginId && u.password === password);
+      user = db.users.find(u => (u.role === 'GURU' || u.role === 'TENDIK' || u.role === 'KEPSEK') && u.nip === loginId && u.password === password);
     }
     // 3. Siswa: login with NISN
     if (!user) {
@@ -3197,6 +3233,7 @@ const ROLE_NAV = {
     { id: 'siswa', label: 'Data Siswa', icon: 'user-cog' },
     { id: 'kelas', label: 'Kelas & Mapel', icon: 'book-copy' },
     { id: 'lms', label: 'Manajemen LMS', icon: 'book-open' },
+    { id: 'monitoring-lms', label: 'Monitor Kegiatan LMS', icon: 'activity' },
     { id: 'penilaian', label: 'Penilaian', icon: 'clipboard-check' },
     { id: 'absensi', label: 'Absensi', icon: 'calendar' },
     { id: 'pengumuman', label: 'Pengumuman', icon: 'megaphone' },
@@ -3242,6 +3279,15 @@ const ROLE_NAV = {
     { id: 'absensi', label: 'Absensi Saya', icon: 'calendar' },
     { id: 'pengumuman', label: 'Pengumuman', icon: 'megaphone' },
     { id: 'jadwal', label: 'Jadwal Pelajaran', icon: 'calendar' },
+    { id: 'profil', label: 'Profil Saya', icon: 'user-circle' }
+  ],
+  /* KEPALA SEKOLAH: akun pengawas — memantau kegiatan daring, LMS, data siswa (khusus lihat) */
+  KEPSEK: [
+    { id: 'dashboard', label: 'Dashboard', icon: 'layout-dashboard' },
+    { id: 'monitoring-lms', label: 'Kegiatan Daring & LMS', icon: 'activity' },
+    { id: 'live-class', label: 'Live Class', icon: 'video' },
+    { id: 'data-siswa', label: 'Data Siswa', icon: 'users' },
+    { id: 'penilaian', label: 'Rekap Penilaian', icon: 'clipboard-check' },
     { id: 'profil', label: 'Profil Saya', icon: 'user-circle' }
   ]
 };
@@ -3316,7 +3362,7 @@ function renderMainContent() {
   if (!user) return;
   const page = uiState.currentPage;
   let html = '';
-  const renderFns = { SUPER_ADMIN: renderAdminPage, GURU: renderGuruPage, TENDIK: renderTendikPage, SISWA: renderSiswaPage };
+  const renderFns = { SUPER_ADMIN: renderAdminPage, GURU: renderGuruPage, TENDIK: renderTendikPage, SISWA: renderSiswaPage, KEPSEK: renderKepsekPage };
   const fn = renderFns[user.role];
   if (fn) {
     try {
@@ -3492,6 +3538,95 @@ function renderAdminPage(page) { return window.ADMIN_PAGES ? (window.ADMIN_PAGES
 function renderGuruPage(page) { return window.GURU_PAGES ? (window.GURU_PAGES[page] || window.GURU_PAGES.dashboard)() : loadingState(); }
 function renderTendikPage(page) { return window.TENDIK_PAGES ? (window.TENDIK_PAGES[page] || window.TENDIK_PAGES.dashboard)() : loadingState(); }
 function renderSiswaPage(page) { return window.SISWA_PAGES ? (window.SISWA_PAGES[page] || window.SISWA_PAGES.dashboard)() : loadingState(); }
+function renderKepsekPage(page) { return window.KEPSEK_PAGES ? (window.KEPSEK_PAGES[page] || window.KEPSEK_PAGES.dashboard)() : loadingState(); }
+
+/* ============================================================
+   MONITOR KEGIATAN LMS & DARING — dipakai Super Admin & Kepala Sekolah
+   Ringkasan seluruh aktivitas belajar-mengajar online: mapel, materi,
+   tugas, pengumpulan siswa, penilaian, live class, dan log aktivitas
+   terbaru. Read-only — khusus pemantauan, tidak mengubah data.
+   ============================================================ */
+function buildMonitorLmsHTML() {
+  const courses = db.courses || [];
+  const liveCount = { live: 0, upcoming: 0, past: 0 };
+  (db.liveClasses || []).forEach(lc => { const s = liveClassStatus(lc); liveCount[s] = (liveCount[s] || 0) + 1; });
+  const orphanAsgs = db.assignments.filter(a => !db.courses.some(c => c.id === a.courseId));
+  const orphanSubs = db.submissions.filter(s => !db.assignments.some(a => a.id === s.assignmentId));
+  const subsNoStudent = db.submissions.filter(s => !db.students.some(st => st.id === s.studentId));
+  const lmsActions = ['SUBMIT TUGAS', 'GABUNG LIVE CLASS', 'TAMBAH MAPEL', 'UPDATE MAPEL', 'HAPUS MAPEL', 'TAMBAH MATERI', 'UPDATE MATERI'];
+  const recentLogs = db.logs.filter(l => lmsActions.includes(l.action)).slice(-14).reverse();
+
+  const perCourse = courses.map(c => {
+    const t = db.teachers.find(x => x.id === c.teacherId);
+    const cls = db.classes.find(cl => cl.id === c.classId);
+    const mats = db.materials.filter(m => m.courseId === c.id).length;
+    const asgs = db.assignments.filter(a => a.courseId === c.id);
+    const asgIds = asgs.map(a => a.id);
+    const subs = db.submissions.filter(s => asgIds.includes(s.assignmentId));
+    const graded = subs.filter(s => s.gradeId && db.grades.some(g => g.id === s.gradeId)).length;
+    const lives = (db.liveClasses || []).filter(lc => lc.courseId === c.id).length;
+    return { c, t, cls, mats, na: asgs.length, ns: subs.length, graded, lives };
+  });
+
+  return pageHeader('Monitor Kegiatan LMS & Daring', 'Pantau seluruh kegiatan belajar-mengajar online sekolah') + `
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
+      ${statCard('Mata Pelajaran', courses.length, 'book-open', 'emerald')}
+      ${statCard('Materi', db.materials.length, 'file-text', 'violet')}
+      ${statCard('Tugas', db.assignments.length, 'clipboard-check', 'amber')}
+      ${statCard('Pengumpulan', db.submissions.length, 'upload', 'blue')}
+      ${statCard('Sudah Dinilai', db.grades.length, 'award', 'teal')}
+      ${statCard('Live Berlangsung', liveCount.live, 'radio', 'red')}
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      ${statCard('Live Akan Datang', liveCount.upcoming, 'clock', 'blue', 'sesi terjadwal')}
+      ${statCard('Live Selesai', liveCount.past, 'check-circle', 'teal', 'total sesi usai')}
+      ${statCard('Total Live Class', (db.liveClasses || []).length, 'video', 'indigo', 'semua jadwal')}
+      ${statCard('Siswa Terdaftar', db.students.length, 'users', 'cyan', 'akun siswa aktif')}
+    </div>
+    <div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden mb-6">
+      <div class="p-4 border-b"><h3 class="font-semibold flex items-center gap-2"><i data-lucide="table-2" style="font-size:16px;"></i> Aktivitas Belajar-Mengajar per Mata Pelajaran</h3></div>
+      ${perCourse.length === 0 ? emptyState('Belum ada mata pelajaran', 'Tambahkan kelas & mapel terlebih dahulu', 'book-open') :
+        table(['Mata Pelajaran', 'Guru', 'Kelas', 'Materi', 'Tugas', 'Pengumpulan', 'Dinilai', 'Live'],
+          perCourse.map(r => [
+            `<span class="font-medium text-sm">${r.c.name}</span>`,
+            `<span class="text-sm">${r.t?.name || '-'}</span>`,
+            badge(r.cls?.name || '-', 'outline'),
+            `<span class="text-sm">${r.mats}</span>`,
+            `<span class="text-sm">${r.na}</span>`,
+            `<span class="text-sm font-medium ${r.ns > 0 ? 'text-emerald-600' : 'text-gray-400'}">${r.ns}</span>`,
+            `<span class="text-sm ${r.graded > 0 ? 'font-bold text-emerald-600' : 'text-gray-400'}">${r.graded}</span>`,
+            `<span class="text-sm">${r.lives}</span>`
+          ])
+        )
+      }
+    </div>
+    ${(orphanAsgs.length > 0 || orphanSubs.length > 0 || subsNoStudent.length > 0) ? `
+    <div class="p-4 rounded-xl bg-amber-50 border border-amber-300 mb-6">
+      <p class="text-sm font-semibold text-amber-800 mb-2 flex items-center gap-2"><i data-lucide="alert-triangle" style="font-size:16px;"></i> Integritas Data (sisa insiden kehilangan data)</p>
+      <ul class="text-xs text-amber-700 space-y-1 ml-1" style="list-style:disc;padding-left:18px;">
+        ${orphanAsgs.length ? '<li>' + orphanAsgs.length + ' tugas kehilangan mata pelajarannya (pengumpulan &amp; nilai tetap tersimpan). Guru dapat memperbaikinya lewat tombol <b>Perbaiki</b> di halaman Tugas.</li>' : ''}
+        ${orphanSubs.length ? '<li>' + orphanSubs.length + ' pengumpulan menunjuk tugas yang sudah tidak ada.</li>' : ''}
+        ${subsNoStudent.length ? '<li>' + subsNoStudent.length + ' pengumpulan kehilangan data siswanya (tetap tersimpan, tampil sebagai "(siswa tidak ditemukan)").</li>' : ''}
+      </ul>
+    </div>` : ''}
+    <div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden">
+      <div class="p-4 border-b"><h3 class="font-semibold flex items-center gap-2"><i data-lucide="activity" style="font-size:16px;"></i> Aktivitas LMS Terbaru</h3></div>
+      ${recentLogs.length === 0 ? '<p class="p-6 text-center text-sm text-gray-500">Belum ada aktivitas LMS tercatat</p>' :
+        table(['Waktu', 'Pengguna', 'Aktivitas', 'Detail'],
+          recentLogs.map(l => {
+            const u = db.users.find(x => x.id === l.userId);
+            return [
+              `<span class="text-xs text-gray-500">${formatDateTime(l.createdAt)}</span>`,
+              `<span class="text-sm font-medium">${u?.name || '-'}</span>`,
+              badge(l.action, l.action === 'SUBMIT TUGAS' ? 'default' : l.action === 'GABUNG LIVE CLASS' ? 'destructive' : 'outline'),
+              `<span class="text-xs text-gray-600 line-clamp-1">${l.detail || '-'}</span>`
+            ];
+          })
+        )
+      }
+    </div>
+  `;
+}
 
 /* ============================================================
    INIT
@@ -4876,7 +5011,7 @@ window.ADMIN_PAGES = {
         ${users.length === 0 ? emptyState('Tidak ada pengguna', 'Belum ada pengguna yang terdaftar sesuai filter', 'users') :
           table(['Nama', 'Email', 'Role', 'NIP/NIS', 'Status', 'Aksi'],
             users.map(u => {
-              const roleLabel = u.role === 'SUPER_ADMIN' ? 'Super Admin' : u.role === 'GURU' ? 'Guru' : u.role === 'TENDIK' ? 'Tendik' : 'Siswa';
+              const roleLabel = u.role === 'SUPER_ADMIN' ? 'Super Admin' : u.role === 'GURU' ? 'Guru' : u.role === 'TENDIK' ? 'Tendik' : u.role === 'KEPSEK' ? 'Kepala Sekolah' : 'Siswa';
               return [
                 `<div class="flex items-center gap-3">${userAvatar(u, 32, 'bg-emerald-50 text-emerald-700')}<div><p class="font-medium text-sm">${u.name}</p><p class="text-xs text-gray-500">${u.gender === 'L' ? 'Laki-laki' : 'Perempuan'}</p></div></div>`,
                 `<span class="text-sm">${u.email}</span>`,
@@ -5089,6 +5224,8 @@ window.ADMIN_PAGES = {
       </div>
     `;
   },
+
+  'monitoring-lms'() { return buildMonitorLmsHTML(); },
 
   penilaian() {
     const filterCourse = window._adminPenilaianCourse || 'ALL';
@@ -5842,7 +5979,8 @@ function openUserForm(userId, defaultRole, lockRole) {
     ? [{ value: fixedRole, label: (ROLE_LABELS[fixedRole] || fixedRole) + ' (tetap)' }]
     : [
         { value: 'SUPER_ADMIN', label: 'Super Admin' }, { value: 'GURU', label: 'Guru' },
-        { value: 'TENDIK', label: 'Tendik' }, { value: 'SISWA', label: 'Siswa' }
+        { value: 'TENDIK', label: 'Tendik' }, { value: 'SISWA', label: 'Siswa' },
+        { value: 'KEPSEK', label: 'Kepala Sekolah' }
       ];
   // State foto profil sementara (diterapkan ke akun saat Update/Simpan diklik)
   window._ufPhoto = user ? (user.photo || '') : undefined;
@@ -7466,6 +7604,10 @@ window.GURU_PAGES = {
     const courses = db.courses.filter(c => c.teacherId === teacher?.id);
     const courseIds = courses.map(c => c.id);
     const assignments = db.assignments.filter(a => courseIds.includes(a.courseId));
+    // Tugas yang mapelnya hilang (insiden data) — tetap ditampilkan agar pengumpulan siswa
+    // & nilai lama tidak "menghilang"; guru dapat memperbaikinya lewat tombol Edit
+    const orphanAsgs = db.assignments.filter(a => !db.courses.some(c => c.id === a.courseId));
+    const orphanSubCount = id => db.submissions.filter(s => s.assignmentId === id).length;
     return pageHeader('Tugas & Penugasan', 'Kelola tugas untuk siswa',
       btn('Buat Tugas', 'openAssignmentForm()', { icon: 'plus' })
     ) + `
@@ -7502,6 +7644,26 @@ window.GURU_PAGES = {
           </div>`;
         }).join('') + '</div>'
       }
+      ${orphanAsgs.length > 0 ? `
+        <div class="mt-6 p-4 rounded-xl bg-amber-50 border border-amber-300">
+          <p class="text-sm font-semibold text-amber-800 mb-1 flex items-center gap-2"><i data-lucide="alert-triangle" style="font-size:16px;"></i> ${orphanAsgs.length} tugas terputus dari mata pelajaran (akibat insiden data)</p>
+          <p class="text-xs text-amber-700 mb-3">Tugas berikut beserta pengumpulan &amp; nilai siswanya masih tersimpan utuh, tetapi mata pelajarannya hilang sehingga tidak muncul di daftar atas maupun halaman Penilaian. Klik <b>Edit</b> lalu pilih mata pelajaran tujuan dan simpan — tugas akan tampil normal kembali.</p>
+          <div class="space-y-2">
+            ${orphanAsgs.map(a => `
+              <div class="flex items-center justify-between gap-3 p-3 rounded-lg bg-white border border-amber-200">
+                <div class="min-w-0">
+                  <p class="font-medium text-sm">${a.title}</p>
+                  <p class="text-xs text-gray-500">Deadline: ${formatDate(a.dueDate)} • ${orphanSubCount(a.id)} siswa mengumpulkan • Max: ${a.maxScore}</p>
+                </div>
+                <div class="flex gap-1 flex-shrink-0">
+                  <button onclick="openAssignmentForm('${a.id}')" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-600 text-white rounded-md flex items-center gap-1"><i data-lucide="wrench" style="font-size: 12px;"></i> Perbaiki</button>
+                  <button onclick="deleteAssignment('${a.id}')" class="p-2 hover:bg-gray-100 rounded"><i data-lucide="trash-2" class="text-red-500" style="font-size: 16px;"></i></button>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      ` : ''}
     `;
   },
 
@@ -7558,7 +7720,11 @@ window.GURU_PAGES = {
     const teacher = db.teachers.find(t => t.userId === user.id);
     const courses = db.courses.filter(c => c.teacherId === teacher?.id);
     const courseIds = courses.map(c => c.id);
-    const assignments = db.assignments.filter(a => courseIds.includes(a.courseId));
+    let assignments = db.assignments.filter(a => courseIds.includes(a.courseId));
+    // Tugas dengan mapel hilang (insiden data) ikut tersedia agar pengumpulan & nilai lama bisa dinilai/dilihat
+    db.assignments.filter(a => !db.courses.some(c => c.id === a.courseId)).forEach(a => {
+      if (!assignments.some(x => x.id === a.id)) assignments.push(a);
+    });
     const assignmentIds = assignments.map(a => a.id);
     const submissions = db.submissions.filter(s => assignmentIds.includes(s.assignmentId));
     const selAsg = window._gradeSelAsg || (assignments[0]?.id || '');
@@ -7571,7 +7737,7 @@ window.GURU_PAGES = {
     ) + `
       <div class="mb-4">
         <select id="sel-asg" onchange="window._gradeSelAsg=this.value; refreshMainContent()" class="px-3 py-2 border rounded-md text-sm w-full sm:w-[300px]">
-          ${assignments.map(a => `<option value="${a.id}" ${selAsg === a.id ? 'selected' : ''}>${a.title} - ${db.courses.find(c => c.id === a.courseId)?.name}</option>`).join('')}
+          ${assignments.map(a => `<option value="${a.id}" ${selAsg === a.id ? 'selected' : ''}>${a.title} - ${db.courses.find(c => c.id === a.courseId)?.name || '(mapel terputus)'}</option>`).join('')}
         </select>
       </div>
       ${subs.length === 0 ? emptyState('Belum ada pengumpulan', 'Belum ada siswa yang mengumpulkan tugas ini', 'clipboard-check') :
@@ -7580,7 +7746,7 @@ window.GURU_PAGES = {
             const st = db.students.find(x => x.id === s.studentId);
             const cls = db.classes.find(c => c.id === st?.classId);
             return [
-              `<span class="font-medium text-sm">${st?.name || '-'}</span>`,
+              `<span class="font-medium text-sm">${st?.name || '(siswa tidak ditemukan)'}</span>`,
               badge(cls?.name || '-', 'outline'),
               `<span class="text-xs">${s.submittedAt ? formatDate(s.submittedAt) : '-'}</span>`,
               badge(s.status, s.status === 'DINILAI' ? 'default' : 'secondary'),
@@ -7916,6 +8082,8 @@ function openAssignmentForm(id) {
   const teacher = db.teachers.find(t => t.userId === user.id);
   const courses = db.courses.filter(c => c.teacherId === teacher?.id);
   const a = id ? db.assignments.find(x => x.id === id) : null;
+  const courseAda = a ? db.courses.some(c => c.id === a.courseId) : true;
+  // Bila mapel tugas hilang (insiden data), pilihan diarahkan ke mapel pertama agar bisa diperbaiki manual
   const dueDefault = a ? new Date(a.dueDate).toISOString().slice(0, 16) : new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 16);
   const currentTypes = a?.submissionTypes || ['TEXT'];
   const subTypeCheckboxes = [
@@ -7926,7 +8094,8 @@ function openAssignmentForm(id) {
   ];
   const body = `
     <form id="asg-form" onsubmit="saveAssignment(event, '${id || ''}')" class="space-y-4">
-      ${field('Mata Pelajaran (menentukan kelas tujuan)', selectField('af-course', courses.map(c => ({ value: c.id, label: c.name + ' - ' + (db.classes.find(cl => cl.id === c.classId)?.name || '') })), a?.courseId || courses[0]?.id || ''))}
+      ${a && !courseAda ? '<div class="p-3 rounded-lg bg-amber-50 border border-amber-300 text-xs text-amber-800 flex items-start gap-2"><i data-lucide="alert-triangle" style="font-size:15px;margin-top:1px;flex-shrink:0;"></i><span><b>Mata pelajaran asli tugas ini hilang dari database</b> (akibat insiden data). Pengumpulan siswa & nilainya tetap tersimpan. Pilih mata pelajaran tujuan di bawah lalu simpan — tugas beserta seluruh pengumpulan siswa akan tampil kembali di halaman Tugas & Penilaian.</span></div>' : ''}
+      ${field('Mata Pelajaran (menentukan kelas tujuan)', selectField('af-course', courses.map(c => ({ value: c.id, label: c.name + ' - ' + (db.classes.find(cl => cl.id === c.classId)?.name || '') })), (a && courseAda) ? a.courseId : (courses[0]?.id || '')))}
       <div id="af-class-hint"></div>
       ${field('Judul Tugas', inputText('af-title', a?.title || '', { required: true }))}
       ${field('Deskripsi / Instruksi', textarea('af-desc', a?.description || '', 4))}
@@ -8050,7 +8219,7 @@ function openGradeDialog(subId) {
       <div class="p-4 rounded-lg bg-gray-50 border">
         <div class="flex items-center justify-between mb-2">
           <div>
-            <p class="text-sm font-medium">${st?.name}</p>
+            <p class="text-sm font-medium">${st?.name || '(siswa tidak ditemukan)'}</p>
             <p class="text-xs text-gray-500">Kelas: ${cls?.name || '-'}</p>
           </div>
           <div class="text-right">
@@ -8547,6 +8716,242 @@ window.TENDIK_PAGES = {
   }
 };
 
+/* ============ KEPALA SEKOLAH — PENGAWAS KEGIATAN DARING ============ */
+/* Akun pengawas: melihat kegiatan belajar-mengajar online, live class,
+   data siswa, dan rekap penilaian. Read-only — tidak mengubah data LMS. */
+window.KEPSEK_PAGES = {
+  dashboard() {
+    const user = getCurrentUser();
+    const liveCount = { live: 0, upcoming: 0, past: 0 };
+    (db.liveClasses || []).forEach(lc => { const s = liveClassStatus(lc); liveCount[s] = (liveCount[s] || 0) + 1; });
+    const liveNow = (db.liveClasses || []).filter(lc => liveClassStatus(lc) === 'live');
+    const lmsActions = ['SUBMIT TUGAS', 'GABUNG LIVE CLASS', 'TAMBAH MAPEL', 'UPDATE MAPEL', 'HAPUS MAPEL', 'TAMBAH MATERI', 'UPDATE MATERI'];
+    const recentLogs = db.logs.filter(l => lmsActions.includes(l.action)).slice(-8).reverse();
+    const recentSubs = db.submissions.slice().sort((a, b) => (b.submittedAt || b.createdAt || '').localeCompare(a.submittedAt || a.createdAt || '')).slice(0, 6);
+
+    return pageHeader('Selamat Datang, ' + (user.name.split(',')[0]) + '!', 'Kepala Sekolah — Pengawas Kegiatan Daring Belajar-Mengajar') + `
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        ${statCard('Siswa', db.students.length, 'users', 'indigo')}
+        ${statCard('Guru', db.teachers.length, 'graduation-cap', 'emerald')}
+        ${statCard('Kelas', db.classes.length, 'book-copy', 'blue')}
+        ${statCard('Mata Pelajaran', db.courses.length, 'book-open', 'violet')}
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        ${statCard('Tugas', db.assignments.length, 'clipboard-check', 'amber')}
+        ${statCard('Pengumpulan', db.submissions.length, 'upload', 'cyan')}
+        ${statCard('Sudah Dinilai', db.grades.length, 'award', 'teal')}
+        ${statCard('Live Berlangsung', liveCount.live, 'radio', 'red')}
+      </div>
+      <div class="grid lg:grid-cols-2 gap-6">
+        ${dataCard('Live Class Berlangsung', 'Sesi tatap muka online yang sedang aktif', 'radio',
+          liveNow.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Tidak ada live class yang berlangsung saat ini</p>' :
+          '<div class="space-y-2">' + liveNow.map(lc => {
+            const c = db.courses.find(x => x.id === lc.courseId);
+            const t = db.teachers.find(x => x.id === lc.teacherId);
+            return `<div class="flex items-center justify-between p-3 rounded-lg border bg-white ring-1 ring-red-200">
+              <div class="min-w-0">
+                <p class="font-medium text-sm line-clamp-1">${lc.title}</p>
+                <p class="text-xs text-gray-500">${c?.name || '-'} • ${t?.name || '-'} • ${lc.time} WIB</p>
+              </div>
+              ${badge('BERLANGSUNG', 'destructive')}
+            </div>`;
+          }).join('') + '</div>'
+        )}
+        ${dataCard('Pengumpulan Tugas Terbaru', 'Aktivitas siswa mengumpulkan tugas', 'upload',
+          recentSubs.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Belum ada pengumpulan</p>' :
+          '<div class="space-y-2 max-h-80 overflow-y-auto">' + recentSubs.map(s => {
+            const st = db.students.find(x => x.id === s.studentId);
+            const a = db.assignments.find(x => x.id === s.assignmentId);
+            return `<div class="flex items-start justify-between p-3 rounded-lg border bg-white">
+              <div class="min-w-0">
+                <p class="font-medium text-sm line-clamp-1">${st?.name || '(siswa tidak ditemukan)'}</p>
+                <p class="text-xs text-gray-500">${a?.title || s.assignmentTitle || '(tugas terputus)'}</p>
+                <p class="text-[10px] text-gray-500 mt-1">${s.submittedAt ? formatDateTime(s.submittedAt) : '-'}</p>
+              </div>
+              ${badge(s.status, s.status === 'DINILAI' ? 'default' : 'secondary')}
+            </div>`;
+          }).join('') + '</div>'
+        )}
+      </div>
+      <div class="mt-6">
+        ${dataCard('Aktivitas Daring Terbaru', 'Rekaman aktivitas belajar-mengajar online', 'activity',
+          recentLogs.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Belum ada aktivitas tercatat</p>' :
+          '<div class="space-y-2">' + recentLogs.map(l => {
+            const u = db.users.find(x => x.id === l.userId);
+            return `<div class="flex items-center justify-between gap-3 p-2.5 rounded-lg border bg-white">
+              <div class="min-w-0">
+                <p class="text-sm font-medium line-clamp-1">${u?.name || '-'} <span class="text-xs text-gray-400">• ${u?.role || ''}</span></p>
+                <p class="text-xs text-gray-500 line-clamp-1">${l.detail || l.action}</p>
+              </div>
+              <div class="text-right flex-shrink-0">
+                ${badge(l.action, l.action === 'SUBMIT TUGAS' ? 'default' : 'outline')}
+                <p class="text-[10px] text-gray-400 mt-1">${formatDateTime(l.createdAt)}</p>
+              </div>
+            </div>`;
+          }).join('') + '</div>',
+          btn('Lihat Semua', 'navigateTo(\'monitoring-lms\')', { variant: 'outline', size: 'sm' })
+        )}
+      </div>
+    `;
+  },
+
+  'monitoring-lms'() { return buildMonitorLmsHTML(); },
+
+  'live-class'() {
+    const all = db.liveClasses || [];
+    const grouped = groupLiveClasses(all);
+    return pageHeader('Live Class', 'Pantau sesi tatap muka online seluruh kelas') + `
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        ${statCard('Berlangsung', grouped.live.length, 'radio', 'red')}
+        ${statCard('Akan Datang', grouped.upcoming.length, 'clock', 'blue')}
+        ${statCard('Selesai', grouped.past.length, 'check-circle', 'teal')}
+        ${statCard('Total Sesi', all.length, 'video', 'violet')}
+      </div>
+      ${grouped.live.length > 0 ? `
+        <h3 class="text-lg font-bold mb-3 flex items-center gap-2"><i data-lucide="radio" class="text-red-500" style="font-size: 20px;"></i> Sedang Berlangsung</h3>
+        <div class="space-y-3 mb-6">${grouped.live.map(lc => renderLiveClassCard(lc, true)).join('')}</div>` : ''}
+      ${grouped.upcoming.length > 0 ? `
+        <h3 class="text-lg font-bold mb-3 flex items-center gap-2"><i data-lucide="clock" class="text-blue-500" style="font-size: 20px;"></i> Akan Datang</h3>
+        <div class="space-y-3 mb-6">${grouped.upcoming.map(lc => renderLiveClassCard(lc, true)).join('')}</div>` : ''}
+      ${grouped.past.length > 0 ? `
+        <h3 class="text-lg font-bold mb-3 flex items-center gap-2"><i data-lucide="check-circle" class="text-emerald-500" style="font-size: 20px;"></i> Selesai</h3>
+        <div class="space-y-3">${grouped.past.map(lc => renderLiveClassCard(lc, true)).join('')}</div>` : ''}
+      ${all.length === 0 ? emptyState('Belum ada Live Class', 'Belum ada jadwal live class yang dibuat guru', 'video') : ''}
+    `;
+  },
+
+  'data-siswa'() {
+    const filterClass = window._kepsekSiswaClass || 'ALL';
+    const search = (window._kepsekSiswaSearch || '').toLowerCase();
+    let users = db.users.filter(u => u.role === 'SISWA');
+    if (filterClass !== 'ALL') {
+      const inClass = db.students.filter(s => s.classId === filterClass).map(s => s.userId);
+      users = users.filter(u => inClass.includes(u.id));
+    }
+    if (search) users = users.filter(u => u.name.toLowerCase().includes(search) || (u.nis && String(u.nis).includes(search)));
+    return pageHeader('Data Siswa', 'Data seluruh siswa (khusus pemantauan)',
+      btn('Cetak PDF', 'openPrintSiswaPicker()', { variant: 'outline', icon: 'printer' })
+    ) + `
+      <div class="flex flex-wrap gap-3 mb-4">
+        <div class="relative flex-1 min-w-[200px]">
+          <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" style="font-size: 16px;"></i>
+          <input placeholder="Cari nama atau NIS..." value="${window._kepsekSiswaSearch || ''}" oninput="window._kepsekSiswaSearch=this.value; refreshMainContent()" class="w-full pl-9 pr-3 py-2 border rounded-md text-sm">
+        </div>
+        <select onchange="window._kepsekSiswaClass=this.value; refreshMainContent()" class="px-3 py-2 border rounded-md text-sm w-full sm:w-[180px]">
+          <option value="ALL">Semua Kelas</option>
+          ${db.classes.map(c => `<option value="${c.id}" ${filterClass === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+        </select>
+        <span class="inline-flex items-center px-3 py-2 text-xs bg-gray-100 rounded-md">${badge(users.length + ' siswa', 'outline')}</span>
+      </div>
+      <div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden">
+        ${users.length === 0 ? emptyState('Tidak ada siswa', 'Belum ada siswa sesuai filter', 'users') :
+          table(['Nama', 'NIS', 'NISN', 'Kelas', 'Gender', 'Status'],
+            users.map(u => {
+              const s = db.students.find(x => x.userId === u.id);
+              const cls = db.classes.find(c => c.id === s?.classId);
+              return [
+                `<div class="flex items-center gap-3">${userAvatar(u, 32, 'bg-indigo-50 text-indigo-700')}<span class="font-medium text-sm">${u.name}</span></div>`,
+                `<span class="text-sm">${u.nis || '-'}</span>`,
+                `<span class="text-sm">${s?.nisn || '-'}</span>`,
+                badge(cls?.name || '-', 'outline'),
+                `<span class="text-sm">${u.gender || '-'}</span>`,
+                badge(u.isActive ? 'Aktif' : 'Nonaktif', u.isActive ? 'default' : 'secondary')
+              ];
+            })
+          )
+        }
+      </div>
+    `;
+  },
+
+  penilaian() {
+    const filterCourse = window._kepsekNilaiCourse || 'ALL';
+    const filterClass = window._kepsekNilaiClass || 'ALL';
+    let grades = db.grades;
+    if (filterCourse !== 'ALL') grades = grades.filter(g => g.courseId === filterCourse);
+    if (filterClass !== 'ALL') {
+      const inClass = db.students.filter(s => s.classId === filterClass).map(s => s.id);
+      grades = grades.filter(g => inClass.includes(g.studentId));
+    }
+    const avg = grades.length ? (grades.reduce((sum, g) => sum + g.score, 0) / grades.length).toFixed(1) : 0;
+    const highest = grades.length ? Math.max(...grades.map(g => g.score)) : 0;
+    const lowest = grades.length ? Math.min(...grades.map(g => g.score)) : 0;
+    return pageHeader('Rekap Penilaian', 'Rekap nilai seluruh siswa (khusus pemantauan)',
+      btn('Cetak Rekap Nilai', 'printRekapNilai()', { variant: 'outline', icon: 'printer' }) + ' ' +
+      btn('Cetak Rapor Siswa', 'printRaporSiswaPicker()', { icon: 'printer' })
+    ) + `
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        ${statCard('Total Nilai', grades.length, 'award', 'emerald')}
+        ${statCard('Rata-rata', avg, 'trending-up', 'violet')}
+        ${statCard('Tertinggi', highest, 'star', 'amber')}
+        ${statCard('Terendah', lowest, 'alert-circle', 'red')}
+      </div>
+      <div class="flex flex-wrap gap-3 mb-4">
+        <select onchange="window._kepsekNilaiCourse=this.value; refreshMainContent()" class="px-3 py-2 border rounded-md text-sm w-full sm:w-[200px]">
+          <option value="ALL">Semua Mapel</option>
+          ${db.courses.map(c => `<option value="${c.id}" ${filterCourse === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+        </select>
+        <select onchange="window._kepsekNilaiClass=this.value; refreshMainContent()" class="px-3 py-2 border rounded-md text-sm w-full sm:w-[200px]">
+          <option value="ALL">Semua Kelas</option>
+          ${db.classes.map(c => `<option value="${c.id}" ${filterClass === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+        </select>
+        <span class="inline-flex items-center px-3 py-2 text-xs bg-gray-100 rounded-md">${badge(grades.length + ' nilai', 'outline')}</span>
+      </div>
+      <div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden">
+        ${grades.length === 0 ? emptyState('Belum ada nilai', 'Belum ada nilai yang diinput sesuai filter', 'award') :
+          table(['Siswa', 'Kelas', 'Mata Pelajaran', 'Tugas', 'Nilai', 'Grade', 'Tanggal'],
+            grades.map(g => {
+              const s = db.students.find(x => x.id === g.studentId);
+              const cls = db.classes.find(c => c.id === s?.classId);
+              const c = db.courses.find(x => x.id === g.courseId);
+              const a = db.assignments.find(x => x.id === g.assignmentId);
+              return [
+                `<span class="font-medium text-sm">${s?.name || '(siswa tidak ditemukan)'}</span>`,
+                `<span class="text-xs">${badge(cls?.name || '-', 'outline')}</span>`,
+                `<span class="text-sm">${c?.name || '-'}</span>`,
+                `<span class="text-sm">${a?.title || '-'}</span>`,
+                `<span class="font-bold text-emerald-600">${g.score}</span>`,
+                `<span class="grade-badge grade-${g.grade}">${g.grade}</span>`,
+                `<span class="text-xs text-gray-500">${formatDate(g.gradedAt)}</span>`
+              ];
+            })
+          )
+        }
+      </div>
+    `;
+  },
+
+  profil() {
+    const user = getCurrentUser();
+    return pageHeader('Profil Saya', 'Kelola informasi pribadi') + `
+      <div class="grid lg:grid-cols-3 gap-6">
+        <div class="bg-white rounded-2xl border-0 shadow-md p-6 text-center">
+          <div class="relative w-20 h-20 mx-auto mb-3">
+            ${userAvatar(user, 80, 'bg-violet-50 text-violet-700', 28)}
+            <button onclick="openPhotoUpload('${user.id}')" class="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-violet-500 hover:bg-violet-600 text-white flex items-center justify-center shadow-md" title="Pasang / Ganti Foto Profil"><i data-lucide="camera" style="font-size: 14px;"></i></button>
+          </div>
+          <h3 class="font-bold text-lg">${user.name}</h3>
+          ${badge('Kepala Sekolah', 'outline')}
+          <div class="mt-4 space-y-1 text-xs text-gray-500">
+            <p>NIP: ${user.nip || '-'}</p><p>Jabatan: ${user.position || 'Kepala Sekolah'}</p><p>${user.email || ''}</p>
+          </div>
+          <button onclick="openPhotoUpload('${user.id}')" class="mt-4 w-full px-3 py-2 text-xs border border-gray-300 rounded-md hover:bg-gray-50 flex items-center justify-center gap-1"><i data-lucide="camera" style="font-size: 12px;"></i> ${user.photo ? 'Ganti Foto Profil' : 'Pasang Foto Profil'}</button>
+        </div>
+        <div class="lg:col-span-2 bg-white rounded-2xl border-0 shadow-md">
+          <div class="p-5 border-b"><h3 class="font-semibold">Edit Profil</h3></div>
+          <div class="p-5 space-y-4">
+            ${field('Nama', inputText('pf-name', user.name))}
+            ${field('Email', inputText('pf-email', user.email))}
+            ${field('Telepon', inputText('pf-phone', user.phone || ''))}
+            ${field('Alamat', textarea('pf-address', user.address || '', 2))}
+            ${btn('Simpan', 'saveProfile()')}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+};
+
 /* ============ SISWA DASHBOARD ============ */
 window.SISWA_PAGES = {
   dashboard() {
@@ -8695,15 +9100,19 @@ window.SISWA_PAGES = {
           const sub = mySubs[a.id];
           const due = new Date(a.dueDate);
           const isOverdue = new Date() > due && !sub;
+          const isClosed = isAssignmentClosed(a);
           const daysLeft = daysUntil(a.dueDate);
           const gr = sub ? db.grades.find(g => g.submissionId === sub.id) : null;
+          const statusBadge = isClosed && !sub ? badge('Ditutup', 'destructive')
+            : isOverdue ? badge('Lewat deadline', 'destructive')
+            : badge(daysLeft === 0 ? 'Tenggat hari ini' : (daysLeft + ' hari lagi'), daysLeft <= 3 ? 'default' : 'secondary');
           return `<div class="bg-white rounded-2xl border-0 shadow-md p-5 ${isOverdue ? 'border-l-4 border-l-red-500' : ''}">
             <div class="flex items-start justify-between gap-3">
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2 mb-2">
                   ${badge(db.courses.find(c => c.id === a.courseId)?.name || '', 'outline')}
                   ${badge(a.type, 'outline')}
-                  ${badge(isOverdue ? 'Lewat deadline' : daysLeft === 0 ? 'Tenggat hari ini' : (daysLeft + ' hari lagi'), isOverdue ? 'destructive' : daysLeft <= 3 ? 'default' : 'secondary')}
+                  ${statusBadge}
                   ${gr ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-xs bg-emerald-500 text-white">Nilai: ' + gr.score + '</span>' : ''}
                 </div>
                 <h3 class="font-semibold mb-1">${a.title}</h3>
@@ -8716,7 +9125,10 @@ window.SISWA_PAGES = {
               <div class="flex-shrink-0">
                 ${sub?.status === 'DINILAI' ?
                   '<button onclick="viewSubmission(\'' + sub.id + '\')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="eye" style="font-size: 12px;"></i> Lihat Nilai</button>' :
-                  '<button onclick="openSubmitDialog(\'' + a.id + '\')" class="px-3 py-1.5 text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-md">' + (sub ? 'Edit Jawaban' : 'Kerjakan') + '</button>'
+                  (isClosed ?
+                    (sub ? '<button onclick="openSubmitDialog(\'' + a.id + '\')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="eye" style="font-size: 12px;"></i> Lihat Jawaban</button>'
+                         : '<span class="inline-flex items-center gap-1 px-3 py-1.5 text-xs bg-red-50 text-red-600 border border-red-200 rounded-md font-medium" title="Batas waktu terlewat — pengumpulan ditutup"><i data-lucide="lock" style="font-size: 12px;"></i> Ditutup</span>') :
+                    '<button onclick="openSubmitDialog(\'' + a.id + '\')" class="px-3 py-1.5 text-xs bg-emerald-500 hover:bg-emerald-600 text-white rounded-md">' + (sub ? 'Edit Jawaban' : 'Kerjakan') + '</button>')
                 }
               </div>
             </div>
@@ -8991,6 +9403,15 @@ function viewMaterial(id) {
   );
 }
 
+/* BATAS WAKTU TUGAS: tugas dianggap tertutup bila status DITUTUP atau sudah lewat dueDate.
+   Setelah tertutup, siswa tidak dapat mengirim / mengubah jawaban (lihat saja). */
+function isAssignmentClosed(a) {
+  if (!a) return false;
+  if (a.status === 'DITUTUP') return true;
+  if (!a.dueDate) return false;
+  try { return new Date() > new Date(a.dueDate); } catch (e) { return false; }
+}
+
 function openSubmitDialog(assignmentId) {
   const a = db.assignments.find(x => x.id === assignmentId);
   if (!a) { showToast('Tugas tidak ditemukan', '', 'error'); return; }
@@ -8998,6 +9419,12 @@ function openSubmitDialog(assignmentId) {
   const user = getCurrentUser();
   const student = db.students.find(s => s.userId === user.id);
   const existing = db.submissions.find(s => s.assignmentId === assignmentId && s.studentId === student.id);
+  // ===== BATAS WAKTU: setelah deadline siswa tidak dapat mengirim tugas lagi =====
+  const closed = isAssignmentClosed(a);
+  if (closed && !existing && user.role === 'SISWA') {
+    showToast('Pengumpulan ditutup', 'Batas waktu (' + formatDate(a.dueDate) + ') sudah terlewat — tugas tidak dapat dikirim lagi', 'error');
+    return;
+  }
   const grade = existing ? db.grades.find(g => g.submissionId === existing.id) : null;
   const c = db.courses.find(x => x.id === a.courseId);
   const allowedTypes = a.submissionTypes || ['TEXT'];
@@ -9037,6 +9464,7 @@ function openSubmitDialog(assignmentId) {
 
   const body = `
     <div class="space-y-4">
+      ${closed ? '<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700 flex items-start gap-2"><i data-lucide="lock" style="font-size:15px;margin-top:1px;flex-shrink:0;"></i><span><b>Pengumpulan ditutup.</b> Batas waktu ' + formatDate(a.dueDate) + ' telah terlewat' + (existing ? ' — jawaban Anda yang terkirim sebelum tenggat tetap tersimpan dan dapat dinilai guru.' : '') + '</span></div>' : ''}
       <div class="p-4 rounded-lg bg-gray-50 border">
         <p class="text-sm font-medium mb-2">Instruksi:</p>
         <p class="text-sm">${a.description}</p>
@@ -9047,7 +9475,7 @@ function openSubmitDialog(assignmentId) {
       <div id="sd-input-area">${inputArea}</div>
     </div>
   `;
-  const footer = existing?.status === 'DINILAI' ?
+  const footer = (existing?.status === 'DINILAI' || closed) ?
     btn('Tutup', 'closeModal()', { variant: 'outline' }) :
     btn('Batal', 'closeModal()', { variant: 'outline' }) + btn('Kumpulkan Tugas', 'submitAssignment(\'' + assignmentId + '\')', { icon: 'upload' });
   showModal(a.title, body, footer, 'max-w-2xl');
@@ -9130,6 +9558,11 @@ function submitAssignment(assignmentId) {
   const user = getCurrentUser();
   const student = db.students.find(s => s.userId === user.id);
   const a = db.assignments.find(x => x.id === assignmentId);
+  // ===== PENGAMAN BATAS WAKTU: tolak pengiriman setelah deadline (juga saat mencoba lewat jalur lain) =====
+  if (a && user.role === 'SISWA' && isAssignmentClosed(a)) {
+    showToast('Pengumpulan ditutup', 'Batas waktu (' + formatDate(a.dueDate) + ') sudah terlewat — tugas tidak dapat dikirim atau diubah lagi', 'error');
+    return;
+  }
   const allowedTypes = a.submissionTypes || ['TEXT'];
   const submissionType = document.getElementById('sd-submissionType')?.value || (allowedTypes.length === 1 ? allowedTypes[0] : 'TEXT');
 
@@ -9253,7 +9686,10 @@ function renderLiveClassCard(lc, isSiswa) {
       : '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-600"><i data-lucide="check-circle" style="font-size: 12px;"></i> Selesai</span>';
 
   const joinLabel = status === 'live' ? 'Gabung Sekarang' : status === 'upcoming' ? 'Gabung / Cek Ruang' : 'Buka Ruang';
-  const joinBtn = `<button onclick="joinLiveClass('${lc.id}')" class="px-4 py-2 ${status === 'live' ? 'bg-red-500 hover:bg-red-600' : 'bg-emerald-500 hover:bg-emerald-600'} text-white rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="log-in" style="font-size: 14px;"></i> ${joinLabel}</button>`;
+  // Siswa: sesi yang sudah lewat jadwal tidak dapat diakses lagi (guru/admin tetap bisa membuka arsip)
+  const joinBtn = (isSiswa && status === 'past')
+    ? '<span class="inline-flex items-center gap-1 px-4 py-2 bg-gray-100 text-gray-500 rounded-md text-sm font-medium cursor-not-allowed" title="Sesi sudah berakhir — tidak dapat diakses lagi"><i data-lucide="lock" style="font-size: 14px;"></i> Sudah Berakhir</span>'
+    : `<button onclick="joinLiveClass('${lc.id}')" class="px-4 py-2 ${status === 'live' ? 'bg-red-500 hover:bg-red-600' : 'bg-emerald-500 hover:bg-emerald-600'} text-white rounded-md text-sm font-medium flex items-center gap-1"><i data-lucide="log-in" style="font-size: 14px;"></i> ${joinLabel}</button>`;
 
   return `<div class="bg-white rounded-2xl border-0 shadow-md p-5 ${status === 'past' ? 'opacity-75' : ''} ${status === 'live' ? 'ring-2 ring-red-400' : ''}">
     <div class="flex items-start justify-between gap-3">
@@ -10166,6 +10602,11 @@ function joinLiveClass(liveClassId) {
   if (!lc) { showToast('Live class tidak ditemukan', '', 'error'); return; }
   const user = getCurrentUser();
   if (user && user.role === 'SISWA') {
+    // ===== BATAS WAKTU LIVE CLASS: sesi yang sudah lewat jadwal+durasi tidak dapat diakses siswa =====
+    if (liveClassStatus(lc) === 'past') {
+      showToast('Live class sudah berakhir', 'Sesi "' + lc.title + '" sudah melewati jadwal (' + formatDate(lc.date) + ' ' + lc.time + ' WIB) dan tidak dapat diakses lagi', 'warning');
+      return;
+    }
     const student = db.students.find(s => s.userId === user.id);
     const cls = db.classes.find(c => c.id === lc.classId);
     if (!student || student.classId !== lc.classId) {
