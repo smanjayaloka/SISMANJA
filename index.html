@@ -752,9 +752,9 @@ function updateSyncIndicator() {
 }
 
 // Info senyap: data baru diterima dari latar belakang (TANPA render ulang — aman untuk form)
-// KECUALI halaman LIVE (Penilaian/Tugas/Nilai/Monitor LMS) — di sana perubahan submission,
-// nilai, atau penghapusan data HARUS tampil secara realtime sesuai kebutuhan guru & siswa.
-var _RS_LIVE_PAGES = ['penilaian', 'tugas', 'nilai', 'monitoring-lms'];
+// KECUALI halaman LIVE (Dashboard/Penilaian/Tugas/Nilai/Monitor LMS) — di sana perubahan
+// submission, nilai, atau penghapusan data HARUS tampil secara realtime sesuai kebutuhan guru & siswa.
+var _RS_LIVE_PAGES = ['dashboard', 'penilaian', 'tugas', 'nilai', 'monitoring-lms', 'lms'];
 function rsPageWantsLiveRefresh() {
   try {
     if (typeof uiState === 'undefined' || !uiState || !uiState.currentPage) return false;
@@ -977,8 +977,14 @@ function pullCloudNow(done) {
   const finish = function(ok) { if (!called) { called = true; if (done) done(ok); } };
   const guard = setTimeout(function() { finish(false); }, 8000);
   try {
-    if (!isCloudConnected() || !firebaseFS) { clearTimeout(guard); finish(false); return; }
-    firebaseFS.collection(CLOUD_FS_COL).get().then(function(snap) {
+    // PERBAIKAN REALTIME: dulu pull ditolak bila status "belum terkonfirmasi" — padahal
+    // justru pada kondisi itu data terbaru paling dibutuhkan (sinyal siswa baru mengumpulkan).
+    // Cukup butuh instance Firestore; get() dipaksa dari SERVER (bukan cache) dan bila
+    // berhasil status koneksi langsung diperbarui.
+    if (!firebaseFS) { clearTimeout(guard); finish(false); return; }
+    firebaseFS.collection(CLOUD_FS_COL).get({ source: 'server' }).then(function(snap) {
+      cloudLastServerConfirmAt = Date.now();
+      markCloudConnected(); // server terbukti menjawab — status pulih + antrean tulisan tertahan ikut terkirim
       const docs = {};
       snap.forEach(function(d) { docs[d.id] = d.data(); });
       cloudSnapshotBuffer = docs;
@@ -1370,8 +1376,13 @@ function adoptCloudData(data, replaceAll) {
       const mergedP = Object.assign({}, lp);
       let pChanged = false;
       // Fasilitas: gabungan union anti-hilang dari kedua sisi (record tidak pernah hilang)
-      const mf = mergeArrayAntiLoss(lp.facilities, cp.facilities);
-      if (stableStringify(mf) !== stableStringify(mergedP.facilities)) { mergedP.facilities = mf; pChanged = true; }
+      // PERBAIKAN ANTI-GEMA: hanya gabungkan bila SALAH SATU sisi memang punya data —
+      // dulu array kosong selalu di-fabricate meski kedua sisi tidak punya, sehingga hasil
+      // merge SELALU berbeda dari cloud dan setiap adopsi memicu tulis-ulang seluruh DB.
+      if (lp.facilities !== undefined || cp.facilities !== undefined) {
+        const mf = mergeArrayAntiLoss(lp.facilities, cp.facilities);
+        if (stableStringify(mf) !== stableStringify(mergedP.facilities)) { mergedP.facilities = mf; pChanged = true; }
+      }
       // ANTI TIMPA-BALIK: konten halaman depan & profil dibagi per grup berpenanda waktu —
       // sisi (cloud/lokal) yang terakhir diperbarui yang menang untuk grupnya, sehingga
       // foto/judul/teks yang baru disunting tidak lagi tertimpa snapshot yang lebih tua.
@@ -1509,9 +1520,15 @@ function handleCloudSnapshot() {
     try { checkEmergencyRecovery(metaMs); } catch (e) { /* abaikan */ }
     return;
   }
-  // 2) Ada perubahan lokal yang belum selesai dikirim (antrean/debounce/sedang berjalan/baru saja berubah) →
-  //    tunda adopsi agar data baru lokal tidak terganti data lama; snapshot disimpan & diproses ulang tick 4 dtk
-  if (cloudPushTimer || cloudPendingPush || _cloudPushInFlight || (Date.now() - _dbLocalDirtyAt < 2500)) {
+  // 2) PERBAIKAN REALTIME: adopsi snapshot hanya ditunda bila push lokal SEDANG BERJALAN
+  //    (_cloudPushInFlight) atau debounce push aktif dengan cloud sehat. Dulu SEMUA
+  //    snapshot masuk ditunda bila cloudPendingPush/antrean macet (mis. koneksi bergetar),
+  //    sehingga pengumpulan tugas siswa TIDAK PERNAH tampil di akun guru. Merge anti-hilang
+  //    (record lebih baru menang + tombstone) membuat adopsi selama antrean macet TETAP AMAN:
+  //    perubahan lokal yang belum terkirim tidak akan hilang.
+  var _pushActuallyBusy = _cloudPushInFlight || (!!cloudPushTimer && isCloudConnected());
+  var _freshLocalEdit = (Date.now() - _dbLocalDirtyAt < 2500) && isCloudConnected();
+  if (_pushActuallyBusy || _freshLocalEdit) {
     console.log('[Firebase] Ada perubahan lokal belum terkirim — adopsi snapshot cloud ditunda agar data baru tidak tertimpa');
     cloudSnapshotBuffer = docs;
     return;
@@ -1520,7 +1537,16 @@ function handleCloudSnapshot() {
   const changed = adoptCloudData(data); // MERGE anti-hilang: record lokal & cloud tidak ada yang hilang
   _lastCloudMetaMs = metaMs; // catat meta cloud yang sudah diterima
   if (changed) {
-    saveDB(); // sebarkan hasil gabungan ke cloud + RTDB — perangkat lain yang datanya lama ikut pulih
+    // PERBAIKAN KONEKSI (anti-gema): hanya tulis balik ke cloud bila hasil gabungan
+    // membawa sesuatu yang BELUM ada di cloud (perubahan lokal yang lebih baru).
+    // Dulu SETIAP perangkat penerima menulis ulang SELURUH database — dengan banyak
+    // perangkat online, satu pengumpulan tugas memicu puluhan tulisan besar serentak
+    // dan membuat koneksi terasa terputus-putus.
+    if (stableStringify(db) !== stableStringify(data)) {
+      saveDB(); // sebarkan hasil gabungan ke cloud + RTDB — perangkat lain yang datanya lama ikut pulih
+    } else {
+      rsNoteLocalWrite(); // isi sudah sama dengan cloud — cukup catat, tanpa tulis ulang
+    }
     if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
     else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka (tanpa sesi) — konten terbaru langsung dirender ulang
   }
@@ -1565,9 +1591,17 @@ function startCloudSync(config) {
       cloudUnsub = firebaseFS.collection(CLOUD_FS_COL).onSnapshot({ includeMetadataChanges: true }, function(snap) {
         const fromCache = !!(snap && snap.metadata && snap.metadata.fromCache);
         if (fromCache) {
-          // Data masih dari cache lokal = koneksi ke server cloud TERPUTUS
-          cloudServerConfirmed = false;
-          markCloudDisconnected(null);
+          // PERBAIKAN KONEKSI: fromCache = true juga terjadi SEKEDAR saat tulisan sedang
+          // diproses / backoff singkat — dulu langsung dianggap "TERPUTUS" sehingga status
+          // berkedip putus-nyambung dan pengguna harus menyambungkan terus.
+          // Sekarang: bila server masih mengonfirmasi dalam 15 detik terakhir → anggap
+          // gangguan sesaat. Bila sudah lama tanpa konfirmasi → periksa kesehatan ke server.
+          if (Date.now() - (cloudLastServerConfirmAt || 0) <= 15000) {
+            console.log('[Firebase] Snapshot from-cache sesaat (tulisan diproses) — koneksi dianggap sehat');
+          } else {
+            cloudServerConfirmed = false;
+            probeCloudHealth(); // probe ringan: tulis bocor? tidak — cukup baca 1 doc kecil
+          }
         } else {
           // Server merespons — koneksi benar-benar sehat
           cloudServerConfirmed = true;
@@ -1583,6 +1617,7 @@ function startCloudSync(config) {
           handleCloudSnapshot();
         }, 700);
       }, function(err) { handleCloudError(err, true); });
+      startSignalListener(); // kanal sinyal ringan: notifikasi pengumpulan tugas & penilaian real-time
     }
     // Cloud kosong: hanya pengguna asli yang sedang memegang data boleh mengisi ulang
     // (FULL ONLINE — tidak ada lagi seed/data contoh yang dikirim ke cloud)
@@ -1606,6 +1641,115 @@ function startCloudSync(config) {
     if (cloudAnnounce) { cloudAnnounce = false; showToast('Gagal koneksi Firebase', cloudConnectError, 'error'); }
     updateCloudStatusUI();
   }
+}
+
+/* ============================================================
+   SINYAL REALTIME ANTAR PERANGKAT (kanal ringan "sija_signal")
+   Masalah: sinkronisasi database penuh lewat dokumen chunk besar
+   butuh waktu (meta + chunk 700KB per potongan), sehingga notifikasi
+   "siswa mengumpulkan tugas" bisa terlambat sampai di akun guru.
+   Solusi: dokumen sinyal KECIL (1 dokumen) yang ditulis SEGERA saat
+   siswa mengumpulkan tugas / guru menilai. Perangkat lain yang
+   mendengarkan dokumen ini langsung:
+   - menarik data terbaru dari server (pullCloudNow), lalu
+   - menampilkan notifikasi + menyegarkan tampilan secara otomatis,
+     di halaman APA PUN (bukan hanya halaman tugas/penilaian).
+   ============================================================ */
+const CLOUD_SIGNAL_COL = 'sija_signal';
+let signalUnsub = null;        // listener dokumen sinyal
+let _lastSignalSeenAt = 0;     // waktu sinyal terakhir yang sudah diproses
+let _signalProbeAt = 0;        // throttle probe kesehatan (min 5 detik antar probe)
+
+// Tulis sinyal kecil ke Firestore — SDK otomatis mengantre bila koneksi sedang buruk
+function writeSignal(type, extra) {
+  try {
+    if (typeof firebase === 'undefined' || !firebaseApp) return;
+    const fs = firebaseFS || firebaseApp.firestore();
+    if (!fs) return;
+    const user = (typeof getCurrentUser === 'function' && getCurrentUser()) || null;
+    const payload = Object.assign({
+      at: Date.now(),
+      type: String(type || 'update'),
+      deviceId: deviceLabel(),
+      by: user ? (user.name || '-') : '-',
+      role: user ? (user.role || '-') : '-'
+    }, extra || {});
+    fs.collection(CLOUD_SIGNAL_COL).doc('latest').set(payload).catch(function(e) {
+      console.warn('[SIGNAL] Gagal menulis sinyal:', e && (e.code || e.message));
+    });
+  } catch (e) { /* abaikan */ }
+}
+
+// Terima sinyal dari perangkat lain → tarik data terbaru + tampilkan + beri notifikasi
+function handlePeerSignal(sig) {
+  try {
+    if (!session || (typeof getCurrentUser !== 'function')) return;
+    const user = getCurrentUser();
+    if (!user) return;
+    const isStaff = user.role === 'GURU' || user.role === 'SUPER_ADMIN' || user.role === 'TENDIK' || user.role === 'KEPSEK';
+    // 1) Tarik data TERKINI langsung dari server (bukan menunggu siklus chunk) lalu tampilkan.
+    //    rsScheduleUI/rsApplyUI melindungi isian form & menunda bila modal terbuka — aman.
+    pullCloudNow(function(ok) {
+      if (!ok && cloudSnapshotBuffer) { try { handleCloudSnapshot(); } catch (e) { /* abaikan */ } }
+      if (!document.getElementById('live-room-overlay')) rsScheduleUI(150);
+      updateSyncIndicator();
+    });
+    // 2) Notifikasi sesuai jenis sinyal
+    if (sig.type === 'submission' && isStaff) {
+      showToast('Tugas baru dikumpulkan', (sig.by || 'Siswa') + ' mengumpulkan tugas "' + (sig.title || '-') + '". Daftar pengumpulan diperbarui otomatis.', 'success');
+    } else if (sig.type === 'grade' && user.role === 'SISWA' && (!sig.targetUserId || sig.targetUserId === user.id)) {
+      showToast('Nilai baru masuk', 'Jawaban Anda untuk tugas "' + (sig.title || '-') + '" sudah dinilai guru.', 'success');
+    }
+  } catch (e) { /* abaikan */ }
+}
+
+// Pasang listener dokumen sinyal (dipanggil dari startCloudSync)
+function startSignalListener() {
+  try {
+    if (signalUnsub || !firebaseFS) return;
+    signalUnsub = firebaseFS.collection(CLOUD_SIGNAL_COL).doc('latest').onSnapshot(function(snap) {
+      const v = (snap && snap.exists) ? snap.data() : null;
+      if (!v || !v.at) return;
+      if (String(v.deviceId || '') === String(deviceLabel())) return; // sinyal tulisan sendiri
+      if (v.at <= _lastSignalSeenAt) return;                          // sinyal lama — sudah diproses
+      const isFirstAttach = (_lastSignalSeenAt === 0);
+      _lastSignalSeenAt = v.at;
+      if (isFirstAttach) return; // baru terpasang — abaikan sinyal basi sebelum halaman ini dibuka
+      handlePeerSignal(v);
+    }, function(err) {
+      console.warn('[SIGNAL] listener error:', err && (err.code || err.message));
+    });
+    console.log('[SIGNAL] Listener sinyal realtime aktif (collection "' + CLOUD_SIGNAL_COL + '")');
+  } catch (e) { /* abaikan */ }
+}
+
+// Probe kesehatan koneksi: baca 1 dokumen kecil dari SERVER.
+// Berhasil → koneksi sehat (status "terputus" palsu dicabut). Gagal → benar-benar terputus.
+function probeCloudHealth() {
+  try {
+    if (!navigator.onLine || isCloudDisabled() || !firebaseFS) return;
+    const t = Date.now();
+    if (t - _signalProbeAt < 5000) return; // jangan spam probe
+    _signalProbeAt = t;
+    firebaseFS.collection(CLOUD_SIGNAL_COL).doc('latest').get({ source: 'server' }).then(function() {
+      cloudServerConfirmed = true;
+      cloudLastServerConfirmAt = Date.now();
+      markCloudConnected();
+      console.log('[Firebase] Probe kesehatan: server merespons — koneksi sehat');
+    }).catch(function(err) {
+      const code = (err && (err.code || '')) || '';
+      if (code.indexOf('permission') >= 0 || code.indexOf('not-found') >= 0 || code.indexOf('unavailable') < 0) {
+        // Server MENJAWAB (meski rules menolak / doc belum ada) → jaringan ke server JALAN
+        cloudServerConfirmed = true;
+        cloudLastServerConfirmAt = Date.now();
+        markCloudConnected();
+        console.log('[Firebase] Probe kesehatan: server merespons (' + (code || 'ok') + ') — koneksi sehat');
+        return;
+      }
+      console.warn('[Firebase] Probe kesehatan gagal:', code || (err && err.message));
+      markCloudDisconnected('Server cloud tidak dapat dihubungi (periksa koneksi internet).');
+    });
+  } catch (e) { /* abaikan */ }
 }
 
 function handleCloudError(err, killedListener) {
@@ -1637,6 +1781,7 @@ function resetFirestoreState() {
   cloudServerConfirmed = false;
   cloudConnectError = null;
   if (cloudUnsub) { try { cloudUnsub(); } catch (e) { /* abaikan */ } cloudUnsub = null; }
+  if (signalUnsub) { try { signalUnsub(); } catch (e) { /* abaikan */ } signalUnsub = null; }
   if (cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
   if (cloudSnapshotTimer) { clearTimeout(cloudSnapshotTimer); cloudSnapshotTimer = null; }
   cloudSnapshotBuffer = null;
@@ -1722,7 +1867,10 @@ function updateOnlineGate() {
     if (db && isValidDatabase(db) && isCloudConnected() && !cloudEmptyConfirmed) { hideOnlineGate(); return; }
     if (cloudEmptyConfirmed && cloudServerConfirmed) { showOnlineGate('empty'); return; }
     // Sudah melewati boot (layar boot tidak ada lagi) & cloud terputus lama → tahan aplikasi
-    if (_bootDone && cloudDownSince !== null && (Date.now() - cloudDownSince > 6000)) {
+    // PERBAIKAN KONEKSI: 6 detik terlalu agresif — guncangan jaringan sesaat (pindah WiFi/kuota,
+    // tulisan besar sedang diproses) sempat menutup aplikasi dan pengguna harus menyambung ulang.
+    // Kini 25 detik: sambung-ulang otomatis diberi kesempatan bekerja dulu.
+    if (_bootDone && cloudDownSince !== null && (Date.now() - cloudDownSince > 25000)) {
       showOnlineGate('connect');
       const d = document.getElementById('online-gate-detail');
       if (d) d.textContent = navigator.onLine
@@ -3072,10 +3220,13 @@ function startDbWatchdog() {
     // 3) Cloud terputus → sambung ulang
     //    - listener mati → langsung coba
     //    - listener hidup tapi server tak pernah konfirmasi > 30 detik → coba juga
+    //    - PERBAIKAN KONEKSI: status "terputus" berjalan > 12 detik → coba juga tanpa
+    //      menunggu pengguna menekan tombol "Sambungkan Ulang" berulang-ulang
     if (!isCloudConnected()) {
       const listenerDead = !cloudListening;
       const noConfirmLong = (Date.now() - (cloudLastServerConfirmAt || 0) > 30000);
-      if (listenerDead || noConfirmLong) reconnectCloud(true);
+      const downLong = (cloudDownSince !== null && (Date.now() - cloudDownSince > 12000));
+      if (listenerDead || noConfirmLong || downLong) reconnectCloud(true);
     }
 
     // 4) Backup RTDB mati → hidupkan lagi secara senyap
@@ -5114,6 +5265,92 @@ function printAktivitasPDF() {
   });
 }
 
+/* ============ CETAK PDF REKAP ABSENSI (Super Admin) ============ */
+/* Modal opsi cetak rekap absensi: filter kelas, status, dan rentang tanggal */
+function openPrintAbsensiAdmin() {
+  if (!_printGuardSuperadmin()) return;
+  const total = db.attendances.length;
+  if (total === 0) { showToast('Belum ada absensi', 'Belum ada data absensi siswa untuk dicetak', 'warning'); return; }
+  const classes = db.classes.slice().sort((a, b) => a.name.localeCompare(b.name, 'id', { numeric: true }));
+  const dates = db.attendances.filter(a => a.date).map(a => new Date(a.date).toISOString().slice(0, 10)).sort();
+  const rentang = dates.length ? dates[0].split('-').reverse().join('/') + ' s.d. ' + dates[dates.length - 1].split('-').reverse().join('/') : '-';
+  const body = `
+    <div class="space-y-4">
+      <div class="p-3 rounded-lg bg-gray-50 border text-xs text-gray-600">Total <b>${total}</b> data absensi tercatat pada sistem (periode: ${rentang}).</div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        ${field('Kelas', `<select id="pa-abs-kelas" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Kelas</option>
+          ${classes.map(c => '<option value="' + c.id + '">' + _printEsc(c.name) + '</option>').join('')}
+        </select>`)}
+        ${field('Status Kehadiran', `<select id="pa-abs-status" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+          <option value="ALL">Semua Status</option>
+          <option value="HADIR">Hadir</option>
+          <option value="SAKIT">Sakit</option>
+          <option value="IZIN">Izin</option>
+          <option value="ALFA">Alfa</option>
+        </select>`)}
+        ${field('Dari Tanggal', '<input type="date" id="pa-abs-from" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">')}
+        ${field('Sampai Tanggal', '<input type="date" id="pa-abs-to" class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">')}
+      </div>
+      <p class="text-xs text-gray-500 flex items-start gap-1"><i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i> <span>Kosongkan rentang tanggal untuk mencetak seluruh periode. Dokumen dilengkapi kop sekolah, ringkasan rekap, dan tanda tangan otomatis. Data diurutkan dari tanggal terlama.</span></p>
+    </div>`;
+  showModal('Cetak PDF Rekap Absensi', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Cetak PDF', 'printAbsensiAdmin()', { icon: 'printer' })
+  , 'max-w-lg');
+}
+
+/* Cetak PDF rekap absensi seluruh siswa dengan filter kelas/status/periode */
+function printAbsensiAdmin() {
+  if (!_printGuardSuperadmin()) return;
+  const read = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const fKelas = read('pa-abs-kelas') || 'ALL';
+  const fStatus = read('pa-abs-status') || 'ALL';
+  const fFrom = read('pa-abs-from');
+  const fTo = read('pa-abs-to');
+  closeModal();
+  const ABS_LBL = { HADIR: 'Hadir', SAKIT: 'Sakit', IZIN: 'Izin', ALFA: 'Alfa' };
+  const dkey = a => new Date(a.date).toISOString().slice(0, 10);
+  let recs = db.attendances.filter(a => a.date);
+  if (fKelas !== 'ALL') recs = recs.filter(a => a.classId === fKelas);
+  if (fStatus !== 'ALL') recs = recs.filter(a => a.status === fStatus);
+  recs = recs.filter(a => { const d = dkey(a); if (fFrom && d < fFrom) return false; if (fTo && d > fTo) return false; return true; });
+  if (recs.length === 0) { showToast('Tidak ada data', 'Tidak ada data absensi sesuai filter yang dipilih', 'warning'); return; }
+  const cname = a => (db.classes.find(c => c.id === a.classId)?.name || '').toLowerCase();
+  const sname = a => (db.students.find(x => x.id === a.studentId)?.name || '').toLowerCase();
+  recs.sort((a, b) => dkey(a).localeCompare(dkey(b)) || cname(a).localeCompare(cname(b), 'id', { numeric: true }) || sname(a).localeCompare(sname(b), 'id'));
+  const rows = recs.map((a, i) => {
+    const s = db.students.find(x => x.id === a.studentId);
+    const cls = db.classes.find(c => c.id === a.classId);
+    return '<tr><td class="center">' + (i + 1) + '</td><td class="center">' + _printEsc(s?.nis || '-') + '</td><td>' + _printEsc(s?.name || '-') +
+      '</td><td class="center">' + _printEsc(cls?.name || '-') + '</td><td class="center">' + formatDate(a.date, { day: '2-digit', month: 'short', year: 'numeric' }) +
+      '</td><td class="center">' + _printEsc(ABS_LBL[a.status] || a.status || '-') + '</td><td>' + _printEsc(a.note || '-') + '</td></tr>';
+  }).join('');
+  const cnt = { HADIR: 0, SAKIT: 0, IZIN: 0, ALFA: 0 };
+  recs.forEach(a => { cnt[a.status] = (cnt[a.status] || 0) + 1; });
+  const uniqDates = [...new Set(recs.map(dkey))].sort();
+  const kelasLabel = fKelas === 'ALL' ? 'Semua Kelas' : _printEsc(db.classes.find(c => c.id === fKelas)?.name || '-');
+  const body = `
+    <table>
+      <thead><tr><th style="width:28px;">No</th><th style="width:65px;">NIS</th><th style="width:150px;">Nama Siswa</th><th style="width:70px;">Kelas</th><th style="width:85px;">Tanggal</th><th style="width:60px;">Status</th><th>Catatan</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="report-summary">
+      <h3>Ringkasan</h3>
+      <div class="report-summary-grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="report-summary-item"><div class="label">Total Data Dicetak</div><div class="value">${recs.length}</div></div>
+        <div class="report-summary-item"><div class="label">Hadir</div><div class="value">${cnt.HADIR}</div></div>
+        <div class="report-summary-item"><div class="label">Sakit</div><div class="value">${cnt.SAKIT}</div></div>
+        <div class="report-summary-item"><div class="label">Izin / Alfa</div><div class="value" style="font-size:12pt;">${cnt.IZIN} / ${cnt.ALFA}</div></div>
+      </div>
+    </div>
+  `;
+  printReport('Laporan Rekap Absensi Siswa', body, {
+    metaInfo: 'Kelas: ' + kelasLabel + ' | Status: ' + (fStatus === 'ALL' ? 'Semua' : ABS_LBL[fStatus]) +
+      ' | Periode: ' + (uniqDates.length ? formatDate(uniqDates[0]) + ' s.d. ' + formatDate(uniqDates[uniqDates.length - 1]) : '-')
+  });
+}
+
 /* ============ CETAK PDF DATA GURU / TENDIK / SISWA (Super Admin) ============ */
 /* Fitur: cetak PDF daftar guru & tendik berdasarkan KATEGORI, daftar siswa berdasarkan KELAS */
 function _printGuardSuperadmin() {
@@ -5828,7 +6065,9 @@ window.ADMIN_PAGES = {
   absensi() {
     const summary = { HADIR: 0, SAKIT: 0, IZIN: 0, ALFA: 0 };
     db.attendances.forEach(a => { summary[a.status] = (summary[a.status] || 0) + 1; });
-    return pageHeader('Rekap Absensi', 'Data kehadiran seluruh siswa') + `
+    return pageHeader('Rekap Absensi', 'Data kehadiran seluruh siswa',
+      db.attendances.length ? btn('Cetak PDF', 'openPrintAbsensiAdmin()', { variant: 'outline', icon: 'printer' }) : ''
+    ) + `
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         ${statCard('Hadir', summary.HADIR, 'calendar', 'emerald')}
         ${statCard('Sakit', summary.SAKIT, 'calendar', 'amber')}
@@ -8875,9 +9114,12 @@ window.GURU_PAGES = {
         ${statCard('Alfa', summary.ALFA, 'alert-circle', 'red')}
       </div>
       <div class="bg-white rounded-2xl border-0 shadow-md">
-        <div class="p-4 border-b flex items-center justify-between">
+        <div class="p-4 border-b flex items-center justify-between gap-2">
           <h3 class="font-semibold">Daftar Hadir - ${course ? db.classes.find(c => c.id === course.classId)?.name : ''}</h3>
-          <button onclick="saveAttendance()" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm rounded-md">Simpan Absensi</button>
+          <div class="flex gap-2 flex-shrink-0">
+            <button onclick="openPrintAbsensiGuru()" class="px-4 py-2 border border-emerald-500 text-emerald-700 hover:bg-emerald-50 text-sm rounded-md flex items-center gap-1"><i data-lucide="printer" style="font-size: 14px;"></i> Cetak PDF</button>
+            <button onclick="saveAttendance()" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm rounded-md">Simpan Absensi</button>
+          </div>
         </div>
         ${students.length === 0 ? '<p class="p-8 text-center text-gray-500 text-sm">Belum ada siswa di kelas ini</p>' :
           table(['Nama Siswa', 'NIS', 'Status', 'Catatan'],
@@ -9394,6 +9636,14 @@ function saveGrade(subId) {
   sub.status = 'DINILAI';
   sub.gradeId = gradeId;
   saveDB();
+  // REALTIME KE SISWA: nilai langsung dikirim + sinyal agar halaman "Nilai Saya" /
+  // "Tugas Saya" siswa otomatis memuat data terbaru + muncul notifikasi.
+  try { saveToCloud(true); } catch (e) { /* antre otomatis */ }
+  try { saveToRTDB(true); } catch (e) { /* antre otomatis */ }
+  try {
+    const _stu = db.students.find(s => s.id === sub.studentId);
+    writeSignal('grade', { title: (a?.title || '-'), targetUserId: _stu ? _stu.userId : '' });
+  } catch (e) { /* abaikan */ }
   closeModal();
   showToast('Nilai disimpan', 'Status siswa kini DINILAI & DIKUNCI', 'success');
   refreshMainContent();
@@ -9423,6 +9673,137 @@ function saveAttendance() {
   });
   saveDB();
   showToast('Absensi disimpan', count + ' data absensi disimpan', 'success');
+}
+
+/* ============ CETAK PDF ABSENSI (Guru) ============ */
+/* Modal pilihan cetak absensi kelas: daftar hadir harian / rekap kehadiran per siswa */
+function openPrintAbsensiGuru() {
+  const user = getCurrentUser();
+  const teacher = db.teachers.find(t => t.userId === user.id);
+  const courses = db.courses.filter(c => c.teacherId === teacher?.id);
+  const course = courses.find(c => c.id === (window._absCourse || '')) || courses[0];
+  if (!course) { showToast('Belum ada mata pelajaran', 'Anda belum mengampu mata pelajaran apa pun untuk dicetak', 'warning'); return; }
+  const cls = db.classes.find(c => c.id === course.classId);
+  const students = db.students.filter(s => s.classId === course.classId);
+  if (students.length === 0) { showToast('Belum ada siswa', 'Belum ada siswa di kelas ini untuk dicetak', 'warning'); return; }
+  const date = window._absDate || new Date().toISOString().slice(0, 10);
+  const recDates = [...new Set(db.attendances.filter(a => a.classId === course.classId && a.date).map(a => new Date(a.date).toISOString().slice(0, 10)))].sort();
+  window._absPrintCourse = course.id; // kunci konteks mapel saat modal dibuka
+  const body = `
+    <div class="space-y-4">
+      <div class="p-3 rounded-lg bg-gray-50 border text-xs text-gray-600">Kelas <b>${_printEsc(cls?.name || '-')}</b> • <b>${students.length}</b> siswa • <b>${recDates.length}</b> pertemuan tercatat di absensi.</div>
+      <div class="space-y-2">
+        <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-emerald-50/50">
+          <input type="radio" name="abs-print-mode" value="HARIAN" checked class="mt-1 flex-shrink-0">
+          <span class="text-sm"><b>Daftar Hadir Harian</b><br><span class="text-xs text-gray-500">Form daftar hadir tanggal ${formatDate(date)} sesuai tampilan di layar (status &amp; catatan saat ini), lengkap dengan kolom tanda tangan siswa.</span></span>
+        </label>
+        <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-emerald-50/50">
+          <input type="radio" name="abs-print-mode" value="REKAP" class="mt-1 flex-shrink-0">
+          <span class="text-sm"><b>Rekap Kehadiran Kelas</b><br><span class="text-xs text-gray-500">Ringkasan kehadiran per siswa (hadir/sakit/izin/alfa + persentase kehadiran) dari seluruh absensi yang sudah tersimpan${recDates.length ? ' — ' + recDates.length + ' pertemuan' : ''}.</span></span>
+        </label>
+      </div>
+      <p class="text-xs text-gray-500 flex items-start gap-1"><i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i> <span>PDF memakai kop sekolah, ringkasan, dan tanda tangan otomatis (Kepala Sekolah &amp; Guru). Dokumen terbuka di tab baru — klik "Cetak / Save PDF".</span></p>
+    </div>`;
+  showModal('Cetak PDF Absensi Kelas', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Cetak PDF', 'printAbsensiGuru()', { icon: 'printer' })
+  , 'max-w-lg');
+}
+
+/* Cetak PDF absensi kelas versi guru: mode HARIAN (daftar hadir) / REKAP (per siswa) */
+function printAbsensiGuru() {
+  const modeEl = document.querySelector('input[name="abs-print-mode"]:checked');
+  const mode = modeEl ? modeEl.value : 'HARIAN';
+  closeModal();
+  const user = getCurrentUser();
+  const teacher = db.teachers.find(t => t.userId === user.id);
+  const courses = db.courses.filter(c => c.teacherId === teacher?.id);
+  const course = db.courses.find(c => c.id === (window._absPrintCourse || window._absCourse || '')) || courses[0];
+  window._absPrintCourse = '';
+  if (!course) { showToast('Belum ada mata pelajaran', 'Tidak ada mata pelajaran untuk dicetak', 'warning'); return; }
+  const cls = db.classes.find(c => c.id === course.classId);
+  const students = db.students.filter(s => s.classId === course.classId).slice()
+    .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'id', { numeric: true }));
+  if (students.length === 0) { showToast('Belum ada siswa', 'Belum ada siswa di kelas ini untuk dicetak', 'warning'); return; }
+  const ABS_LBL = { HADIR: 'Hadir', SAKIT: 'Sakit', IZIN: 'Izin', ALFA: 'Alfa' };
+  const metaBase = 'Kelas: ' + _printEsc(cls?.name || '-') + ' | Mata Pelajaran: ' + _printEsc(course.name || '-') + ' | Guru Pengampu: ' + _printEsc(teacher?.name || user.name);
+
+  /* ---- MODE REKAP: ringkasan kehadiran per siswa + rincian per pertemuan ---- */
+  if (mode === 'REKAP') {
+    const recs = db.attendances.filter(a => a.classId === course.classId && a.date);
+    if (recs.length === 0) { showToast('Belum ada absensi tersimpan', 'Simpan absensi terlebih dahulu untuk mencetak rekap kehadiran', 'warning'); return; }
+    const rows = students.map((s, i) => {
+      const mine = recs.filter(a => a.studentId === s.id);
+      const c = { HADIR: 0, SAKIT: 0, IZIN: 0, ALFA: 0 };
+      mine.forEach(a => { c[a.status] = (c[a.status] || 0) + 1; });
+      const pct = mine.length ? Math.round(c.HADIR / mine.length * 100) : null;
+      return '<tr><td class="center">' + (i + 1) + '</td><td class="center">' + _printEsc(s.nis || '-') + '</td><td>' + _printEsc(s.name) +
+        '</td><td class="center">' + c.HADIR + '</td><td class="center">' + c.SAKIT + '</td><td class="center">' + c.IZIN + '</td><td class="center">' + c.ALFA +
+        '</td><td class="center">' + mine.length + '</td><td class="center" style="font-weight:bold;">' + (pct === null ? '-' : pct + '%') + '</td></tr>';
+    }).join('');
+    const byDate = {};
+    recs.forEach(a => { const d = new Date(a.date).toISOString().slice(0, 10); (byDate[d] = byDate[d] || { HADIR: 0, SAKIT: 0, IZIN: 0, ALFA: 0 })[a.status]++; });
+    const dates = Object.keys(byDate).sort();
+    const pertemuanRows = dates.map((d, i) => {
+      const b = byDate[d];
+      return '<tr><td class="center">' + (i + 1) + '</td><td class="center">' + formatDate(d) +
+        '</td><td class="center">' + (b.HADIR || 0) + '</td><td class="center">' + (b.SAKIT || 0) + '</td><td class="center">' + (b.IZIN || 0) + '</td><td class="center">' + (b.ALFA || 0) + '</td></tr>';
+    }).join('');
+    const tot = { HADIR: 0, SAKIT: 0, IZIN: 0, ALFA: 0 };
+    recs.forEach(a => { tot[a.status] = (tot[a.status] || 0) + 1; });
+    const body = `
+      <table>
+        <thead><tr><th style="width:28px;">No</th><th style="width:65px;">NIS</th><th>Nama Siswa</th><th style="width:35px;">H</th><th style="width:35px;">S</th><th style="width:35px;">I</th><th style="width:35px;">A</th><th style="width:50px;">Total</th><th style="width:70px;">% Hadir</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="report-summary">
+        <h3>Ringkasan</h3>
+        <div class="report-summary-grid">
+          <div class="report-summary-item"><div class="label">Total Siswa</div><div class="value">${students.length}</div></div>
+          <div class="report-summary-item"><div class="label">Pertemuan Tercatat</div><div class="value">${dates.length}</div></div>
+          <div class="report-summary-item"><div class="label">Total Entri (H/S/I/A)</div><div class="value" style="font-size:11pt;">${tot.HADIR} / ${tot.SAKIT} / ${tot.IZIN} / ${tot.ALFA}</div></div>
+        </div>
+      </div>
+      <p style="font-size:12pt; font-weight:bold; margin:16px 0 0 0;">Rincian per Pertemuan</p>
+      <table>
+        <thead><tr><th style="width:28px;">No</th><th>Tanggal</th><th style="width:60px;">Hadir</th><th style="width:60px;">Sakit</th><th style="width:60px;">Izin</th><th style="width:60px;">Alfa</th></tr></thead>
+        <tbody>${pertemuanRows}</tbody>
+      </table>`;
+    printReport('Rekap Kehadiran Siswa' + (cls ? ' — Kelas ' + _printEsc(cls.name) : ''), body, {
+      metaInfo: metaBase + ' | Periode: ' + (dates.length ? formatDate(dates[0]) + ' s.d. ' + formatDate(dates[dates.length - 1]) : '-')
+    });
+    return;
+  }
+
+  /* ---- MODE HARIAN: form daftar hadir sesuai tampilan layar + kolom tanda tangan ---- */
+  const date = window._absDate || new Date().toISOString().slice(0, 10);
+  const existing = db.attendances.filter(a => a.classId === course.classId && a.date && new Date(a.date).toISOString().slice(0, 10) === date);
+  const summary = { HADIR: 0, SAKIT: 0, IZIN: 0, ALFA: 0 };
+  const rows = students.map((s, i) => {
+    const ex = existing.find(a => a.studentId === s.id);
+    const st = (window._absState && window._absState[s.id]) ? window._absState[s.id] : (ex ? { status: ex.status, note: ex.note || '' } : { status: 'HADIR', note: '' });
+    const status = st.status || 'HADIR';
+    summary[status] = (summary[status] || 0) + 1;
+    return '<tr><td class="center">' + (i + 1) + '</td><td class="center">' + _printEsc(s.nis || '-') + '</td><td>' + _printEsc(s.name) +
+      '</td><td class="center">' + _printEsc(ABS_LBL[status] || status) + '</td><td>' + _printEsc(st.note || '-') + '</td><td style="height:34px;"></td></tr>';
+  }).join('');
+  const body = `
+    <table>
+      <thead><tr><th style="width:28px;">No</th><th style="width:70px;">NIS</th><th style="width:170px;">Nama Siswa</th><th style="width:60px;">Status</th><th>Catatan</th><th style="width:110px;">Tanda Tangan</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="report-summary">
+      <h3>Ringkasan Kehadiran</h3>
+      <div class="report-summary-grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="report-summary-item"><div class="label">Hadir</div><div class="value">${summary.HADIR}</div></div>
+        <div class="report-summary-item"><div class="label">Sakit</div><div class="value">${summary.SAKIT}</div></div>
+        <div class="report-summary-item"><div class="label">Izin</div><div class="value">${summary.IZIN}</div></div>
+        <div class="report-summary-item"><div class="label">Alfa</div><div class="value">${summary.ALFA}</div></div>
+      </div>
+    </div>`;
+  printReport('Daftar Hadir Siswa', body, {
+    metaInfo: metaBase + ' | Tanggal: ' + formatDate(date)
+  });
 }
 
 /* ============ DETAIL AKTIVITAS SISWA (Wali Kelas) ============ */
@@ -10774,6 +11155,15 @@ function submitAssignment(assignmentId) {
   }
   db.logs.push({ id: uid('log'), userId: user.id, action: 'SUBMIT TUGAS', detail: 'Mengumpulkan tugas "' + (a?.title || '-') + '" (' + items.map(it => (_SUB_KIND_META[it.kind] || { label: it.kind }).label).join(' + ') + ')' + (existing ? ' (revisi)' : ''), createdAt: now() });
   saveDB();
+  // ===== REALTIME KE AKUN GURU (PERBAIKAN UTAMA) =====
+  // Dulu pengumpulan hanya antre lewat debounce 900ms + bisa tertahan bila koneksi
+  // bergetar, sehingga tugas lama tidak muncul di akun guru. Kini:
+  // 1) kirim SEGERA ke Cloud Firestore + backup RTDB (tanpa menunggu debounce);
+  // 2) tulis SINYAL kecil ("sija_signal") yang langsung memicu akun guru memuat data
+  //    terbaru + notifikasi "Tugas baru dikumpulkan" — di halaman mana pun guru berada.
+  try { saveToCloud(true); } catch (e) { /* antre otomatis */ }
+  try { saveToRTDB(true); } catch (e) { /* antre otomatis */ }
+  try { writeSignal('submission', { title: (a?.title || '-'), assignmentId: assignmentId, studentName: (student && student.name) || user.name || 'Siswa' }); } catch (e) { /* abaikan */ }
   closeModal();
   showToast('Tugas berhasil dikumpulkan!', items.length + ' bentuk jawaban terkirim: ' + items.map(it => (_SUB_KIND_META[it.kind] || { label: it.kind }).label).join(', '), 'success');
   refreshMainContent();
