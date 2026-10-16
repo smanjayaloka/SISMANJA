@@ -511,12 +511,15 @@ const DB_BAK_KEY = 'sija_db_bak_v1';  // salinan cadangan lokal — pemulihan bi
 const SESSION_KEY = 'sija_session_v1';
 const SESSION_BAK_KEY = 'sija_session_bak_v1'; // salinan sesi anti-hilang (storage di-evict/dibersihkan browser)
 const UI_KEY = 'sija_ui_v1';
+const EMERGENCY_KEY = 'sija_db_emergency_v1'; // KOTAK HITAM: salinan darurat perubahan yang belum terkirim ke cloud (anti data hilang)
 
 let db = null;
 let session = null;
 let uiState = { currentPage: 'dashboard', sidebarOpen: false };
 let lastBakAt = 0;          // (tidak dipakai lagi — FULL ONLINE: database tidak disimpan lokal)
 let lastSaveErrToastAt = 0; // debounce toast error penyimpanan
+let _emergencyClearAfterPush = false; // tandai: hapus kotak hitam setelah push cloud berhasil
+let _emergencyRecovered = false;      // pemulihan dari kotak hitam sudah dilakukan sesi ini
 
 /* ============================================================
    FULL ONLINE MODE (Task 16)
@@ -606,6 +609,100 @@ function saveDB() {
   // memperbarui halamannya masing-masing lewat refresh eksplisit di handler-nya, dan perubahan
   // dari luar ditampilkan lewat tombol "Sinkron" di bilah atas — agar halaman tidak ter-reset
   // dan isian form tidak hilang saat pengguna sedang bekerja.
+  // PERBAIKAN ANTI-HILANG: bila cloud sedang TERPUTUS, perubahan hanya ada di RAM —
+  // tab yang tertutup/mati sebelum tersambung ulang berarti data hilang permanen.
+  // Selamatkan segera ke kotak hitam localStorage (ditimpa terus, hanya 1 salinan terbaru).
+  if (!isCloudConnected()) saveEmergencySnapshot('offline');
+}
+
+/* ============================================================
+   KOTAK HITAM ANTI-HILANG — perbaikan "data terputus → data hilang"
+   Masalah: mode FULL ONLINE menyimpan database hanya di memori + cloud.
+   Saat koneksi terputus, perubahan mengantre di RAM (cloudPendingPush);
+   bila tab ditutup/refresh/crash sebelum tersambung ulang, perubahan
+   itu HILANG PERMANEN — inilah penyebab utama data sekolah hilang.
+   Solusi: salinan darurat bertanda-waktu di localStorage yang:
+   - ditulis setiap ada perubahan saat cloud terputus, saat tab
+     disembunyikan, dan saat halaman akan ditutup;
+   - digabung kembali secara ANTI-HILANG ke database pada kunjungan
+     berikutnya (record lebih baru menang; tombstone melindungi data
+     yang memang sudah dihapus; snapshot lebih tua dari cloud dibuang).
+   ============================================================ */
+function saveEmergencySnapshot(reason) {
+  try {
+    if (!db || !isValidDatabase(db)) return;
+    localStorage.setItem(EMERGENCY_KEY, JSON.stringify({ at: now(), reason: String(reason || ''), json: JSON.stringify(db) }));
+  } catch (e) { /* kuota penuh / storage diblokir — abaikan */ }
+}
+function readEmergencySnapshot() {
+  try {
+    const raw = localStorage.getItem(EMERGENCY_KEY);
+    if (!raw) return null;
+    const wrap = JSON.parse(raw);
+    if (!wrap || typeof wrap.json !== 'string') return null;
+    const data = JSON.parse(wrap.json);
+    if (!isValidDatabase(data)) { try { localStorage.removeItem(EMERGENCY_KEY); } catch (e) {} return null; }
+    return { at: Date.parse(wrap.at) || 0, data: data };
+  } catch (e) { return null; }
+}
+function clearEmergencySnapshot() {
+  try { localStorage.removeItem(EMERGENCY_KEY); } catch (e) { /* abaikan */ }
+}
+// Gabungkan kembali perubahan darurat yang sempat tidak terkirim ke cloud.
+// cloudMetaMs = waktu meta cloud terbaru yang diketahui (0 bila cloud kosong).
+function checkEmergencyRecovery(cloudMetaMs) {
+  if (_emergencyRecovered) return;
+  const snap = readEmergencySnapshot();
+  if (!snap) return;
+  // Snapshot lebih tua (atau sama) dari data cloud yang sudah ada → tidak membawa apa-apa baru
+  if (db && snap.at <= (cloudMetaMs || 0)) { clearEmergencySnapshot(); return; }
+  try {
+    if (!db) {
+      // Browser baru / data belum terbaca dari mana pun → adopsi penuh salinan darurat,
+      // lalu isi ulang cloud + backup secepatnya (cloud mungkin sedang kosong).
+      if (adoptCloudData(snap.data, true)) {
+        cloudEmptyConfirmed = false; // cloud akan diisi ulang — cabang status "kosong"
+        _emergencyRecovered = true;
+        _emergencyClearAfterPush = true;
+        saveToCloud(true); saveToRTDB(true);
+        updateOnlineGate();
+        try { if (session) { renderApp(); } else { renderLanding(); } lucide.createIcons(); } catch (e) { /* abaikan */ }
+        showToast('Data berhasil dipulihkan', 'Perubahan terakhir yang sempat terputus dari database dikembalikan dari penyimpanan darurat perangkat ini.', 'success');
+        console.log('[EMERGENCY] Database dipulihkan dari salinan darurat lokal (' + new Date(snap.at).toLocaleString('id-ID') + ')');
+      }
+      return;
+    }
+    // Database sudah ada (dari cloud) → gabung anti-hilang: perubahan offline
+    // yang lebih baru dari cloud tidak boleh hilang.
+    const before = stableStringify(db);
+    adoptCloudData(snap.data);
+    if (stableStringify(db) !== before) {
+      _emergencyClearAfterPush = true; // kotak hitam dihapus setelah push berikutnya terkonfirmasi
+      saveDB(); // sebarkan hasil gabungan ke cloud + RTDB
+      if (session) rsNotifyNewData('pemulihan data offline');
+      else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } }
+      showToast('Data berhasil dipulihkan', 'Perubahan yang sempat tidak terkirim ke database telah digabungkan kembali secara aman.', 'success');
+      console.log('[EMERGENCY] Perubahan offline digabungkan kembali ke database');
+    } else {
+      clearEmergencySnapshot();
+    }
+    _emergencyRecovered = true;
+  } catch (e) { console.warn('[EMERGENCY] Pemulihan gagal:', e && e.message); }
+}
+// Bidikan terakhir sebelum halaman ditutup/disembunyikan: simpan kotak hitam
+// (sinkron & instan) + dorong segera perubahan yang masih mengantre bila server tersambung.
+function flushPendingBeforeExit() {
+  try {
+    if (!db || !isValidDatabase(db)) return;
+    const hasQueue = !!(cloudPendingPush || rtdbPendingPush || cloudPushTimer || rtdbPushTimer);
+    if (!isCloudConnected() || hasQueue || (Date.now() - _dbLocalDirtyAt < 3000)) {
+      saveEmergencySnapshot('exit');
+    }
+    if (hasQueue) {
+      if (isCloudConnected()) { try { saveToCloud(true); } catch (e) { /* abaikan */ } }
+      if (isRtdbActive()) { try { saveToRTDB(true); } catch (e) { /* abaikan */ } }
+    }
+  } catch (e) { /* abaikan */ }
 }
 
 // Penanda waktu per-grup konten schoolProfile (anti timpa-balik antar perangkat):
@@ -827,6 +924,11 @@ function rsStartRealtimeSync() {
 
   // 2) Tab kembali terlihat / fokus → sesi dicek + penyegaran tertunda diterapkan;
   //    DATA selalu terbaru otomatis lewat listener realtime Cloud Firestore
+  // PERBAIKAN ANTI-HILANG: saat tab DISEMBUNYIKAN, halaman akan DITUTUP, atau perangkat
+  // mematikan tab di latar belakang (khas HP) — selamatkan perubahan yang belum terkirim.
+  document.addEventListener('visibilitychange', function() { if (document.hidden) flushPendingBeforeExit(); });
+  window.addEventListener('pagehide', flushPendingBeforeExit);
+  window.addEventListener('beforeunload', flushPendingBeforeExit);
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) return;
     updateOnlineGate();
@@ -847,6 +949,11 @@ function rsStartRealtimeSync() {
   setInterval(function() {
     if (cloudSnapshotBuffer) { try { handleCloudSnapshot(); } catch (e) { /* abaikan */ } }
     if (rtdbSnapshotBuffer) { try { processRtdbSnapshot(); } catch (e) { /* abaikan */ } }
+    // PERBAIKAN ANTI-HILANG: antrean perubahan yang gagal terkirim (jaringan putus
+    // di tengah push, dsb.) dicoba lagi rutin — dulu hanya dicoba sekali saat momen
+    // sambung-ulang, sehingga perubahan bisa menggantung di RAM sampai halaman tertutup.
+    if (cloudPendingPush && isCloudConnected() && !_cloudPushInFlight && !cloudPushTimer) { try { saveToCloud(true); } catch (e) { /* abaikan */ } }
+    if (rtdbPendingPush && isRtdbActive() && !rtdbPushTimer) { try { saveToRTDB(true); } catch (e) { /* abaikan */ } }
     onlineGateTick();
     if (_rsPendingUI && !document.hidden && !rsUiBusy()) { try { rsApplyUI(); } catch (e) { /* abaikan */ } }
   }, 4000);
@@ -1353,6 +1460,10 @@ function handleCloudSnapshot() {
       cloudEmptyConfirmed = true; // FULL ONLINE: tanpa data cloud aplikasi tidak bisa dipakai — laporkan ke layar boot
       console.warn('[Firebase] Database cloud KOSONG — hubungi Super Admin (pulihan via backup RTDB)');
     }
+    // PERBAIKAN ANTI-HILANG: sebelum menyatakan data hilang, coba pulihkan dari
+    // kotak hitam perangkat ini dan/atau backup Realtime Database secara otomatis.
+    try { checkEmergencyRecovery(0); } catch (e) { /* abaikan */ }
+    try { tryRtdbAutoRescue(); } catch (e) { /* abaikan */ }
     return;
   }
   const metaMs = Date.parse(meta.updatedAt) || 0;
@@ -1373,6 +1484,9 @@ function handleCloudSnapshot() {
     console.warn('[Firebase] Snapshot cloud tidak sah — diabaikan (data lokal dipertahankan)');
     return;
   }
+  // PERBAIKAN: server terbukti berisi database valid — status "cloud kosong" dicabut
+  // (menutup kasus gerbang 'kosong' yang tidak tertutup setelah cloud diisi ulang)
+  cloudEmptyConfirmed = false;
   // ===== ANTI-REVERT: jangan biarkan snapshot cloud yang LAMA menimpa perubahan lokal yang lebih baru =====
   // 1) Snapshot lebih tua dari yang sudah pernah diterima → buang (echo tulisan lama)
   if (metaMs && metaMs < _lastCloudMetaMs) {
@@ -1390,6 +1504,9 @@ function handleCloudSnapshot() {
       else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — konten cloud langsung tampil
       console.log('[Firebase] Database sekolah dimuat dari cloud — aplikasi siap');
     }
+    // PERBAIKAN ANTI-HILANG: setelah data cloud terpasang, gabungkan perubahan offline
+    // dari kotak hitam yang lebih baru (perubahan yang sempat tidak terkirim ke cloud)
+    try { checkEmergencyRecovery(metaMs); } catch (e) { /* abaikan */ }
     return;
   }
   // 2) Ada perubahan lokal yang belum selesai dikirim (antrean/debounce/sedang berjalan/baru saja berubah) →
@@ -1407,6 +1524,9 @@ function handleCloudSnapshot() {
     if (session) rsNotifyNewData('perangkat lain'); // adopsi senyap — ditampilkan lewat tombol "Sinkron"
     else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka (tanpa sesi) — konten terbaru langsung dirender ulang
   }
+  // PERBAIKAN ANTI-HILANG: gabungkan perubahan offline dari kotak hitam yang lebih
+  // baru dari cloud (perubahan yang dulu hilang karena terputus)
+  try { checkEmergencyRecovery(metaMs); } catch (e) { /* abaikan */ }
 }
 
 function ensureFirebaseApp(config) {
@@ -1580,7 +1700,7 @@ function showOnlineGate(mode) {
   const btn = document.getElementById('online-gate-retry');
   if (t) t.textContent = mode === 'empty' ? 'Database Cloud Kosong' : 'Menghubungkan ke Server...';
   if (d) d.textContent = mode === 'empty'
-    ? 'Server cloud terjangkau tetapi belum berisi data sekolah. Hubungi Super Admin (pulihan data tersedia di halaman Database & Cloud akun Super Admin).'
+    ? 'Server cloud terjangkau tetapi belum berisi data sekolah. Aplikasi otomatis mencoba memulihkan data dari penyimpanan darurat perangkat & backup RTDB — bila berhasil, layar ini tertutup sendiri. Bila tidak, hubungi Super Admin (pulihan manual tersedia di halaman Database & Cloud).'
     : 'Aplikasi sekolah berjalan FULL ONLINE — data hanya tersimpan di server cloud, bukan di browser. Menunggu database sekolah terbaca...';
   if (spin) spin.style.display = mode === 'empty' ? 'none' : '';
   if (btn) btn.classList.toggle('hidden', mode === 'empty');
@@ -1657,9 +1777,19 @@ function saveToCloud(immediate) {
       _cloudPushInFlight = false;
       _lastCloudMetaMs = sentMs; // server kini berisi tulisan kita — snapshot echo dengan waktu ini tidak dianggap lebih baru
       console.log('[Firebase] Data terkirim ke cloud (' + Math.round(json.length / 1024) + ' KB)');
-    }).catch(function(err) { _cloudPushInFlight = false; handleCloudError(err, false); });
+      // PERBAIKAN: perubahan hasil pemulihan kotak hitam sudah benar-benar aman di server
+      if (_emergencyClearAfterPush) { _emergencyClearAfterPush = false; clearEmergencySnapshot(); }
+    }).catch(function(err) {
+      _cloudPushInFlight = false;
+      // PERBAIKAN: push gagal (jaringan putus di tengah jalan) — antrean WAJIB dicatat
+      // agar otomatis dikirim ulang saat tersambung; dulu bug di sini membuat perubahan
+      // menggantung di RAM saja dan hilang saat halaman ditutup.
+      if (!isCloudDisabled()) cloudPendingPush = true;
+      handleCloudError(err, false);
+    });
   } catch (e) {
     _cloudPushInFlight = false;
+    if (!isCloudDisabled()) cloudPendingPush = true; // PERBAIKAN: gagal kirim → catat antrean
     handleCloudError(e, false);
   }
 }
@@ -1771,6 +1901,7 @@ let rtdbLastTotal = 0;           // jumlah chunk terakhir yang dikirim (untuk be
 let rtdbLastPushAt = null;       // waktu backup terakhir dari perangkat ini
 let rtdbLastMeta = null;         // meta backup terakhir yang terlihat di server
 let rtdbPendingPush = false;     // ada perubahan lokal yang menunggu dikirim ke backup
+let rtdbLastSnapshotVal = null;  // PERBAIKAN: salinan terakhir isi node backup — dipakai pemulihan otomatis bila cloud kosong
 let lastRtdbUiState = null;      // anti-render berulang ikon status RTDB
 
 function isRtdbActive() { return !!(firebaseRTDB && rtdbUrlInUse && rtdbListening); }
@@ -1846,6 +1977,8 @@ function startRtdbSync(url) {
     rtdbConnectedUnsub = firebaseRTDB.ref('.info/connected').on('value', function(snap) {
       rtdbSocketConnected = !!snap.val();
       if (rtdbSocketConnected) rtdbError = null;
+      // PERBAIKAN: socket tersambung kembali → kirim sisa backup yang sempat gagal/gantung
+      if (rtdbSocketConnected && rtdbPendingPush) { try { saveToRTDB(true); } catch (e) { /* abaikan */ } }
       updateRtdbStatusUI();
     }, function() { /* abaikan */ });
     // Dengarkan isi backup (memungkinkan pemulihan otomatis & antar perangkat)
@@ -1883,9 +2016,13 @@ function parseRtdbBackup(val) {
   }
   try {
     const data = JSON.parse(json);
-    Object.keys(db).forEach(function(k) {
-      if (Array.isArray(db[k]) && (data[k] === undefined || data[k] === null)) data[k] = [];
-    });
+    // PERBAIKAN: db bisa belum ada (browser baru / cloud kosong — justru saat pemulihan
+    // dibutuhkan) — dulu Object.keys(null) melempar error sehingga backup dianggap rusak
+    if (db && typeof db === 'object') {
+      Object.keys(db).forEach(function(k) {
+        if (Array.isArray(db[k]) && (data[k] === undefined || data[k] === null)) data[k] = [];
+      });
+    }
     if (!Array.isArray(data.presentations)) data.presentations = [];
     return { ok: true, data: data, meta: meta };
   } catch (e) { return { ok: false, reason: 'corrupt' }; }
@@ -1895,6 +2032,7 @@ function processRtdbSnapshot() {
   if (!rtdbSnapshotBuffer) return;
   const val = rtdbSnapshotBuffer;
   rtdbSnapshotBuffer = null;
+  rtdbLastSnapshotVal = val; // PERBAIKAN: simpan salinan terakhir untuk pemulihan otomatis
   const parsed = parseRtdbBackup(val);
   if (parsed.ok) rtdbLastMeta = parsed.meta;
   updateRtdbStatusUI();
@@ -1903,7 +2041,27 @@ function processRtdbSnapshot() {
   // semula" (snapshot backup dari perangkat lain bisa lebih tua dari data live).
   // Sumber data aplikasi HANYA Cloud Firestore realtime. Pemulihan dari backup RTDB
   // tetap tersedia sebagai aksi EKSPLISIT Super Admin (tombol "Pulihkan dari Backup").
+  // PERBAIKAN ANTI-HILANG (pengecualian): bila Cloud Firestore terkonfirmasi KOSONG dan
+  // perangkat ini belum memegang data sama sekali, backup RTDB adalah satu-satunya salinan
+  // data sekolah yang tersisa — pulihkan OTOMATIS agar data tidak hilang total.
+  try { tryRtdbAutoRescue(); } catch (e) { /* abaikan */ }
   return;
+}
+
+// Pemulihan otomatis dari backup RTDB — HANYA saat cloud kosong terkonfirmasi dan
+// perangkat belum memegang data. Data backup diadopsi penuh lalu cloud diisi ulang.
+function tryRtdbAutoRescue() {
+  if (db || !cloudEmptyConfirmed || !rtdbLastSnapshotVal) return;
+  const parsed = parseRtdbBackup(rtdbLastSnapshotVal);
+  if (!parsed.ok || !isValidDatabase(parsed.data)) return;
+  if (adoptCloudData(parsed.data, true)) {
+    cloudEmptyConfirmed = false; // cloud akan diisi ulang — cabang status "kosong"
+    saveToCloud(true); saveToRTDB(true); // isi ulang cloud + segarkan backup
+    updateOnlineGate();
+    try { if (session) { renderApp(); } else { renderLanding(); } lucide.createIcons(); } catch (e) { /* abaikan */ }
+    showToast('Data berhasil dipulihkan', 'Database cloud kosong — data sekolah dipulihkan otomatis dari backup Realtime Database (' + formatDateTime(parsed.meta.updatedAt) + ').', 'success');
+    console.log('[RTDB] Pemulihan otomatis: cloud kosong → data backup diadopsi & cloud diisi ulang');
+  }
 }
 
 // Kirim seluruh database lokal ke node backup RTDB (meta + chunk string).
@@ -1941,8 +2099,13 @@ function saveToRTDB(immediate) {
       console.log('[RTDB] Backup terkirim (' + Math.round(json.length / 1024) + ' KB) → node "' + RTDB_PATH + '"');
       writeRtdbHistory(false); // simpan versi ke riwayat backup (maks 1 versi per 5 menit)
       updateRtdbStatusUI();
-    }).catch(function(err) { handleRtdbError(err); });
+    }).catch(function(err) {
+      // PERBAIKAN: backup gagal → antrean dicatat agar dikirim ulang otomatis saat tersambung
+      if (!isCloudDisabled()) rtdbPendingPush = true;
+      handleRtdbError(err);
+    });
   } catch (e) {
+    if (!isCloudDisabled()) rtdbPendingPush = true; // PERBAIKAN: gagal kirim → catat antrean
     handleRtdbError(e);
   }
 }
