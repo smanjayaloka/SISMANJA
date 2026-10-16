@@ -3191,6 +3191,42 @@ function formatDateTime(d) {
 function daysUntil(d) { return Math.ceil((new Date(d).getTime() - Date.now()) / (1000 * 86400)); }
 function gradeLetter(score) { return score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'E'; }
 
+/* ===== PERBAIKAN WAKTU BATAS TUGAS (akurat & tepat) =====
+   toLocalDatetimeInput: konversi tanggal → nilai untuk <input datetime-local>
+   memakai waktu LOKAL perangkat. Dulu memakai toISOString().slice(0,16) yang
+   berbasis UTC sehingga saat guru MENEDIT tugas, jam tenggat bergeser
+   (di WIB mundur 7 jam) — inilah penyebab batas waktu tidak akurat. */
+function toLocalDatetimeInput(d) {
+  const dt = d ? new Date(d) : new Date();
+  if (isNaN(dt.getTime())) return '';
+  const pad = function(n) { return String(n).length < 2 ? '0' + n : String(n); };
+  return dt.getFullYear() + '-' + pad(dt.getMonth() + 1) + '-' + pad(dt.getDate()) + 'T' + pad(dt.getHours()) + ':' + pad(dt.getMinutes());
+}
+/* formatDueDateTime: tanggal + JAM (HH:MM) — sebelumnya hanya tanggal,
+   siswa tidak tahu jam tepat batas pengumpulan ditutup. */
+function formatDueDateTime(d) {
+  if (!d) return '-';
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return '-';
+  const jam = dt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }).replace('.', ':');
+  return formatDate(d) + ', pukul ' + jam;
+}
+/* dueCountdown: hitung mundur presisi ke batas waktu (hari/jam/menit). */
+function dueCountdown(d) {
+  if (!d) return '';
+  const diff = new Date(d).getTime() - Date.now();
+  if (isNaN(diff)) return '';
+  if (diff <= 0) return 'Lewat batas';
+  const totalMin = Math.floor(diff / 60000);
+  const hari = Math.floor(totalMin / 1440);
+  const jam = Math.floor((totalMin % 1440) / 60);
+  const menit = totalMin % 60;
+  if (hari >= 2) return hari + ' hari lagi';
+  if (hari === 1) return '1 hari ' + jam + ' jam lagi';
+  if (jam >= 1) return jam + ' jam ' + menit + ' menit lagi';
+  return menit + ' menit lagi';
+}
+
 /* ============================================================
    SEED DATABASE DIHAPUS (Task 16 — FULL ONLINE)
    Data contoh/akun demo (siswa, guru, tendik, kelas, mapel bawaan)
@@ -3957,7 +3993,7 @@ function buildMonitorLmsHTML() {
     const asgs = db.assignments.filter(a => a.courseId === c.id);
     const asgIds = asgs.map(a => a.id);
     const subs = db.submissions.filter(s => asgIds.includes(s.assignmentId));
-    const graded = subs.filter(s => s.gradeId && db.grades.some(g => g.id === s.gradeId)).length;
+    const graded = subs.filter(s => db.grades.some(g => g.submissionId === s.id) || (s.gradeId && db.grades.some(g => g.id === s.gradeId))).length;
     const lives = (db.liveClasses || []).filter(lc => lc.courseId === c.id).length;
     return { c, t, cls, mats, na: asgs.length, ns: subs.length, graded, lives };
   });
@@ -4623,7 +4659,99 @@ function printRekapKelas() {
 function _printEsc(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-const _SUB_TYPE_LABELS = { TEXT: 'Teks', LINK: 'Link', FILE: 'File', IMAGE: 'Gambar' };
+const _SUB_TYPE_LABELS = { TEXT: 'Teks', LINK: 'Link', FILE: 'File', IMAGE: 'Gambar', PDF: 'PDF' };
+/* ============ MULTI-BENTUK PENGUMPULAN TUGAS ============
+   Siswa dapat mengirim jawaban berupa teks ketikan, foto JPG/PNG, PDF/dokumen, dan/atau link —
+   salah satu, beberapa, atau semuanya (sesuai format yang diizinkan guru pada tugas).
+   Data utama: submission.items[{id,kind,name,text,url,size}] — field lama tetap disinkronkan. */
+const _SUB_KIND_META = {
+  TEXT: { label: 'Teks', icon: 'keyboard', cls: 'bg-sky-50 text-sky-700 border-sky-200' },
+  IMAGE: { label: 'Gambar', icon: 'image', cls: 'bg-violet-50 text-violet-700 border-violet-200' },
+  PDF: { label: 'PDF', icon: 'file-text', cls: 'bg-red-50 text-red-600 border-red-200' },
+  FILE: { label: 'Dokumen', icon: 'file', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  LINK: { label: 'Link', icon: 'link', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' }
+};
+/* Normalisasi submission ke daftar items — kompatibel data lama (field tunggal) */
+function subItemsOf(sub) {
+  if (!sub) return [];
+  if (Array.isArray(sub.items) && sub.items.length) {
+    return sub.items.filter(it => it && (it.kind === 'TEXT' ? String(it.text || '').trim() : (it.url || it.text || '')))
+      .map(it => ({ id: it.id || uid('sit'), kind: it.kind || 'TEXT', name: it.name || '', text: it.text || '', url: it.url || '', size: it.size || 0 }));
+  }
+  const out = [];
+  const isImg = /\.(jpg|jpeg|png|gif|webp)$/i.test(sub.fileName || '');
+  if (sub.linkUrl) out.push({ kind: 'LINK', url: sub.linkUrl, name: 'Link' });
+  else if (sub.submissionType === 'LINK' && sub.content) out.push({ kind: 'LINK', url: sub.content, name: 'Link' });
+  if (sub.content && sub.submissionType !== 'LINK' && !sub.linkUrl) out.push({ kind: 'TEXT', text: sub.content });
+  if (sub.fileData && sub.fileName) out.push({ kind: isImg ? 'IMAGE' : (/\.pdf$/i.test(sub.fileName) ? 'PDF' : 'FILE'), url: sub.fileData, name: sub.fileName });
+  return out.map(it => ({ id: uid('sit'), name: '', text: '', url: '', size: 0, ...it }));
+}
+/* Teks ringkas bentuk jawaban (dipakai kolom cetak) */
+function subKindText(sub) {
+  const ks = [...new Set(subItemsOf(sub).map(it => it.kind))];
+  return ks.map(k => (_SUB_KIND_META[k] || { label: k }).label).join('+') || '-';
+}
+/* Badge HTML bentuk jawaban (dipakai tabel penilaian & daftar pengumpulan guru) */
+function subKindBadges(sub) {
+  const ks = [...new Set(subItemsOf(sub).map(it => it.kind))];
+  if (!ks.length) return '<span class="text-[10px] text-gray-400 italic">belum ada</span>';
+  return ks.map(k => {
+    const m = _SUB_KIND_META[k] || { label: k, icon: 'file', cls: 'bg-gray-50 text-gray-600 border-gray-200' };
+    return '<span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border text-[10px] font-medium ' + m.cls + '"><i data-lucide="' + m.icon + '" style="font-size:10px;"></i>' + m.label + '</span>';
+  }).join(' ');
+}
+/* Penampil SEMUA bentuk jawaban siswa — foto JPG (preview+lightbox), PDF (viewer), dokumen (unduh), link (buka), teks */
+window._subViewMap = {};
+function renderSubmissionItemsView(sub) {
+  const items = subItemsOf(sub);
+  if (!items.length) return '<p class="text-sm text-gray-400 italic">Siswa belum mengumpulkan jawaban</p>';
+  items.forEach(it => { if (it.id) window._subViewMap[it.id] = it; });
+  const parts = items.map(function(it, i) {
+    const kind = it.kind || 'TEXT';
+    if (kind === 'TEXT') {
+      return '<div><p class="text-xs font-medium text-gray-500 mb-1 flex items-center gap-1"><i data-lucide="keyboard" style="font-size:12px;"></i> Jawaban Teks:</p><p class="text-sm whitespace-pre-wrap bg-white p-3 rounded border">' + attEsc(it.text || '') + '</p></div>';
+    }
+    if (kind === 'IMAGE') {
+      return '<div><p class="text-xs font-medium text-gray-500 mb-1 flex items-center gap-1"><i data-lucide="image" style="font-size:12px;"></i> Gambar: ' + attEsc(it.name || 'foto tugas') + '</p>'
+        + '<img src="' + it.url + '" alt="Jawaban gambar siswa ' + (i + 1) + '" class="w-full max-h-80 object-contain rounded border bg-gray-50 cursor-zoom-in" onclick="openImageLightbox(this.src, \'' + attEsc(it.name || 'Gambar').replace(/'/g, "\\'") + '\')">'
+        + '<a href="' + it.url + '" download="' + attEsc(it.name || 'gambar') + '" class="inline-flex items-center gap-1 text-xs text-sky-600 hover:text-sky-700 mt-1"><i data-lucide="download" style="font-size:12px;"></i> Unduh gambar</a></div>';
+    }
+    if (kind === 'PDF') {
+      return '<div class="flex items-center gap-2 p-3 rounded-lg border bg-red-50/60 border-red-200"><div class="w-10 h-10 rounded bg-red-100 text-red-600 flex flex-col items-center justify-center flex-shrink-0"><i data-lucide="file-text" style="font-size:16px;"></i><span class="text-[8px] font-bold">PDF</span></div>'
+        + '<div class="flex-1 min-w-0"><p class="text-sm font-medium truncate">' + attEsc(it.name || 'Dokumen PDF') + '</p><p class="text-[10px] text-gray-400">Dokumen PDF' + (it.size ? ' (' + Math.round(it.size / 1024) + ' KB)' : '') + '</p></div>'
+        + '<button type="button" onclick="openSubPdfViewer(\'' + it.id + '\')" class="px-3 py-1.5 text-xs text-white bg-red-500 hover:bg-red-600 rounded-md flex items-center gap-1 flex-shrink-0"><i data-lucide="eye" style="font-size:12px;"></i> Buka</button>'
+        + '<a href="' + it.url + '" download="' + attEsc(it.name || 'dokumen') + '" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1 flex-shrink-0"><i data-lucide="download" style="font-size:12px;"></i> Unduh</a></div>';
+    }
+    if (kind === 'LINK') {
+      return '<a href="' + attEsc(it.url) + '" target="_blank" rel="noopener" class="flex items-center gap-2 p-3 rounded-lg border bg-sky-50/60 border-sky-200 hover:border-sky-400"><div class="w-10 h-10 rounded bg-sky-100 text-sky-600 flex items-center justify-center flex-shrink-0"><i data-lucide="link" style="font-size:18px;"></i></div>'
+        + '<div class="flex-1 min-w-0"><p class="text-sm font-medium">' + attEsc(it.name || 'Link') + '</p><p class="text-[10px] text-gray-400 truncate">' + attEsc(it.url) + '</p></div>'
+        + '<span class="px-3 py-1.5 text-xs text-white bg-sky-500 rounded-md flex items-center gap-1 flex-shrink-0"><i data-lucide="external-link" style="font-size:12px;"></i> Buka</span></a>';
+    }
+    const ext = (it.name || '').split('.').pop().toUpperCase() || 'DOC';
+    return '<div class="flex items-center gap-2 p-3 rounded-lg border bg-amber-50/60 border-amber-200"><div class="w-10 h-10 rounded bg-amber-100 text-amber-700 flex flex-col items-center justify-center flex-shrink-0"><i data-lucide="file" style="font-size:16px;"></i><span class="text-[8px] font-bold">' + attEsc(ext.slice(0, 4)) + '</span></div>'
+      + '<div class="flex-1 min-w-0"><p class="text-sm font-medium truncate">' + attEsc(it.name || 'Dokumen') + '</p><p class="text-[10px] text-gray-400">Dokumen' + (it.size ? ' (' + Math.round(it.size / 1024) + ' KB)' : '') + ' — dibuka dengan aplikasi Office</p></div>'
+      + '<a href="' + it.url + '" download="' + attEsc(it.name || 'dokumen') + '" class="px-3 py-1.5 text-xs text-white bg-amber-500 hover:bg-amber-600 rounded-md flex items-center gap-1 flex-shrink-0"><i data-lucide="download" style="font-size:12px;"></i> Unduh</a></div>';
+  });
+  return '<div class="space-y-3">' + parts.join('') + '</div>';
+}
+/* Viewer PDF jawaban siswa (dataURL → Blob URL, pratinjau penuh dalam modal) */
+function openSubPdfViewer(itemId) {
+  const a = window._subViewMap[itemId];
+  if (!a || !a.url) { showToast('Lampiran tidak ditemukan', 'Jawaban PDF tidak tersedia', 'error'); return; }
+  let url = a.url;
+  try {
+    const base64 = url.split(',')[1] || '';
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    setTimeout(function() { URL.revokeObjectURL(url); }, 600000);
+  } catch (e) { /* gunakan dataURL apa adanya */ }
+  showModal('Jawaban Siswa: ' + (a.name || 'Dokumen PDF'),
+    '<iframe src="' + url + '" class="w-full rounded-lg border" style="height:70vh" title="Pratinjau PDF jawaban siswa"></iframe>'
+    + '<p class="text-xs text-gray-400 mt-2">Bila pratinjau tidak tampil, gunakan tombol Unduh pada daftar jawaban.</p>',
+    btn('Tutup', 'closeModal()', { variant: 'outline' }), 'max-w-4xl');
+}
 /* Blok <style> khusus dokumen cetak tugas (disisipkan ke dalam body print window) */
 function printAssignmentStyles() {
   return `<style>
@@ -4644,27 +4772,27 @@ function printAssignmentStyles() {
     .asg-status-belum { color: #991b1b; font-weight: bold; }
   </style>`;
 }
-/* Render jawaban lengkap 1 siswa untuk dokumen cetak (teks/link/file/gambar/feedback) */
+/* Render jawaban lengkap 1 siswa untuk dokumen cetak — SEMUA BENTUK (teks/link/gambar/PDF/dokumen/feedback) */
 function buildAssignmentAnswerHTML(sub, idx) {
   const st = db.students.find(x => x.id === sub.studentId);
   const cls = db.classes.find(c => c.id === st?.classId);
   const g = db.grades.find(gr => gr.submissionId === sub.id);
   let inner = '';
-  const isImageFile = /\.(jpg|jpeg|png|gif|webp)$/i.test(sub.fileName || '');
-  const hasText = sub.submissionType === 'TEXT' || (!sub.submissionType && sub.content && !sub.linkUrl);
-  if (hasText && sub.content) {
-    inner += '<div class="asg-answer-label">Jawaban Teks</div><div class="asg-answer-text">' + _printEsc(sub.content) + '</div>';
-  }
-  if (sub.submissionType === 'LINK' || sub.linkUrl) {
-    inner += '<div class="asg-answer-label">Link yang Dikumpulkan</div><div class="asg-answer-text">' + _printEsc(sub.linkUrl || sub.content || '-') + '</div>';
-  }
-  if (sub.submissionType === 'FILE' || (sub.fileName && !isImageFile)) {
-    inner += '<div class="asg-answer-label">File yang Dikumpulkan</div><div class="asg-answer-text">' + _printEsc(sub.fileName || '-') +
-      (sub.fileData ? '' : '<br><span style="font-size:9pt;color:#888;">* Isi file tidak dapat dicetak. Silakan periksa/unduh file langsung melalui menu Penilaian di aplikasi.</span>') + '</div>';
-  }
-  if ((sub.submissionType === 'IMAGE' || isImageFile) && sub.fileData) {
-    inner += '<div class="asg-answer-label">Gambar yang Dikumpulkan</div><img class="asg-answer-img" src="' + sub.fileData + '">';
-  }
+  subItemsOf(sub).forEach(function(it) {
+    if (it.kind === 'TEXT') {
+      inner += '<div class="asg-answer-label">Jawaban Teks</div><div class="asg-answer-text">' + _printEsc(it.text || '') + '</div>';
+    } else if (it.kind === 'LINK') {
+      inner += '<div class="asg-answer-label">Link yang Dikumpulkan</div><div class="asg-answer-text">' + _printEsc(it.url || '-') + '</div>';
+    } else if (it.kind === 'IMAGE') {
+      inner += '<div class="asg-answer-label">Gambar yang Dikumpulkan' + (it.name ? ' — ' + _printEsc(it.name) : '') + '</div><img class="asg-answer-img" src="' + it.url + '">';
+    } else if (it.kind === 'PDF') {
+      inner += '<div class="asg-answer-label">Dokumen PDF yang Dikumpulkan</div><div class="asg-answer-text">' + _printEsc(it.name || '-') +
+        '<br><span style="font-size:9pt;color:#888;">* Isi PDF dapat dibuka guru melalui menu Penilaian di aplikasi (tombol Buka pada jawaban).</span></div>';
+    } else {
+      inner += '<div class="asg-answer-label">File yang Dikumpulkan</div><div class="asg-answer-text">' + _printEsc(it.name || '-') +
+        '<br><span style="font-size:9pt;color:#888;">* Isi file tidak dapat dicetak. Silakan periksa/unduh file langsung melalui menu Penilaian di aplikasi.</span></div>';
+    }
+  });
   if (g && g.feedback) {
     inner += '<div class="asg-answer-label">Feedback Guru</div><div class="asg-answer-text asg-feedback">' + _printEsc(g.feedback) + '</div>';
   }
@@ -4687,7 +4815,7 @@ function openPrintAssignmentPicker(assignmentId) {
     <div class="space-y-4">
       <div class="p-3 rounded-lg bg-emerald-50 border border-emerald-200">
         <p class="text-sm font-semibold text-emerald-900">${a.title}</p>
-        <p class="text-xs text-emerald-700 mt-1">${course?.name || '-'} | Deadline: ${formatDate(a.dueDate)} | Nilai maks: ${a.maxScore}</p>
+        <p class="text-xs text-emerald-700 mt-1">${course?.name || '-'} | Deadline: ${formatDueDateTime(a.dueDate)} | Nilai maks: ${a.maxScore}</p>
         <p class="text-xs text-emerald-700 mt-0.5">${subs.length} siswa mengumpulkan, ${graded} sudah dinilai</p>
       </div>
       <label class="flex items-start gap-2 cursor-pointer">
@@ -4737,7 +4865,7 @@ function printAssignmentPDF(assignmentId) {
     const g = db.grades.find(gr => gr.submissionId === r.sub.id);
     return '<tr><td class="center">' + (i + 1) + '</td><td>' + _printEsc(r.st.nis || '-') + '</td><td>' + _printEsc(r.st.name) +
       '</td><td class="center">' + _printEsc(cls?.name || '-') + '</td><td class="center">' + (r.sub.submittedAt ? formatDateTime(r.sub.submittedAt) : '-') +
-      '</td><td class="center">' + _printEsc(_SUB_TYPE_LABELS[r.sub.submissionType] || r.sub.submissionType || 'Teks') +
+      '</td><td class="center">' + _printEsc(subKindText(r.sub)) +
       '</td><td class="center">' + _printEsc(r.sub.status || 'DIKUMPULKAN') + '</td><td class="center">' + (g ? g.score : '-') + '</td><td class="center">' + (g ? g.grade : '-') + '</td></tr>';
   });
   notSubmitted.forEach((s, i) => {
@@ -4753,7 +4881,7 @@ function printAssignmentPDF(assignmentId) {
         <span class="lbl">Mata Pelajaran</span><span>: <strong>${_printEsc(course?.name || '-')}</strong></span>
         <span class="lbl">Guru Pengampu</span><span>: ${_printEsc(teacher?.name || '-')}</span>
         <span class="lbl">Jenis Tugas</span><span>: ${_printEsc(a.type || 'INDIVIDU')}</span>
-        <span class="lbl">Deadline</span><span>: ${formatDate(a.dueDate)}</span>
+        <span class="lbl">Deadline</span><span>: ${formatDueDateTime(a.dueDate)}</span>
         <span class="lbl">Nilai Maksimal</span><span>: ${a.maxScore}</span>
         <span class="lbl">Status Tugas</span><span>: ${_printEsc(a.status || 'AKTIF')}</span>
       </div>
@@ -4792,7 +4920,7 @@ function printSubmissionPDF(subId) {
   const st = db.students.find(x => x.id === sub.studentId);
   const cls = db.classes.find(c => c.id === st?.classId);
   const body = printAssignmentStyles() + `
-    <div class="report-extra"><strong>Tugas:</strong> ${_printEsc(a.title)} | <strong>Mapel:</strong> ${_printEsc(course?.name || '-')} | <strong>Deadline:</strong> ${formatDate(a.dueDate)}</div>
+    <div class="report-extra"><strong>Tugas:</strong> ${_printEsc(a.title)} | <strong>Mapel:</strong> ${_printEsc(course?.name || '-')} | <strong>Deadline:</strong> ${formatDueDateTime(a.dueDate)}</div>
     <div class="report-student-info"><strong>Siswa:</strong> ${_printEsc(st?.name || '-')} (NIS ${_printEsc(st?.nis || '-')}) | <strong>Kelas:</strong> ${_printEsc(cls?.name || '-')}</div>
     <div class="asg-answers-title">Jawaban Siswa</div>
     ${buildAssignmentAnswerHTML(sub, 0)}
@@ -8058,6 +8186,196 @@ function compressImageFile(file, maxW, quality) {
   });
 }
 
+/* ============================================================
+   PERBAIKAN: LAMPIRAN GURU — GAMBAR / LINK VIDEO / PDF
+   Guru dapat menyisipkan lampiran pada TUGAS dan MATERI.
+   Struktur data: attachments = [{id, kind:'IMAGE'|'PDF'|'LINK', name, url, size}]
+   - IMAGE  : dataURL terkompresi (compressImageFile 1400px / 0.75)
+   - PDF    : dataURL asli (maks 5MB), dilihat via modal (Blob URL)
+   - LINK   : URL teks (YouTube otomatis dikenali sebagai video)
+   ============================================================ */
+const ATT_MAX_FILE_BYTES = 5 * 1024 * 1024; // 5MB per berkas
+const ATT_MAX_COUNT = 8;                    // maks 8 lampiran per tugas/materi
+
+function attNewId() { return 'att' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+function attFormState(key) {
+  if (!window[key]) window[key] = [];
+  return window[key];
+}
+function attIsVideoLink(url) {
+  return /youtu\.?be|youtube\.com|vimeo\.com|drive\.google\.com|dailymotion\.com|tiktok\.com/i.test(url || '');
+}
+function attEsc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function attCountBadge(atts) {
+  const n = (atts || []).length;
+  if (!n) return '';
+  const imgs = atts.filter(a => a.kind === 'IMAGE').length;
+  const pdfs = atts.filter(a => a.kind === 'PDF').length;
+  const vids = atts.filter(a => a.kind === 'LINK' && attIsVideoLink(a.url)).length;
+  const parts = [];
+  if (imgs) parts.push(imgs + ' gambar');
+  if (pdfs) parts.push(pdfs + ' PDF');
+  if (vids) parts.push(vids + ' video');
+  const other = n - imgs - pdfs - vids;
+  if (other > 0) parts.push(other + ' link');
+  return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-violet-50 text-violet-700 border border-violet-200" title="Lampiran guru: ' + attEsc(parts.join(', ')) + '"><i data-lucide="paperclip" style="font-size: 12px;"></i> ' + n + ' lampiran</span>';
+}
+
+/* --- Editor lampiran pada form (tugas & materi) --- */
+function attPickFile(key, kind) {
+  const inp = document.getElementById('att-file-' + key);
+  if (!inp) return;
+  inp.dataset.kind = kind;
+  inp.value = '';
+  inp.click();
+}
+async function attOnFileChosen(input, key) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const kind = input.dataset.kind || 'PDF';
+  const list = attFormState(key);
+  if (list.length >= ATT_MAX_COUNT) { showToast('Lampiran penuh', 'Maksimal ' + ATT_MAX_COUNT + ' lampiran', 'warning'); return; }
+  if (file.size > ATT_MAX_FILE_BYTES) { showToast('File terlalu besar', 'Ukuran maksimal 5MB. File: ' + (file.size / 1048576).toFixed(2) + 'MB', 'error'); return; }
+  try {
+    let item;
+    if (kind === 'IMAGE') {
+      showToast('Memproses gambar...', 'Mengompresi ' + file.name, 'info');
+      const dataUrl = await compressImageFile(file, 1400, 0.75);
+      item = { id: attNewId(), kind: 'IMAGE', name: file.name, url: dataUrl, size: Math.round(dataUrl.length * 0.75) };
+    } else {
+      showToast('Membaca PDF...', file.name, 'info');
+      const dataUrl = await new Promise(function(res, rej) {
+        const r = new FileReader();
+        r.onload = function(e) { res(e.target.result); };
+        r.onerror = function() { rej(new Error('Gagal membaca file')); };
+        r.readAsDataURL(file);
+      });
+      item = { id: attNewId(), kind: 'PDF', name: file.name, url: dataUrl, size: file.size };
+    }
+    list.push(item);
+    renderAttachmentEditor(key);
+    showToast('Lampiran ditambahkan', file.name + ' (' + (item.size / 1024).toFixed(0) + 'KB)', 'success');
+  } catch (err) {
+    showToast('Gagal memproses file', err && err.message ? err.message : 'Coba file lain', 'error');
+  }
+}
+function attAddLink(key) {
+  const list = attFormState(key);
+  if (list.length >= ATT_MAX_COUNT) { showToast('Lampiran penuh', 'Maksimal ' + ATT_MAX_COUNT + ' lampiran', 'warning'); return; }
+  const url = prompt('Tempelkan LINK video / materi (contoh: https://youtu.be/... atau https://drive.google.com/...):', 'https://');
+  if (!url) return;
+  const clean = url.trim();
+  if (!/^https?:\/\/.+/i.test(clean)) { showToast('Link tidak valid', 'URL harus diawali http:// atau https://', 'error'); return; }
+  list.push({ id: attNewId(), kind: 'LINK', name: attIsVideoLink(clean) ? 'Video' : 'Link', url: clean, size: 0 });
+  renderAttachmentEditor(key);
+  showToast('Link ditambahkan', '', 'success');
+}
+function attRemoveItem(key, attId) {
+  const list = attFormState(key);
+  const idx = list.findIndex(a => a.id === attId);
+  if (idx >= 0) { list.splice(idx, 1); renderAttachmentEditor(key); }
+}
+function renderAttachmentEditor(key) {
+  const holder = document.getElementById('att-list-' + key);
+  if (!holder) return;
+  const list = attFormState(key);
+  if (list.length === 0) {
+    holder.innerHTML = '<p class="text-xs text-gray-400 italic">Belum ada lampiran. Gunakan tombol di atas untuk menambahkan gambar, PDF, atau link video.</p>';
+    return;
+  }
+  holder.innerHTML = '<div class="space-y-2">' + list.map(function(a) {
+    let preview;
+    if (a.kind === 'IMAGE') {
+      preview = '<img src="' + a.url + '" class="w-14 h-14 object-cover rounded border bg-gray-50">';
+    } else if (a.kind === 'PDF') {
+      preview = '<div class="w-14 h-14 rounded border bg-red-50 flex flex-col items-center justify-center text-red-600"><i data-lucide="file-text" style="font-size:18px;"></i><span class="text-[9px] font-bold mt-0.5">PDF</span></div>';
+    } else {
+      const vid = attIsVideoLink(a.url);
+      preview = '<div class="w-14 h-14 rounded border ' + (vid ? 'bg-rose-50 text-rose-600' : 'bg-sky-50 text-sky-600') + ' flex flex-col items-center justify-center"><i data-lucide="' + (vid ? 'play-circle' : 'link') + '" style="font-size:18px;"></i><span class="text-[9px] font-bold mt-0.5">' + (vid ? 'VIDEO' : 'LINK') + '</span></div>';
+    }
+    return '<div class="flex items-center gap-2 p-2 rounded-lg border bg-white">'
+      + preview
+      + '<div class="flex-1 min-w-0"><p class="text-xs font-medium truncate">' + attEsc(a.name) + '</p>'
+      + (a.kind === 'LINK' ? '<p class="text-[10px] text-gray-400 truncate">' + attEsc(a.url) + '</p>' : '<p class="text-[10px] text-gray-400">' + (a.size / 1024).toFixed(0) + ' KB</p>')
+      + '</div>'
+      + '<button type="button" onclick="attRemoveItem(\'' + key + '\',\'' + a.id + '\')" class="p-1.5 text-red-500 hover:bg-red-50 rounded" title="Hapus lampiran"><i data-lucide="trash-2" style="font-size:14px;"></i></button>'
+      + '</div>';
+  }).join('') + '</div>';
+  if (window.lucide && lucide.createIcons) lucide.createIcons();
+}
+function attEditorSection(key, existing) {
+  if (existing && existing.length) window[key] = existing.map(a => ({ id: a.id || attNewId(), kind: a.kind || 'LINK', name: a.name || 'Lampiran', url: a.url || '', size: a.size || 0 }));
+  else window[key] = [];
+  return `
+    <div class="space-y-2 p-3 rounded-lg border-2 border-dashed border-violet-200 bg-violet-50/40">
+      <label class="block text-sm font-medium flex items-center gap-1"><i data-lucide="paperclip" style="font-size: 14px;"></i> Lampiran (gambar / link video / PDF)</label>
+      <p class="text-xs text-gray-500">Sisipkan media pembelajaran — siswa akan melihat lampiran ini saat membuka tugas/materi. Gambar otomatis dikompres, PDF maks 5MB.</p>
+      <div class="flex flex-wrap gap-2">
+        <button type="button" onclick="attPickFile('${key}','IMAGE')" class="inline-flex items-center gap-1.5 px-3 py-2 text-xs bg-white border rounded-lg hover:border-violet-400"><i data-lucide="image" style="font-size:14px;"></i> + Gambar</button>
+        <button type="button" onclick="attAddLink('${key}')" class="inline-flex items-center gap-1.5 px-3 py-2 text-xs bg-white border rounded-lg hover:border-rose-400"><i data-lucide="play-circle" style="font-size:14px;"></i> + Link Video</button>
+        <button type="button" onclick="attPickFile('${key}','PDF')" class="inline-flex items-center gap-1.5 px-3 py-2 text-xs bg-white border rounded-lg hover:border-red-400"><i data-lucide="file-text" style="font-size:14px;"></i> + PDF</button>
+      </div>
+      <input type="file" id="att-file-${key}" class="hidden" onchange="attOnFileChosen(this,'${key}')">
+      <div id="att-list-${key}"></div>
+    </div>`;
+}
+
+/* --- Tampilan lampiran (siswa & guru membaca) --- */
+function renderAttachmentView(atts) {
+  const list = atts || [];
+  if (list.length === 0) return '';
+  const items = list.map(function(a) {
+    if (a.kind === 'IMAGE') {
+      return '<div class="space-y-1"><p class="text-xs font-medium text-gray-500 flex items-center gap-1"><i data-lucide="image" style="font-size:12px;"></i> Gambar: ' + attEsc(a.name) + '</p>'
+        + '<img src="' + a.url + '" class="w-full max-h-72 object-contain rounded-lg border bg-gray-50 cursor-zoom-in" onclick="openImageLightbox(this.src, \'' + attEsc(a.name).replace(/'/g, "\\'") + '\')"></div>';
+    }
+    if (a.kind === 'PDF') {
+      const kb = a.size ? ' (' + (a.size / 1024).toFixed(0) + ' KB)' : '';
+      return '<div class="flex items-center gap-2 p-3 rounded-lg border bg-red-50/60 border-red-200"><div class="w-10 h-10 rounded bg-red-100 text-red-600 flex flex-col items-center justify-center flex-shrink-0"><i data-lucide="file-text" style="font-size:16px;"></i><span class="text-[8px] font-bold">PDF</span></div>'
+        + '<div class="flex-1 min-w-0"><p class="text-sm font-medium truncate">' + attEsc(a.name) + '</p><p class="text-[10px] text-gray-400">Dokumen PDF' + kb + '</p></div>'
+        + '<button type="button" onclick="openPdfViewer(\'' + a.id + '\')" class="px-3 py-1.5 text-xs text-white bg-red-500 hover:bg-red-600 rounded-md flex items-center gap-1 flex-shrink-0"><i data-lucide="eye" style="font-size:12px;"></i> Buka</button>'
+        + '<a href="' + a.url + '" download="' + attEsc(a.name) + '" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1 flex-shrink-0"><i data-lucide="download" style="font-size:12px;"></i> Unduh</a></div>';
+    }
+    const vid = attIsVideoLink(a.url);
+    if (vid) {
+      return '<a href="' + attEsc(a.url) + '" target="_blank" rel="noopener" class="flex items-center gap-2 p-3 rounded-lg border bg-rose-50/60 border-rose-200 hover:border-rose-400"><div class="w-10 h-10 rounded bg-rose-100 text-rose-600 flex items-center justify-center flex-shrink-0"><i data-lucide="play-circle" style="font-size:18px;"></i></div>'
+        + '<div class="flex-1 min-w-0"><p class="text-sm font-medium">' + attEsc(a.name || 'Video Pembelajaran') + '</p><p class="text-[10px] text-gray-400 truncate">' + attEsc(a.url) + '</p></div>'
+        + '<span class="px-3 py-1.5 text-xs text-white bg-rose-500 rounded-md flex items-center gap-1 flex-shrink-0"><i data-lucide="external-link" style="font-size:12px;"></i> Tonton</span></a>';
+    }
+    return '<a href="' + attEsc(a.url) + '" target="_blank" rel="noopener" class="flex items-center gap-2 p-3 rounded-lg border bg-sky-50/60 border-sky-200 hover:border-sky-400"><div class="w-10 h-10 rounded bg-sky-100 text-sky-600 flex items-center justify-center flex-shrink-0"><i data-lucide="link" style="font-size:18px;"></i></div>'
+      + '<div class="flex-1 min-w-0"><p class="text-sm font-medium">' + attEsc(a.name || 'Link') + '</p><p class="text-[10px] text-gray-400 truncate">' + attEsc(a.url) + '</p></div>'
+      + '<span class="px-3 py-1.5 text-xs text-white bg-sky-500 rounded-md flex items-center gap-1 flex-shrink-0"><i data-lucide="external-link" style="font-size:12px;"></i> Buka</span></a>';
+  });
+  return '<div class="space-y-3 p-3 rounded-lg border-2 border-dashed border-violet-200 bg-violet-50/30"><p class="text-sm font-semibold flex items-center gap-1 text-violet-800"><i data-lucide="paperclip" style="font-size:15px;"></i> Lampiran (' + list.length + ')</p>' + items.join('') + '</div>';
+}
+/* Peta lampiran aktif pada modal tampilan (untuk PDF viewer) */
+window._attViewMap = {};
+function attRegisterViewMap(atts) {
+  (atts || []).forEach(a => { window._attViewMap[a.id] = a; });
+}
+function openImageLightbox(src, name) {
+  showModal(name || 'Gambar', '<img src="' + src + '" class="w-full rounded-lg" alt="' + attEsc(name || 'Gambar') + '">', btn('Tutup', 'closeModal()', { variant: 'outline' }), 'max-w-4xl');
+}
+function openPdfViewer(attId) {
+  const a = window._attViewMap[attId];
+  if (!a || !a.url) { showToast('Lampiran tidak ditemukan', '', 'error'); return; }
+  let url = a.url;
+  try {
+    const base64 = url.split(',')[1] || '';
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    setTimeout(function() { URL.revokeObjectURL(url); }, 600000);
+  } catch (e) { /* gunakan dataURL apa adanya */ }
+  showModal('PDF: ' + (a.name || 'Dokumen'),
+    '<iframe src="' + url + '" class="w-full rounded-lg border" style="height:70vh" title="Pratinjau PDF"></iframe>'
+    + '<p class="text-xs text-gray-400 mt-2">Bila pratinjau tidak tampil, gunakan tombol Unduh pada daftar lampiran.</p>',
+    btn('Tutup', 'closeModal()', { variant: 'outline' }), 'max-w-4xl');
+}
+
 async function uploadHeroPhotos(input) {
   const files = input && input.files ? Array.from(input.files) : [];
   if (input) input.value = '';
@@ -8344,6 +8662,7 @@ window.GURU_PAGES = {
             </div>
             <h3 class="font-semibold mb-1">${m.title}</h3>
             <p class="text-sm text-gray-500 line-clamp-2 mb-3">${m.content}</p>
+            <div class="mb-2">${attCountBadge(m.attachments)}</div>
             <div class="flex items-center justify-between text-xs text-gray-500">
               <span>Pertemuan ke-${m.meetingKe || 1}</span>
               <span>${formatDate(m.createdAt)}</span>
@@ -8385,14 +8704,15 @@ window.GURU_PAGES = {
                   ${badge(c?.name || '', 'outline')}
                   ${badge('Kelas: ' + (db.classes.find(cl => cl.id === c?.classId)?.name || '-'), 'outline')}
                   ${badge(a.type, 'outline')}
-                  ${badge(isOverdue ? 'Lewat' : (daysLeft + ' hari lagi'), isOverdue ? 'destructive' : 'secondary')}
+                  ${badge(isOverdue ? 'Lewat' : (dueCountdown(a.dueDate) || '-'), isOverdue ? 'destructive' : 'secondary')}
                 </div>
                 <h3 class="font-semibold mb-1">${a.title}</h3>
                 <p class="text-sm text-gray-500 line-clamp-2 mb-2">${a.description}</p>
-                <div class="flex items-center gap-4 text-xs text-gray-500">
-                  <span class="flex items-center gap-1"><i data-lucide="clock" style="font-size: 12px;"></i>Deadline: ${formatDate(a.dueDate)}</span>
-                  <span class="flex items-center gap-1"><i data-lucide="users" style="font-size: 12px;"></i>${subs.length} siswa mengumpulkan</span>
+                <div class="flex items-center gap-4 text-xs text-gray-500 flex-wrap">
+                  <span class="flex items-center gap-1"><i data-lucide="clock" style="font-size: 12px;"></i>Deadline: ${formatDueDateTime(a.dueDate)}</span>
+                  <button onclick="openAsgSubmissions('${a.id}')" title="Lihat siswa yang mengerjakan &amp; apa yang dikumpulkan" class="flex items-center gap-1 text-emerald-600 hover:text-emerald-700 font-medium underline decoration-dotted underline-offset-2"><i data-lucide="users" style="font-size: 12px;"></i>${subs.length} siswa mengumpulkan — lihat</button>
                   <span class="flex items-center gap-1"><i data-lucide="award" style="font-size: 12px;"></i>Max: ${a.maxScore}</span>
+                  ${attCountBadge(a.attachments)}
                 </div>
               </div>
               <div class="flex gap-1">
@@ -8413,7 +8733,7 @@ window.GURU_PAGES = {
               <div class="flex items-center justify-between gap-3 p-3 rounded-lg bg-white border border-amber-200">
                 <div class="min-w-0">
                   <p class="font-medium text-sm">${a.title}</p>
-                  <p class="text-xs text-gray-500">Deadline: ${formatDate(a.dueDate)} • ${orphanSubCount(a.id)} siswa mengumpulkan • Max: ${a.maxScore}</p>
+                  <p class="text-xs text-gray-500">Deadline: ${formatDueDateTime(a.dueDate)} • ${orphanSubCount(a.id)} siswa mengumpulkan • Max: ${a.maxScore}</p>
                 </div>
                 <div class="flex gap-1 flex-shrink-0">
                   <button onclick="openAssignmentForm('${a.id}')" class="px-3 py-1.5 text-xs bg-amber-500 hover:bg-amber-600 text-white rounded-md flex items-center gap-1"><i data-lucide="wrench" style="font-size: 12px;"></i> Perbaiki</button>
@@ -8501,17 +8821,19 @@ window.GURU_PAGES = {
         </select>
       </div>
       ${subs.length === 0 ? emptyState('Belum ada pengumpulan', 'Belum ada siswa yang mengumpulkan tugas ini', 'clipboard-check') :
-        '<div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden">' + table(['Siswa', 'Kelas', 'Tgl Kumpul', 'Status', 'Nilai', 'Aksi'],
+        '<div class="bg-white rounded-2xl border-0 shadow-md overflow-hidden">' + table(['Siswa', 'Kelas', 'Tgl Kumpul', 'Bentuk Tugas', 'Status', 'Nilai', 'Aksi'],
           subs.map(s => {
             const st = db.students.find(x => x.id === s.studentId);
             const cls = db.classes.find(c => c.id === st?.classId);
+            const _gr = db.grades.find(g => g.submissionId === s.id) || (s.gradeId ? db.grades.find(g => g.id === s.gradeId) : null);
             return [
               `<span class="font-medium text-sm">${st?.name || '(siswa tidak ditemukan)'}</span>`,
               badge(cls?.name || '-', 'outline'),
               `<span class="text-xs">${s.submittedAt ? formatDate(s.submittedAt) : '-'}</span>`,
-              badge(s.status, s.status === 'DINILAI' ? 'default' : 'secondary'),
-              s.gradeId ? '<span class="font-bold text-emerald-600">' + (db.grades.find(g => g.id === s.gradeId)?.score || '-') + '</span>' : '<span class="text-gray-400 text-xs">-</span>',
-              `<button onclick="openGradeDialog('${s.id}')" class="px-3 py-1 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="award" style="font-size: 12px;"></i> ${s.gradeId ? 'Lihat' : 'Nilai'}</button>`
+              '<span class="flex flex-wrap gap-1 max-w-[130px]">' + subKindBadges(s) + '</span>',
+              badge(s.status === 'DINILAI' ? 'DINILAI · DIKUNCI' : s.status, s.status === 'DINILAI' ? 'default' : 'secondary'),
+              _gr ? '<span class="font-bold text-emerald-600">' + _gr.score + ' (' + _gr.grade + ')</span>' : '<span class="text-gray-400 text-xs">-</span>',
+              `<button onclick="openGradeDialog('${s.id}')" class="px-3 py-1 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="award" style="font-size: 12px;"></i> ${_gr ? 'Lihat / Ubah' : 'Nilai'}</button>`
             ];
           })
         ) + '</div>'
@@ -8778,6 +9100,7 @@ function openMaterialForm(id) {
       </div>
       ${field('Deskripsi Singkat', inputText('mf-desc', m?.description || ''))}
       ${field('Konten Materi', textarea('mf-content', m?.content || '', 8))}
+      ${attEditorSection('_mfAtt', m ? (m.attachments || []) : null)}
       <div class="flex items-center gap-2">
         <input type="checkbox" id="mf-published" ${m ? (m.published ? 'checked' : '') : 'checked'}>
         <label for="mf-published" class="text-sm cursor-pointer">Publikasikan ke siswa</label>
@@ -8815,7 +9138,8 @@ function saveMaterial(e, id) {
     description: document.getElementById('mf-desc').value,
     type: document.getElementById('mf-type').value,
     meetingKe: parseInt(document.getElementById('mf-meeting').value),
-    published: document.getElementById('mf-published').checked
+    published: document.getElementById('mf-published').checked,
+    attachments: (window._mfAtt || []).map(a => ({ id: a.id, kind: a.kind, name: a.name, url: a.url, size: a.size }))
   };
   if (id) {
     Object.assign(db.materials.find(m => m.id === id), data);
@@ -8844,14 +9168,14 @@ function openAssignmentForm(id) {
   const courses = db.courses.filter(c => c.teacherId === teacher?.id);
   const a = id ? db.assignments.find(x => x.id === id) : null;
   const courseAda = a ? db.courses.some(c => c.id === a.courseId) : true;
-  // Bila mapel tugas hilang (insiden data), pilihan diarahkan ke mapel pertama agar bisa diperbaiki manual
-  const dueDefault = a ? new Date(a.dueDate).toISOString().slice(0, 16) : new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 16);
+  // PERBAIKAN WAKTU: isi form memakai waktu LOKAL (dulu UTC → tenggat bergeser 7 jam saat edit)
+  const dueDefault = a ? toLocalDatetimeInput(a.dueDate) : toLocalDatetimeInput(Date.now() + 7 * 86400000);
   const currentTypes = a?.submissionTypes || ['TEXT'];
   const subTypeCheckboxes = [
-    { value: 'TEXT', label: 'Diketik langsung (teks)', icon: 'file-text' },
-    { value: 'FILE', label: 'File Dokumen (DOC/PDF/PPT)', icon: 'file' },
-    { value: 'IMAGE', label: 'Gambar (JPG/PNG)', icon: 'image' },
-    { value: 'LINK', label: 'Link/URL', icon: 'link' }
+    { value: 'TEXT', label: 'Teks ketikan (diketik langsung)', icon: 'keyboard' },
+    { value: 'FILE', label: 'PDF / Dokumen (PDF, DOC, PPT)', icon: 'file-text' },
+    { value: 'IMAGE', label: 'Foto/Gambar (JPG/PNG)', icon: 'image' },
+    { value: 'LINK', label: 'Link/URL (contoh: video YouTube)', icon: 'link' }
   ];
   const body = `
     <form id="asg-form" onsubmit="saveAssignment(event, '${id || ''}')" class="space-y-4">
@@ -8866,6 +9190,8 @@ function openAssignmentForm(id) {
         ${field('Status', selectField('af-status', [{ value: 'AKTIF', label: 'Aktif' }, { value: 'DITUTUP', label: 'Ditutup' }, { value: 'DRAFT', label: 'Draft' }], a?.status || 'AKTIF'))}
       </div>
       ${field('Tenggat Waktu', inputText('af-dueDate', dueDefault, { type: 'datetime-local' }))}
+      <p class="text-xs text-amber-600 -mt-2 flex items-center gap-1"><i data-lucide="clock" style="font-size: 12px;"></i> Tenggat memakai <b>jam perangkat Anda</b>. Siswa hanya dapat mengumpulkan s/d menit tepat batas ini — pastikan tanggal &amp; jam benar.</p>
+      ${attEditorSection('_asgAtt', a ? (a.attachments || []) : null)}
       <div class="space-y-2">
         <label class="block text-sm font-medium">Format Pengumpulan Siswa *</label>
         <p class="text-xs text-gray-500 mb-2">Pilih format yang diperbolehkan untuk siswa mengumpulkan tugas:</p>
@@ -8878,7 +9204,7 @@ function openAssignmentForm(id) {
             </label>
           `).join('')}
         </div>
-        <p class="text-xs text-amber-600 mt-1"><i data-lucide="info" style="font-size: 12px; display: inline;"></i> Minimal pilih 1 format. Siswa akan melihat opsi pengumpulan sesuai dengan format yang dipilih.</p>
+        <p class="text-xs text-amber-600 mt-1"><i data-lucide="info" style="font-size: 12px; display: inline;"></i> Minimal pilih 1 format. Bila memilih lebih dari satu, siswa boleh mengirim <b>salah satu, beberapa, atau semuanya</b> — jawaban semua bentuk tetap tampil dan dapat Anda buka saat menilai.</p>
       </div>
     </form>
   `;
@@ -8910,6 +9236,12 @@ function saveAssignment(e, id) {
     showToast('Pilih format', 'Minimal pilih 1 format pengumpulan', 'warning');
     return;
   }
+  // PERBAIKAN WAKTU: validasi tenggat wajib terisi & dapat dibaca
+  const dueRaw = document.getElementById('af-dueDate').value;
+  if (!dueRaw || isNaN(new Date(dueRaw).getTime())) {
+    showToast('Tenggat tidak valid', 'Isi tanggal &amp; jam batas waktu tugas terlebih dahulu', 'error');
+    return;
+  }
   const data = {
     courseId: document.getElementById('af-course').value,
     title: document.getElementById('af-title').value,
@@ -8917,8 +9249,9 @@ function saveAssignment(e, id) {
     type: document.getElementById('af-type').value,
     maxScore: parseInt(document.getElementById('af-maxScore').value),
     status: document.getElementById('af-status').value,
-    dueDate: new Date(document.getElementById('af-dueDate').value).toISOString(),
-    submissionTypes: submissionTypes
+    dueDate: new Date(dueRaw).toISOString(),
+    submissionTypes: submissionTypes,
+    attachments: (window._asgAtt || []).map(a => ({ id: a.id, kind: a.kind, name: a.name, url: a.url, size: a.size }))
   };
   if (id) {
     Object.assign(db.assignments.find(a => a.id === id), data);
@@ -8945,6 +9278,49 @@ function deleteAssignment(id) {
   });
 }
 
+/* ============ DAFTAR PENGUMPULAN TUGAS (Guru) ============
+   Guru melihat SISWA YANG MENGERJAKAN & APA YANG DIKERJAKAN:
+   nama + kelas + waktu kumpul + bentuk jawaban (teks/gambar/PDF/dokumen/link) + status + nilai.
+   Juga daftar siswa yang BELUM mengumpulkan. */
+function openAsgSubmissions(assignmentId) {
+  const a = db.assignments.find(x => x.id === assignmentId);
+  if (!a) { showToast('Tugas tidak ditemukan', '', 'error'); return; }
+  const course = db.courses.find(c => c.id === a.courseId);
+  const targetStudents = course?.classId ? db.students.filter(s => s.classId === course.classId) : [];
+  const subs = db.submissions.filter(s => s.assignmentId === assignmentId);
+  const gradedCount = subs.filter(s => s.status === 'DINILAI').length;
+  const notSubmitted = targetStudents.filter(s => !subs.some(x => x.studentId === s.id))
+    .sort((x, y) => (x.name || '').localeCompare(y.name || ''));
+  const rows = subs.map(function(s) {
+    const st = db.students.find(x => x.id === s.studentId);
+    const cls = db.classes.find(c => c.id === st?.classId);
+    const gr = db.grades.find(g => g.submissionId === s.id) || (s.gradeId ? db.grades.find(g => g.id === s.gradeId) : null);
+    return '<div class="flex items-center gap-3 p-3 rounded-lg border hover:bg-gray-50">'
+      + '<div class="w-9 h-9 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center flex-shrink-0 text-sm font-bold">' + attEsc((st?.name || '?').charAt(0).toUpperCase()) + '</div>'
+      + '<div class="flex-1 min-w-0">'
+      + '<p class="text-sm font-medium truncate">' + attEsc(st?.name || '(siswa tidak ditemukan)') + '</p>'
+      + '<p class="text-[11px] text-gray-500">Kelas ' + attEsc(cls?.name || '-') + ' • Kumpul: ' + (s.submittedAt ? formatDueDateTime(s.submittedAt) : '-') + '</p>'
+      + '<div class="flex flex-wrap gap-1 mt-1">' + subKindBadges(s) + '</div>'
+      + '</div>'
+      + '<div class="text-right flex-shrink-0 space-y-1.5">'
+      + (gr ? '<p class="text-sm font-bold text-emerald-600">' + gr.score + ' (' + gr.grade + ')</p>' + badge('DIKUNCI', 'secondary') : badge(s.status || 'DIKUMPULKAN', 'secondary'))
+      + '<button onclick="openGradeDialog(\'' + s.id + '\')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1 ml-auto"><i data-lucide="award" style="font-size:12px;"></i> ' + (gr ? 'Lihat / Ubah' : 'Nilai') + '</button>'
+      + '</div></div>';
+  }).join('');
+  const belumList = notSubmitted.map(s => '<span class="inline-flex items-center gap-1 px-2 py-1 rounded bg-amber-50 border border-amber-200 text-xs text-amber-800"><i data-lucide="user-x" style="font-size:11px;"></i>' + attEsc(s.name) + '</span>').join(' ');
+  const body = `
+    <div class="space-y-3">
+      <div class="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-sm">
+        <p class="font-semibold text-emerald-900">${attEsc(a.title)}</p>
+        <p class="text-xs text-emerald-700 mt-0.5">${attEsc(course?.name || '(mapel terputus)')} • Tenggat: ${formatDueDateTime(a.dueDate)}</p>
+        <p class="text-xs text-emerald-700 mt-1"><b>${subs.length}</b> siswa mengumpulkan • <b>${gradedCount}</b> sudah dinilai • <b>${notSubmitted.length}</b> belum mengumpulkan</p>
+      </div>
+      ${subs.length ? '<div class="space-y-2 max-h-80 overflow-y-auto pr-1">' + rows + '</div>' : '<p class="text-sm text-gray-400 italic text-center py-2">Belum ada siswa yang mengumpulkan.</p>'}
+      ${notSubmitted.length ? '<div><p class="text-xs font-medium text-gray-500 mb-1.5 flex items-center gap-1"><i data-lucide="user-x" style="font-size:12px;"></i> Belum mengumpulkan (' + notSubmitted.length + '):</p><div class="flex flex-wrap gap-1.5">' + belumList + '</div></div>' : ''}
+    </div>`;
+  showModal('Pengumpulan Tugas Siswa', body, btn('Tutup', 'closeModal()', { variant: 'outline' }), 'max-w-2xl');
+}
+
 /* ============ GRADE DIALOG (Guru) ============ */
 function openGradeDialog(subId) {
   const sub = db.submissions.find(s => s.id === subId);
@@ -8955,30 +9331,9 @@ function openGradeDialog(subId) {
   const curScore = existingGrade?.score || 0;
   const curFeedback = existingGrade?.feedback || '';
 
-  // Build submission display based on type
-  let submissionDisplay = '';
-  if (sub.submissionType === 'TEXT' || (!sub.submissionType && sub.content)) {
-    submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1">Jawaban Teks:</p><p class="text-sm whitespace-pre-wrap bg-white p-3 rounded border">' + (sub.content || '(Tidak ada jawaban)') + '</p>';
-  }
-  if (sub.submissionType === 'LINK' || sub.linkUrl) {
-    submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">Link yang dikumpulkan:</p><a href="' + (sub.linkUrl || sub.content || '') + '" target="_blank" class="inline-flex items-center gap-1 text-sm text-emerald-600 hover:text-emerald-700 bg-emerald-50 px-3 py-2 rounded border border-emerald-200"><i data-lucide="external-link" style="font-size: 14px;"></i> ' + (sub.linkUrl || sub.content || '-') + '</a>';
-  }
-  if (sub.submissionType === 'FILE' || sub.fileName) {
-    if (sub.fileData) {
-      const fileExt = (sub.fileName || '').split('.').pop().toUpperCase();
-      submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">File yang dikumpulkan:</p><a href="' + sub.fileData + '" download="' + (sub.fileName || 'download') + '" class="inline-flex items-center gap-2 text-sm text-white bg-blue-500 hover:bg-blue-600 px-3 py-2 rounded"><i data-lucide="download" style="font-size: 14px;"></i> ' + (sub.fileName || 'File') + ' <span class="text-xs bg-white/20 px-1.5 py-0.5 rounded">' + fileExt + '</span></a>';
-    } else if (sub.fileName) {
-      submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">File: ' + sub.fileName + ' (tidak tersedia)</p>';
-    }
-  }
-  if (sub.submissionType === 'IMAGE' || (sub.fileData && sub.fileName && /\.(jpg|jpeg|png|gif|webp)$/i.test(sub.fileName))) {
-    if (sub.fileData) {
-      submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">Gambar:</p><img src="' + sub.fileData + '" alt="Gambar siswa" class="w-full max-h-80 object-contain rounded border bg-gray-50"><a href="' + sub.fileData + '" download="' + (sub.fileName || 'gambar') + '" class="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-700 mt-1"><i data-lucide="download" style="font-size: 12px;"></i> Download gambar</a>';
-    }
-  }
-  if (!submissionDisplay) {
-    submissionDisplay = '<p class="text-sm text-gray-400 italic">Siswa belum mengumpulkan jawaban</p>';
-  }
+  // SEMUA BENTUK JAWABAN DAPAT DIBUKA & DILIHAT GURU untuk dinilai:
+  // teks ketikan, foto JPG/PNG (preview + lightbox), PDF (viewer penuh), dokumen (unduh), link (buka tab baru)
+  const submissionDisplay = renderSubmissionItemsView(sub);
 
   const body = `
     <div class="space-y-4">
@@ -8986,7 +9341,8 @@ function openGradeDialog(subId) {
         <div class="flex items-center justify-between mb-2">
           <div>
             <p class="text-sm font-medium">${st?.name || '(siswa tidak ditemukan)'}</p>
-            <p class="text-xs text-gray-500">Kelas: ${cls?.name || '-'}</p>
+            <p class="text-xs text-gray-500">Kelas: ${cls?.name || '-'} • Kumpul: ${sub.submittedAt ? formatDueDateTime(sub.submittedAt) : '-'}</p>
+            <div class="flex flex-wrap items-center gap-1 mt-1"><span class="text-[11px] text-gray-500">Bentuk:</span> ${subKindBadges(sub)}</div>
           </div>
           <div class="text-right">
             <p class="text-xs text-gray-500">Tugas</p>
@@ -9021,19 +9377,25 @@ function saveGrade(subId) {
   const feedback = document.getElementById('gd-feedback').value;
   const grade = gradeLetter(score);
   const existing = db.grades.find(g => g.submissionId === subId);
+  let gradeId;
   if (existing) {
     Object.assign(existing, { score, grade, feedback, gradedById: user.id, gradedAt: now() });
+    gradeId = existing.id;
   } else {
+    gradeId = uid('grd');
     db.grades.push({
-      id: uid('grd'), submissionId: subId, studentId: sub.studentId,
+      id: gradeId, submissionId: subId, studentId: sub.studentId,
       courseId: a.courseId, assignmentId: sub.assignmentId,
       score, grade, feedback, gradedById: user.id, gradedAt: now(), createdAt: now()
     });
   }
+  // PERBAIKAN PENILAIAN: tandai status DINILAI + simpan gradeId pada submission
+  // agar kolom Nilai & penghitung "sudah dinilai" tampil (dulu selalu "-")
   sub.status = 'DINILAI';
+  sub.gradeId = gradeId;
   saveDB();
   closeModal();
-  showToast('Nilai disimpan', '', 'success');
+  showToast('Nilai disimpan', 'Status siswa kini DINILAI & DIKUNCI', 'success');
   refreshMainContent();
 }
 
@@ -9095,7 +9457,7 @@ function openWaliSiswaDetail(studentId) {
     return `<tr class="border-b">
       <td class="py-2 px-2 text-xs">${_printEsc(course?.name || '-')}</td>
       <td class="py-2 px-2 text-xs font-medium">${_printEsc(a.title)}</td>
-      <td class="py-2 px-2 text-xs text-gray-500">${a.dueDate ? formatDate(a.dueDate) : '-'}</td>
+      <td class="py-2 px-2 text-xs text-gray-500">${a.dueDate ? formatDueDateTime(a.dueDate) : '-'}</td>
       <td class="py-2 px-2">${statusBadge}</td>
       <td class="py-2 px-2 text-xs text-gray-500">${sub?.submittedAt ? formatDateTime(sub.submittedAt) : '-'}</td>
     </tr>`;
@@ -9534,7 +9896,7 @@ window.KEPSEK_PAGES = {
                 <p class="text-xs text-gray-500">${a?.title || s.assignmentTitle || '(tugas terputus)'}</p>
                 <p class="text-[10px] text-gray-500 mt-1">${s.submittedAt ? formatDateTime(s.submittedAt) : '-'}</p>
               </div>
-              ${badge(s.status, s.status === 'DINILAI' ? 'default' : 'secondary')}
+              ${badge(s.status === 'DINILAI' ? 'DINILAI · DIKUNCI' : s.status, s.status === 'DINILAI' ? 'default' : 'secondary')}
             </div>`;
           }).join('') + '</div>'
         )}
@@ -9750,9 +10112,9 @@ window.SISWA_PAGES = {
               <div class="flex-1 min-w-0">
                 <p class="font-medium text-sm line-clamp-1">${a.title}</p>
                 <p class="text-xs text-gray-500">${db.courses.find(c => c.id === a.courseId)?.name}</p>
-                <p class="text-[10px] text-gray-500 mt-1">Deadline: ${formatDate(a.dueDate, { day: 'numeric', month: 'long' })}</p>
+                <p class="text-[10px] text-gray-500 mt-1">Deadline: ${formatDueDateTime(a.dueDate)}</p>
               </div>
-              ${badge(days < 0 ? 'Lewat' : days === 0 ? 'Hari ini' : (days + ' hari'), days < 0 ? 'destructive' : days <= 3 ? 'default' : 'secondary')}
+              ${badge(days < 0 ? 'Lewat' : (dueCountdown(a.dueDate) || 'Hari ini'), days < 0 ? 'destructive' : days <= 3 ? 'default' : 'secondary')}
             </div>`;
           }).join('') + '</div>'
         )}
@@ -9869,28 +10231,33 @@ window.SISWA_PAGES = {
           const isClosed = isAssignmentClosed(a);
           const daysLeft = daysUntil(a.dueDate);
           const gr = sub ? db.grades.find(g => g.submissionId === sub.id) : null;
-          const statusBadge = isClosed && !sub ? badge('Ditutup', 'destructive')
+          const isGraded = sub && sub.status === 'DINILAI';
+          const statusBadge = isGraded ? badge('DIKUNCI', 'secondary')
+            : isClosed && !sub ? badge('Ditutup', 'destructive')
             : isOverdue ? badge('Lewat deadline', 'destructive')
-            : badge(daysLeft === 0 ? 'Tenggat hari ini' : (daysLeft + ' hari lagi'), daysLeft <= 3 ? 'default' : 'secondary');
+            : badge(dueCountdown(a.dueDate) || 'Tenggat hari ini', daysLeft <= 3 ? 'default' : 'secondary');
           return `<div class="bg-white rounded-2xl border-0 shadow-md p-5 ${isOverdue ? 'border-l-4 border-l-red-500' : ''}">
             <div class="flex items-start justify-between gap-3">
               <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2 mb-2">
+                <div class="flex items-center gap-2 mb-2 flex-wrap">
                   ${badge(db.courses.find(c => c.id === a.courseId)?.name || '', 'outline')}
                   ${badge(a.type, 'outline')}
                   ${statusBadge}
-                  ${gr ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-xs bg-emerald-500 text-white">Nilai: ' + gr.score + '</span>' : ''}
+                  ${isGraded ? '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-emerald-500 text-white"><i data-lucide="check-circle" style="font-size: 12px;"></i> DINILAI</span>' : ''}
+                  ${gr ? '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-emerald-50 text-emerald-700 border border-emerald-200">Nilai: ' + gr.score + ' (' + gr.grade + ')</span>' : ''}
+                  ${attCountBadge(a.attachments)}
                 </div>
                 <h3 class="font-semibold mb-1">${a.title}</h3>
                 <p class="text-sm text-gray-500 line-clamp-2 mb-2">${a.description}</p>
-                <div class="flex items-center gap-4 text-xs text-gray-500">
-                  <span class="flex items-center gap-1"><i data-lucide="clock" style="font-size: 12px;"></i>${formatDate(a.dueDate)}</span>
+                <div class="flex items-center gap-4 text-xs text-gray-500 flex-wrap">
+                  <span class="flex items-center gap-1" title="Batas waktu tepat"><i data-lucide="clock" style="font-size: 12px;"></i>${formatDueDateTime(a.dueDate)}</span>
+                  <span class="flex items-center gap-1" title="Bentuk jawaban yang diizinkan guru"><i data-lucide="upload" style="font-size: 12px;"></i>${(a.submissionTypes || ['TEXT']).map(t => (_SUB_KIND_META[t] || { label: t }).label).join(' · ')}</span>
                   <span class="flex items-center gap-1"><i data-lucide="award" style="font-size: 12px;"></i>Max: ${a.maxScore}</span>
                 </div>
               </div>
               <div class="flex-shrink-0">
-                ${sub?.status === 'DINILAI' ?
-                  '<button onclick="viewSubmission(\'' + sub.id + '\')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="eye" style="font-size: 12px;"></i> Lihat Nilai</button>' :
+                ${isGraded ?
+                  '<button onclick="viewSubmission(\'' + sub.id + '\')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="lock" style="font-size: 12px;"></i> Lihat Nilai</button>' :
                   (isClosed ?
                     (sub ? '<button onclick="openSubmitDialog(\'' + a.id + '\')" class="px-3 py-1.5 text-xs border rounded-md hover:bg-gray-50 flex items-center gap-1"><i data-lucide="eye" style="font-size: 12px;"></i> Lihat Jawaban</button>'
                          : '<span class="inline-flex items-center gap-1 px-3 py-1.5 text-xs bg-red-50 text-red-600 border border-red-200 rounded-md font-medium" title="Batas waktu terlewat — pengumpulan ditutup"><i data-lucide="lock" style="font-size: 12px;"></i> Ditutup</span>') :
@@ -10163,7 +10530,8 @@ function viewMaterial(id) {
     <p class="text-xs text-gray-500 mb-4">Oleh: ${author?.name || '-'} • ${formatDate(m.createdAt, { dateStyle: 'long' })}</p>
     <div class="prose prose-sm max-w-none">
       <p class="text-gray-700 whitespace-pre-wrap leading-relaxed">${m.content}</p>
-    </div>`,
+    </div>
+    ${attRegisterViewMap(m.attachments || []), renderAttachmentView(m.attachments)}`,
     btn('Tutup', 'closeModal()', { variant: 'outline' }),
     'max-w-3xl'
   );
@@ -10188,135 +10556,149 @@ function openSubmitDialog(assignmentId) {
   // ===== BATAS WAKTU: setelah deadline siswa tidak dapat mengirim tugas lagi =====
   const closed = isAssignmentClosed(a);
   if (closed && !existing && user.role === 'SISWA') {
-    showToast('Pengumpulan ditutup', 'Batas waktu (' + formatDate(a.dueDate) + ') sudah terlewat — tugas tidak dapat dikirim lagi', 'error');
+    showToast('Pengumpulan ditutup', 'Batas waktu (' + formatDueDateTime(a.dueDate) + ') sudah terlewat — tugas tidak dapat dikirim lagi', 'error');
     return;
   }
   const grade = existing ? db.grades.find(g => g.submissionId === existing.id) : null;
   const c = db.courses.find(x => x.id === a.courseId);
   const allowedTypes = a.submissionTypes || ['TEXT'];
-  const curType = existing?.submissionType || 'TEXT';
+  const items = existing ? subItemsOf(existing) : [];
+  const textItem = items.find(it => it.kind === 'TEXT');
+  const linkItem = items.find(it => it.kind === 'LINK');
+  // State unggahan sementara: gambar bisa lebih dari satu, PDF/dokumen satu file
+  window._sdState = {
+    images: items.filter(it => it.kind === 'IMAGE').map(it => ({ name: it.name || 'gambar.jpg', url: it.url, size: it.size || 0 })),
+    file: (items.find(it => it.kind === 'PDF' || it.kind === 'FILE') || null)
+  };
 
-  // Build submission input area based on allowed types
+  // Badge format yang diizinkan guru
+  const fmtBadges = allowedTypes.map(t => {
+    const m = _SUB_KIND_META[t] || { label: t, icon: 'file', cls: 'bg-gray-50 text-gray-600 border-gray-200' };
+    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-xs font-medium ' + m.cls + '"><i data-lucide="' + m.icon + '" style="font-size:12px;"></i>' + m.label + '</span>';
+  }).join(' ');
+
+  // ===== Input SETIAP bentuk yang diizinkan — tampil BERSAMAAN; siswa boleh isi salah satu / beberapa / semuanya =====
   let inputArea = '';
   if (allowedTypes.includes('TEXT')) {
-    inputArea += '<div class="space-y-2"><label class="text-sm font-medium flex items-center gap-1"><i data-lucide="file-text" style="font-size: 14px;"></i> Jawaban Teks</label><textarea id="sd-content" rows="6" placeholder="Ketik jawaban Anda di sini..." class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">' + (existing?.content || '') + '</textarea></div>';
-  }
-  if (allowedTypes.includes('LINK')) {
-    inputArea += '<div class="space-y-2 mt-3"><label class="text-sm font-medium flex items-center gap-1"><i data-lucide="link" style="font-size: 14px;"></i> Link/URL</label><input id="sd-link" type="url" value="' + (existing?.linkUrl || '') + '" placeholder="https://..." class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"></div>';
-  }
-  if (allowedTypes.includes('FILE')) {
-    const fileTypes = '.doc,.docx,.pdf,.ppt,.pptx,.xls,.xlsx,.txt';
-    inputArea += '<div class="space-y-2 mt-3"><label class="text-sm font-medium flex items-center gap-1"><i data-lucide="file" style="font-size: 14px;"></i> File Dokumen (DOC/PDF/PPT)</label><div class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center hover:border-emerald-400 transition-colors cursor-pointer" onclick="document.getElementById(\'sd-file\').click()"><i data-lucide="upload-cloud" class="text-gray-400 mx-auto mb-2" style="font-size: 32px;"></i><p class="text-sm font-medium">Klik untuk pilih file</p><p class="text-xs text-gray-500">DOC, PDF, PPT, XLS (max 5MB)</p><input type="file" id="sd-file" accept="' + fileTypes + '" class="hidden" onchange="handleFileSelect(this, \'FILE\')"></div><div id="sd-file-info" class="mt-2">' + (existing?.fileName ? '<div class="flex items-center gap-2 p-2 rounded bg-blue-50 border border-blue-200"><i data-lucide="file" class="text-blue-600" style="font-size: 16px;"></i><span class="text-sm flex-1 truncate">' + existing.fileName + '</span><button type="button" onclick="removeFile(\'FILE\')" class="text-red-500"><i data-lucide="x" style="font-size: 14px;"></i></button></div>' : '') + '</div></div>';
+    inputArea += '<div class="space-y-1.5"><label class="text-sm font-medium flex items-center gap-1.5"><i data-lucide="keyboard" style="font-size:14px;"></i> Teks Ketikan</label>'
+      + '<textarea id="sd-content" rows="5" placeholder="Ketik jawaban Anda di sini..." class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">' + attEsc(textItem?.text || '') + '</textarea></div>';
   }
   if (allowedTypes.includes('IMAGE')) {
-    inputArea += '<div class="space-y-2 mt-3"><label class="text-sm font-medium flex items-center gap-1"><i data-lucide="image" style="font-size: 14px;"></i> Gambar (JPG/PNG)</label><div class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center hover:border-emerald-400 transition-colors cursor-pointer" onclick="document.getElementById(\'sd-image\').click()"><i data-lucide="image-plus" class="text-gray-400 mx-auto mb-2" style="font-size: 32px;"></i><p class="text-sm font-medium">Klik untuk pilih gambar</p><p class="text-xs text-gray-500">JPG, PNG, GIF, WebP (max 5MB)</p><input type="file" id="sd-image" accept="image/jpeg,image/png,image/gif,image/webp" class="hidden" onchange="handleFileSelect(this, \'IMAGE\')"></div><div id="sd-image-info" class="mt-2">' + (existing?.fileData && /\.(jpg|jpeg|png|gif|webp)$/i.test(existing.fileName) ? '<div class="relative"><img src="' + existing.fileData + '" class="w-full max-h-48 object-contain rounded border"><button type="button" onclick="removeFile(\'IMAGE\')" class="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1"><i data-lucide="x" style="font-size: 12px;"></i></button></div>' : '') + '</div></div>';
+    inputArea += '<div class="space-y-1.5"><label class="text-sm font-medium flex items-center gap-1.5"><i data-lucide="image" style="font-size:14px;"></i> Foto Jawaban (JPG/PNG)</label>'
+      + '<p class="text-xs text-gray-500">Bisa melampirkan lebih dari satu foto (maks 5) — foto otomatis dikompres agar hemat.</p>'
+      + '<div class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center hover:border-emerald-400 transition-colors cursor-pointer" onclick="document.getElementById(\'sd-image\').click()"><i data-lucide="camera" class="text-gray-400 mx-auto mb-2" style="font-size: 28px;"></i><p class="text-sm font-medium">Klik untuk pilih foto</p><p class="text-xs text-gray-500">JPG, PNG, GIF, WebP</p>'
+      + '<input type="file" id="sd-image" accept="image/jpeg,image/png,image/gif,image/webp" multiple class="hidden" onchange="sdHandleFiles(this)"></div>'
+      + '<div id="sd-image-info" class="mt-2"></div></div>';
   }
-
-  // Format selector if multiple types
-  let formatSelector = '';
-  if (allowedTypes.length > 1) {
-    const typeOptions = {
-      TEXT: { label: 'Teks', icon: 'file-text' },
-      FILE: { label: 'File', icon: 'file' },
-      IMAGE: { label: 'Gambar', icon: 'image' },
-      LINK: { label: 'Link', icon: 'link' }
-    };
-    formatSelector = '<div class="mb-3"><label class="text-sm font-medium mb-2 block">Pilih Format Pengumpulan:</label><div class="flex flex-wrap gap-2">' +
-      allowedTypes.map(t => {
-        const info = typeOptions[t];
-        return '<button type="button" onclick="switchSubmissionType(\'' + t + '\')" id="sd-type-btn-' + t + '" class="px-3 py-2 text-sm border rounded-lg flex items-center gap-1 hover:bg-gray-50 ' + (curType === t ? 'border-emerald-500 bg-emerald-50 text-emerald-700' : '') + '"><i data-lucide="' + info.icon + '" style="font-size: 14px;"></i> ' + info.label + '</button>';
-      }).join('') + '</div></div>';
+  if (allowedTypes.includes('FILE')) {
+    inputArea += '<div class="space-y-1.5"><label class="text-sm font-medium flex items-center gap-1.5"><i data-lucide="file-text" style="font-size:14px;"></i> PDF / Dokumen</label>'
+      + '<div class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center hover:border-emerald-400 transition-colors cursor-pointer" onclick="document.getElementById(\'sd-file\').click()"><i data-lucide="upload-cloud" class="text-gray-400 mx-auto mb-2" style="font-size: 28px;"></i><p class="text-sm font-medium">Klik untuk pilih file</p><p class="text-xs text-gray-500">PDF, DOC, PPT, XLS, TXT (maks 5MB) — PDF dapat dibuka langsung oleh guru</p>'
+      + '<input type="file" id="sd-file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt" class="hidden" onchange="sdHandleFiles(this)"></div>'
+      + '<div id="sd-file-info" class="mt-2"></div></div>';
   }
+  if (allowedTypes.includes('LINK')) {
+    inputArea += '<div class="space-y-1.5"><label class="text-sm font-medium flex items-center gap-1.5"><i data-lucide="link" style="font-size:14px;"></i> Link/URL</label>'
+      + '<input id="sd-link" type="url" value="' + attEsc(linkItem?.url || '') + '" placeholder="https://..." class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"></div>';
+  }
+  const hint = (allowedTypes.length > 1)
+    ? '<div class="p-2.5 rounded-lg bg-sky-50 border border-sky-200 text-xs text-sky-800 flex items-start gap-1.5"><i data-lucide="info" style="font-size:13px;margin-top:1px;flex-shrink:0;"></i><span>Guru mengizinkan <b>semua bentuk di bawah</b> — isi <b>salah satu saja</b>, <b>beberapa</b>, atau <b>semuanya sekaligus</b> sesuai perintah guru pada instruksi tugas.</span></div>'
+    : '<div class="p-2.5 rounded-lg bg-sky-50 border border-sky-200 text-xs text-sky-800 flex items-start gap-1.5"><i data-lucide="info" style="font-size:13px;margin-top:1px;flex-shrink:0;"></i><span>Guru meminta pengumpulan dalam bentuk <b>' + attEsc((_SUB_KIND_META[allowedTypes[0]] || { label: allowedTypes[0] }).label) + '</b> saja.</span></div>';
 
   const body = `
     <div class="space-y-4">
-      ${closed ? '<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700 flex items-start gap-2"><i data-lucide="lock" style="font-size:15px;margin-top:1px;flex-shrink:0;"></i><span><b>Pengumpulan ditutup.</b> Batas waktu ' + formatDate(a.dueDate) + ' telah terlewat' + (existing ? ' — jawaban Anda yang terkirim sebelum tenggat tetap tersimpan dan dapat dinilai guru.' : '') + '</span></div>' : ''}
+      ${closed ? '<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700 flex items-start gap-2"><i data-lucide="lock" style="font-size:15px;margin-top:1px;flex-shrink:0;"></i><span><b>Pengumpulan ditutup.</b> Batas waktu ' + formatDueDateTime(a.dueDate) + ' telah terlewat' + (existing ? ' — jawaban Anda yang terkirim sebelum tenggat tetap tersimpan dan dapat dinilai guru.' : '') + '</span></div>' : ''}
+      ${(!closed && a.dueDate) ? '<div class="p-3 rounded-lg bg-amber-50 border border-amber-200 text-sm text-amber-800 flex items-start gap-2"><i data-lucide="clock" style="font-size:15px;margin-top:1px;flex-shrink:0;"></i><span><b>Batas waktu:</b> ' + formatDueDateTime(a.dueDate) + (existing ? '' : ' — sisa <b>' + dueCountdown(a.dueDate) + '</b>') + '</span></div>' : ''}
+      ${(existing && existing.status === 'DINILAI') ? '<div class="p-3 rounded-lg bg-gray-100 border border-gray-300 text-sm text-gray-700 flex items-start gap-2"><i data-lucide="lock" style="font-size:15px;margin-top:1px;flex-shrink:0;"></i><span><b>Jawaban DIKUNCI.</b> Tugas Anda sudah dinilai oleh guru — jawaban tidak dapat diubah lagi.</span></div>' : ''}
       <div class="p-4 rounded-lg bg-gray-50 border">
         <p class="text-sm font-medium mb-2">Instruksi:</p>
         <p class="text-sm">${a.description}</p>
       </div>
-      ${grade ? '<div class="p-4 rounded-lg bg-emerald-50 border border-emerald-200"><div class="flex items-center justify-between mb-2"><p class="text-sm font-medium text-emerald-700">Nilai Anda</p>' + badge(grade.score + ' - ' + grade.grade, 'default') + '</div><p class="text-sm text-emerald-800">' + grade.feedback + '</p></div>' : ''}
-      <input type="hidden" id="sd-submissionType" value="${curType}">
-      ${formatSelector}
-      <div id="sd-input-area">${inputArea}</div>
+      ${attRegisterViewMap(a.attachments || []), renderAttachmentView(a.attachments)}
+      ${grade ? '<div class="p-4 rounded-lg bg-emerald-50 border border-emerald-200"><div class="flex items-center justify-between mb-2"><p class="text-sm font-medium text-emerald-700">Nilai Anda</p><div class="flex items-center gap-1.5">' + badge('DINILAI', 'default') + badge('DIKUNCI', 'secondary') + '</div></div><p class="text-sm text-emerald-800">' + grade.feedback + '</p></div>' : ''}
+      <div class="flex flex-wrap items-center gap-1.5"><span class="text-xs font-medium text-gray-600">Format yang diizinkan guru:</span> ${fmtBadges}</div>
+      ${hint}
+      <div id="sd-input-area" class="space-y-4">${inputArea}</div>
     </div>
   `;
   const footer = (existing?.status === 'DINILAI' || closed) ?
     btn('Tutup', 'closeModal()', { variant: 'outline' }) :
     btn('Batal', 'closeModal()', { variant: 'outline' }) + btn('Kumpulkan Tugas', 'submitAssignment(\'' + assignmentId + '\')', { icon: 'upload' });
   showModal(a.title, body, footer, 'max-w-2xl');
+  sdRenderImages();
+  sdRenderFile();
 }
 
-// Helper: switch submission type in dialog
-function switchSubmissionType(type) {
-  document.getElementById('sd-submissionType').value = type;
-  // Update button styles
-  document.querySelectorAll('[id^="sd-type-btn-"]').forEach(btn => {
-    btn.className = btn.className.replace('border-emerald-500 bg-emerald-50 text-emerald-700', '');
-    if (btn.id === 'sd-type-btn-' + type) {
-      btn.classList.add('border-emerald-500', 'bg-emerald-50', 'text-emerald-700');
-    }
-  });
-  // Show/hide input areas
-  const areas = ['sd-content', 'sd-link', 'sd-file', 'sd-image'];
-  areas.forEach(id => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const container = el.closest('.space-y-2, .border-2');
-    if (container) {
-      container.style.display = (type === 'TEXT' && id === 'sd-content') || (type === 'LINK' && id === 'sd-link') || (type === 'FILE' && id === 'sd-file') || (type === 'IMAGE' && id === 'sd-image') ? '' : 'none';
-    }
-  });
-  lucide.createIcons();
+/* Helper: pratinjau daftar foto terlampir pada dialog pengumpulan */
+function sdRenderImages() {
+  const holder = document.getElementById('sd-image-info');
+  if (!holder) return;
+  const list = (window._sdState && window._sdState.images) || [];
+  holder.innerHTML = list.length === 0 ? '' : '<div class="grid grid-cols-2 sm:grid-cols-3 gap-2">' + list.map(function(im, i) {
+    return '<div><div class="relative"><img src="' + im.url + '" alt="' + attEsc(im.name) + '" class="w-full h-24 object-cover rounded border bg-gray-50"><button type="button" onclick="sdRemoveImage(' + i + ')" title="Hapus foto" class="absolute top-1 right-1 bg-red-500 text-white rounded-full p-1 shadow"><i data-lucide="x" style="font-size:12px;"></i></button></div><p class="text-[10px] text-gray-500 truncate mt-0.5">' + attEsc(im.name) + ' (' + Math.round((im.size || 0) / 1024) + ' KB)</p></div>';
+  }).join('') + '</div>';
+  if (window.lucide && lucide.createIcons) lucide.createIcons();
 }
-
-// Helper: handle file selection (reads as base64)
-function handleFileSelect(input, type) {
-  const file = input.files && input.files[0];
-  if (!file) return;
-  const maxSize = 5 * 1024 * 1024;
-  if (file.size > maxSize) {
-    showToast('File terlalu besar', 'Ukuran maksimal 5MB. File: ' + (file.size / 1024 / 1024).toFixed(2) + 'MB', 'error');
-    input.value = '';
-    return;
-  }
-  showToast('Membaca file...', file.name, 'info');
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    const dataUrl = e.target.result;
-    if (type === 'FILE') {
-      const infoDiv = document.getElementById('sd-file-info');
-      if (infoDiv) {
-        infoDiv.innerHTML = '<div class="flex items-center gap-2 p-2 rounded bg-blue-50 border border-blue-200"><i data-lucide="file" class="text-blue-600" style="font-size: 16px;"></i><span class="text-sm flex-1 truncate">' + file.name + '</span><button type="button" onclick="removeFile(\'FILE\')" class="text-red-500"><i data-lucide="x" style="font-size: 14px;"></i></button></div>';
-        infoDiv.dataset.fileData = dataUrl;
-        infoDiv.dataset.fileName = file.name;
+function sdRemoveImage(i) {
+  if (!window._sdState) return;
+  window._sdState.images.splice(i, 1);
+  sdRenderImages();
+}
+/* Helper: pratinjau PDF/dokumen terlampir pada dialog pengumpulan */
+function sdRenderFile() {
+  const holder = document.getElementById('sd-file-info');
+  if (!holder) return;
+  const f = window._sdState && window._sdState.file;
+  const isPdf = f && /\.pdf$/i.test(f.name || '');
+  holder.innerHTML = !f ? '' : '<div class="flex items-center gap-2 p-2 rounded bg-blue-50 border border-blue-200"><div class="w-9 h-9 rounded flex flex-col items-center justify-center flex-shrink-0 ' + (isPdf ? 'bg-red-100 text-red-600' : 'bg-amber-100 text-amber-700') + '"><i data-lucide="' + (isPdf ? 'file-text' : 'file') + '" style="font-size:14px;"></i><span class="text-[8px] font-bold">' + (isPdf ? 'PDF' : attEsc(((f.name || '').split('.').pop() || 'DOC').toUpperCase().slice(0, 4))) + '</span></div>'
+    + '<div class="flex-1 min-w-0"><p class="text-sm font-medium truncate">' + attEsc(f.name) + '</p><p class="text-[10px] text-gray-400">' + Math.round((f.size || 0) / 1024) + ' KB</p></div>'
+    + '<button type="button" onclick="sdRemoveFile()" title="Hapus file" class="text-red-500 p-1.5 rounded hover:bg-red-50"><i data-lucide="x" style="font-size:14px;"></i></button></div>';
+  if (window.lucide && lucide.createIcons) lucide.createIcons();
+}
+function sdRemoveFile() {
+  if (!window._sdState) return;
+  window._sdState.file = null;
+  sdRenderFile();
+  const fi = document.getElementById('sd-file');
+  if (fi) fi.value = '';
+}
+/* Helper: proses file terpilih — foto dikompres otomatis, PDF/dokumen dibaca base64 */
+function sdHandleFiles(input) {
+  const files = Array.from((input && input.files) || []);
+  if (!files.length) return;
+  if (input.id === 'sd-image') {
+    const list = (window._sdState && window._sdState.images) || (window._sdState.images = []);
+    (async function() {
+      let ok = 0;
+      for (const file of files) {
+        if (list.length >= 5) { showToast('Maksimal 5 foto', 'Hapus salah satu foto untuk menambah lagi', 'warning'); break; }
+        if (!/^image\/(jpeg|png|gif|webp)$/.test(file.type)) { showToast('Format tidak didukung', file.name + ' — gunakan JPG/PNG/GIF/WebP', 'error'); continue; }
+        try {
+          const dataUrl = await compressImageFile(file, 1400, 0.72);
+          if (dataUrl.length > 1200000) { showToast('Foto terlalu besar', file.name + ' — setelah dikompres masih >1MB', 'error'); continue; }
+          list.push({ name: file.name, url: dataUrl, size: Math.round(dataUrl.length * 0.75) });
+          ok++;
+        } catch (e) { showToast('Gagal membaca foto', file.name, 'error'); }
       }
-    } else if (type === 'IMAGE') {
-      const infoDiv = document.getElementById('sd-image-info');
-      if (infoDiv) {
-        infoDiv.innerHTML = '<div class="relative"><img src="' + dataUrl + '" class="w-full max-h-48 object-contain rounded border"><button type="button" onclick="removeFile(\'IMAGE\')" class="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1"><i data-lucide="x" style="font-size: 12px;"></i></button></div>';
-        infoDiv.dataset.fileData = dataUrl;
-        infoDiv.dataset.fileName = file.name;
-      }
+      input.value = '';
+      sdRenderImages();
+      if (ok > 0) showToast('Foto siap dikirim', ok + ' foto terlampir (total ' + list.length + ')', 'success');
+    })();
+  } else {
+    const file = files[0];
+    if (file.size > 5 * 1024 * 1024) {
+      showToast('File terlalu besar', 'Ukuran maksimal 5MB. File: ' + (file.size / 1024 / 1024).toFixed(2) + 'MB', 'error');
+      input.value = '';
+      return;
     }
-    lucide.createIcons();
-    showToast('File siap', file.name + ' (' + (file.size / 1024).toFixed(0) + 'KB)', 'success');
-  };
-  reader.readAsDataURL(file);
-}
-
-// Helper: remove selected file
-function removeFile(type) {
-  if (type === 'FILE') {
-    const infoDiv = document.getElementById('sd-file-info');
-    if (infoDiv) { infoDiv.innerHTML = ''; delete infoDiv.dataset.fileData; delete infoDiv.dataset.fileName; }
-    const fileInput = document.getElementById('sd-file');
-    if (fileInput) fileInput.value = '';
-  } else if (type === 'IMAGE') {
-    const infoDiv = document.getElementById('sd-image-info');
-    if (infoDiv) { infoDiv.innerHTML = ''; delete infoDiv.dataset.fileData; delete infoDiv.dataset.fileName; }
-    const fileInput = document.getElementById('sd-image');
-    if (fileInput) fileInput.value = '';
+    showToast('Membaca file...', file.name, 'info');
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      if (!window._sdState) window._sdState = { images: [], file: null };
+      window._sdState.file = { name: file.name, url: e.target.result, size: file.size };
+      sdRenderFile();
+      showToast('File siap dikirim', file.name + ' (' + Math.round(file.size / 1024) + ' KB)', 'success');
+    };
+    reader.readAsDataURL(file);
   }
 }
 
@@ -10324,38 +10706,61 @@ function submitAssignment(assignmentId) {
   const user = getCurrentUser();
   const student = db.students.find(s => s.userId === user.id);
   const a = db.assignments.find(x => x.id === assignmentId);
+  // ===== PENGAMAN PENILAIAN: jawaban yang sudah DINILAI tidak boleh ditimpa (DIKUNCI) =====
+  const _exSub = db.submissions.find(s => s.assignmentId === assignmentId && s.studentId === student.id);
+  if (_exSub && _exSub.status === 'DINILAI') {
+    showToast('Tugas dikunci', 'Jawaban Anda sudah dinilai guru (DIKUNCI) — tidak dapat diubah lagi', 'error');
+    return;
+  }
   // ===== PENGAMAN BATAS WAKTU: tolak pengiriman setelah deadline (juga saat mencoba lewat jalur lain) =====
   if (a && user.role === 'SISWA' && isAssignmentClosed(a)) {
-    showToast('Pengumpulan ditutup', 'Batas waktu (' + formatDate(a.dueDate) + ') sudah terlewat — tugas tidak dapat dikirim atau diubah lagi', 'error');
+    showToast('Pengumpulan ditutup', 'Batas waktu (' + formatDueDateTime(a.dueDate) + ') sudah terlewat — tugas tidak dapat dikirim atau diubah lagi', 'error');
     return;
   }
   const allowedTypes = a.submissionTypes || ['TEXT'];
-  const submissionType = document.getElementById('sd-submissionType')?.value || (allowedTypes.length === 1 ? allowedTypes[0] : 'TEXT');
 
-  // Collect data based on type
-  let content = '', linkUrl = '', fileData = '', fileName = '';
-  if (submissionType === 'TEXT') {
-    content = document.getElementById('sd-content')?.value || '';
-    if (!content.trim()) { showToast('Jawaban kosong', 'Ketik jawaban terlebih dahulu', 'warning'); return; }
-  } else if (submissionType === 'LINK') {
-    linkUrl = document.getElementById('sd-link')?.value || '';
-    if (!linkUrl.trim()) { showToast('Link kosong', 'Masukkan URL terlebih dahulu', 'warning'); return; }
-    content = linkUrl;
-  } else if (submissionType === 'FILE') {
-    const infoDiv = document.getElementById('sd-file-info');
-    fileData = infoDiv?.dataset.fileData || '';
-    fileName = infoDiv?.dataset.fileName || '';
-    if (!fileData) { showToast('File belum dipilih', 'Pilih file terlebih dahulu', 'warning'); return; }
-  } else if (submissionType === 'IMAGE') {
-    const infoDiv = document.getElementById('sd-image-info');
-    fileData = infoDiv?.dataset.fileData || '';
-    fileName = infoDiv?.dataset.fileName || '';
-    if (!fileData) { showToast('Gambar belum dipilih', 'Pilih gambar terlebih dahulu', 'warning'); return; }
+  // ===== KUMPULKAN SEMUA BENTUK YANG TERISI (bukan salah satu): teks + foto + PDF/dokumen + link =====
+  const items = [];
+  if (allowedTypes.includes('TEXT')) {
+    const txt = (document.getElementById('sd-content')?.value || '').trim();
+    if (txt) items.push({ id: uid('sit'), kind: 'TEXT', name: 'Jawaban Teks', text: txt, url: '', size: txt.length });
   }
+  if (allowedTypes.includes('IMAGE')) {
+    ((window._sdState && window._sdState.images) || []).forEach(im => {
+      if (im && im.url) items.push({ id: uid('sit'), kind: 'IMAGE', name: im.name || 'foto tugas', url: im.url, size: im.size || 0 });
+    });
+  }
+  if (allowedTypes.includes('FILE')) {
+    const f = window._sdState && window._sdState.file;
+    if (f && f.url) items.push({ id: uid('sit'), kind: /\.pdf$/i.test(f.name || '') ? 'PDF' : 'FILE', name: f.name, url: f.url, size: f.size || 0 });
+  }
+  if (allowedTypes.includes('LINK')) {
+    let link = (document.getElementById('sd-link')?.value || '').trim();
+    if (link && !/^https?:\/\//i.test(link) && /^[\w-]+(\.[\w-]+)+/.test(link)) link = 'https://' + link; // https:// otomatis
+    if (link) items.push({ id: uid('sit'), kind: 'LINK', name: 'Link', url: link, size: 0 });
+  }
+  if (items.length === 0) {
+    showToast('Belum ada jawaban', 'Isi minimal salah satu bentuk yang diizinkan guru (' + allowedTypes.map(t => (_SUB_KIND_META[t] || { label: t }).label).join(', ') + ')', 'warning');
+    return;
+  }
+  const linkItem = items.find(it => it.kind === 'LINK');
+  if (linkItem && !/^https?:\/\/.+\..+/i.test(linkItem.url)) {
+    showToast('Link tidak valid', 'Link harus berupa URL lengkap, contoh: https://youtu.be/xxxx', 'warning');
+    return;
+  }
+
+  // Sinkron field lama (kompatibilitas laporan/cetak/versi lama)
+  const textItem = items.find(it => it.kind === 'TEXT');
+  const fileItem = items.find(it => it.kind === 'IMAGE' || it.kind === 'PDF' || it.kind === 'FILE');
+  const content = textItem ? textItem.text : (linkItem ? linkItem.url : '');
+  const linkUrl = linkItem ? linkItem.url : '';
+  const fileData = fileItem ? fileItem.url : '';
+  const fileName = fileItem ? fileItem.name : '';
+  const submissionType = items[0].kind === 'TEXT' ? 'TEXT' : items[0].kind === 'LINK' ? 'LINK' : items[0].kind === 'IMAGE' ? 'IMAGE' : 'FILE';
 
   const existing = db.submissions.find(s => s.assignmentId === assignmentId && s.studentId === student.id);
   const subData = {
-    content, linkUrl, fileData, fileName, submissionType,
+    content, linkUrl, fileData, fileName, submissionType, items,
     assignmentTitle: (a?.title || '').slice(0, 200), // jejak judul tugas — dipakai pemulihan bila hubungan putus
     status: 'DIKUMPULKAN', submittedAt: now()
   };
@@ -10367,10 +10772,10 @@ function submitAssignment(assignmentId) {
       ...subData, createdAt: now()
     });
   }
-  db.logs.push({ id: uid('log'), userId: user.id, action: 'SUBMIT TUGAS', detail: 'Mengumpulkan tugas "' + (a?.title || '-') + '"' + (existing ? ' (revisi)' : ''), createdAt: now() });
+  db.logs.push({ id: uid('log'), userId: user.id, action: 'SUBMIT TUGAS', detail: 'Mengumpulkan tugas "' + (a?.title || '-') + '" (' + items.map(it => (_SUB_KIND_META[it.kind] || { label: it.kind }).label).join(' + ') + ')' + (existing ? ' (revisi)' : ''), createdAt: now() });
   saveDB();
   closeModal();
-  showToast('Tugas berhasil dikumpulkan!', '', 'success');
+  showToast('Tugas berhasil dikumpulkan!', items.length + ' bentuk jawaban terkirim: ' + items.map(it => (_SUB_KIND_META[it.kind] || { label: it.kind }).label).join(', '), 'success');
   refreshMainContent();
 }
 
@@ -10380,28 +10785,10 @@ function viewSubmission(subId) {
   const gr = db.grades.find(g => g.submissionId === sub.id);
   const c = db.courses.find(x => x.id === a.courseId);
 
-  // Build submission display based on type
-  let submissionDisplay = '';
-  if (sub.submissionType === 'TEXT' || (!sub.submissionType && sub.content)) {
-    submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1">Jawaban Teks:</p><p class="text-sm whitespace-pre-wrap p-3 bg-gray-50 rounded border">' + (sub.content || '(Tidak ada jawaban)') + '</p>';
-  }
-  if (sub.submissionType === 'LINK' || sub.linkUrl) {
-    submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">Link:</p><a href="' + (sub.linkUrl || sub.content || '') + '" target="_blank" class="inline-flex items-center gap-1 text-sm text-emerald-600 bg-emerald-50 px-3 py-2 rounded border border-emerald-200"><i data-lucide="external-link" style="font-size: 14px;"></i> Buka Link</a>';
-  }
-  if (sub.submissionType === 'FILE' || (sub.fileData && sub.fileName && !/\.(jpg|jpeg|png|gif|webp)$/i.test(sub.fileName))) {
-    if (sub.fileData) {
-      const fileExt = (sub.fileName || '').split('.').pop().toUpperCase();
-      submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">File:</p><a href="' + sub.fileData + '" download="' + (sub.fileName || 'download') + '" class="inline-flex items-center gap-2 text-sm text-white bg-blue-500 px-3 py-2 rounded"><i data-lucide="download" style="font-size: 14px;"></i> ' + (sub.fileName || 'File') + ' <span class="text-xs bg-white/20 px-1.5 py-0.5 rounded">' + fileExt + '</span></a>';
-    }
-  }
-  if (sub.submissionType === 'IMAGE' || (sub.fileData && sub.fileName && /\.(jpg|jpeg|png|gif|webp)$/i.test(sub.fileName))) {
-    if (sub.fileData) {
-      submissionDisplay += '<p class="text-xs font-medium text-gray-500 mb-1 mt-3">Gambar:</p><img src="' + sub.fileData + '" class="w-full max-h-64 object-contain rounded border bg-gray-50">';
-    }
-  }
-  if (!submissionDisplay) {
-    submissionDisplay = '<p class="text-sm text-gray-400 italic">Belum ada jawaban</p>';
-  }
+  // Tampilan SEMUA bentuk jawaban siswa (dengan lampiran dari guru)
+  const submissionDisplay = renderAttachmentView(a.attachments)
+    + '<p class="text-xs font-medium text-gray-500 mb-1.5 mt-1 flex items-center gap-1"><i data-lucide="upload" style="font-size:12px;"></i> Jawaban Anda:</p>'
+    + renderSubmissionItemsView(sub);
 
   const body = `
     <div class="space-y-4">
@@ -10409,7 +10796,7 @@ function viewSubmission(subId) {
         <p class="text-sm font-medium mb-2">Instruksi:</p>
         <p class="text-sm">${a.description}</p>
       </div>
-      ${gr ? '<div class="p-4 rounded-lg bg-emerald-50 border border-emerald-200"><div class="flex items-center justify-between mb-2"><p class="text-sm font-medium text-emerald-700">Nilai Anda</p>' + badge(gr.score + ' - ' + gr.grade, 'default') + '</div><p class="text-sm text-emerald-800">' + gr.feedback + '</p></div>' : ''}
+      ${gr ? '<div class="p-4 rounded-lg bg-emerald-50 border border-emerald-200"><div class="flex items-center justify-between mb-2"><p class="text-sm font-medium text-emerald-700">Nilai Anda</p><div class="flex items-center gap-1.5">' + badge(gr.score + ' - ' + gr.grade, 'default') + badge('DIKUNCI', 'secondary') + '</div></div><p class="text-sm text-emerald-800">' + gr.feedback + '</p></div>' : ''}
       ${submissionDisplay}
     </div>
   `;
