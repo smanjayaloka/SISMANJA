@@ -740,6 +740,9 @@ var _dbLocalDirtyAt = 0;     // ms terakhir kali data lokal berubah (penanda ant
 var _lastCloudMetaMs = 0;    // waktu meta cloud terbaru yang pernah dilihat tab ini (anti snapshot basi)
 var _lastRtdbMetaMs = 0;     // waktu meta backup RTDB terbaru yang pernah dilihat tab ini
 var _cloudPushInFlight = false; // push batch ke Firestore sedang berjalan (belum dikonfirmasi server)
+var _cloudPushSentMs = 0;       // waktu batch push terakhir DIMULAI — isinya sudah mencakup semua data saat itu
+var _subDeliveredUntil = 0;     // watermark: SEMUA pengumpulan tugas dengan createdAt <= nilai ini terkonfirmasi ada di cloud
+var _subDeliveredIds = {};      // daftar id pengumpulan yang terkonfirmasi ada di cloud (diadopsi dari snapshot server)
 var _rsNewDataAvail = false;    // data terbaru sudah diterima di latar belakang — menunggu tombol Sinkron
 var _rsNotifyAt = 0;            // throttle info "data baru tersedia" (anti spam toast)
 
@@ -1510,6 +1513,7 @@ function handleCloudSnapshot() {
     _lastCloudMetaMs = metaMs;
     cloudEmptyConfirmed = false;
     if (adoptCloudData(data, true)) {
+      stampSubsDeliveredFromCloud(data); // STATUS KIRIM: semua pengumpulan dalam cloud server = terkirim
       updateOnlineGate(); // sembunyikan layar "menghubungkan" — data sudah siap
       if (session) rsNotifyNewData('perangkat lain');
       else { try { renderLanding(); lucide.createIcons(); } catch (e) { /* abaikan */ } } // halaman depan terbuka — konten cloud langsung tampil
@@ -1533,8 +1537,9 @@ function handleCloudSnapshot() {
     cloudSnapshotBuffer = docs;
     return;
   }
-  if (stableStringify(data) === stableStringify(db)) { _lastCloudMetaMs = metaMs; return; } // tulisan sendiri / tidak ada perubahan
+  if (stableStringify(data) === stableStringify(db)) { stampSubsDeliveredFromCloud(data); _lastCloudMetaMs = metaMs; return; } // tulisan sendiri / tidak ada perubahan — isi cloud sama dgn lokal
   const changed = adoptCloudData(data); // MERGE anti-hilang: record lokal & cloud tidak ada yang hilang
+  stampSubsDeliveredFromCloud(data); // STATUS KIRIM: pengumpulan yang ada di salinan cloud = terkonfirmasi terkirim
   _lastCloudMetaMs = metaMs; // catat meta cloud yang sudah diterima
   if (changed) {
     // PERBAIKAN KONEKSI (anti-gema): hanya tulis balik ke cloud bila hasil gabungan
@@ -1905,6 +1910,7 @@ function saveToCloud(immediate) {
   try {
     const json = JSON.stringify(db);
     const sentMs = Date.now(); // updatedAt meta = waktu kirim ini (dipakai anti-revert)
+    _cloudPushSentMs = sentMs; // status "Sedang Mengirim" tugas siswa: semua data saat ini sudah ikut dalam batch
     const total = Math.max(1, Math.ceil(json.length / CLOUD_FS_CHUNK));
     const col = firebaseFS.collection(CLOUD_FS_COL);
     const batch = firebaseFS.batch();
@@ -1924,7 +1930,9 @@ function saveToCloud(immediate) {
       cloudPendingPush = false;
       _cloudPushInFlight = false;
       _lastCloudMetaMs = sentMs; // server kini berisi tulisan kita — snapshot echo dengan waktu ini tidak dianggap lebih baru
+      _subDeliveredUntil = sentMs; // STATUS KIRIM: seluruh pengumpulan yang dibuat sebelum titik ini PASTI sudah ada di cloud
       console.log('[Firebase] Data terkirim ke cloud (' + Math.round(json.length / 1024) + ' KB)');
+      try { _notifyStudentDeliveryUpdate(); } catch (e) { /* abaikan */ } // segarkan badge "Terkirim/Belum Terkirim" bila siswa sedang melihat halaman Tugas
       // PERBAIKAN: perubahan hasil pemulihan kotak hitam sudah benar-benar aman di server
       if (_emergencyClearAfterPush) { _emergencyClearAfterPush = false; clearEmergencySnapshot(); }
     }).catch(function(err) {
@@ -1940,6 +1948,107 @@ function saveToCloud(immediate) {
     if (!isCloudDisabled()) cloudPendingPush = true; // PERBAIKAN: gagal kirim → catat antrean
     handleCloudError(e, false);
   }
+}
+
+/* ============ STATUS KIRIM TUGAS SISWA (Terkirim / Sedang Mengirim / Belum Terkirim) ============ */
+/* Tujuan: siswa tahu apakah jawabannya BENAR-BENAR sudah sampai ke server cloud (dan akun
+   guru), bukan sekadar tersimpan di perangkat. Bila belum → halaman Tugas menampilkan
+   peringatan "TUGAS BELUM TERKIRIM" + tombol "Kirim Ulang" agar siswa dapat mengirim lagi. */
+
+// Catat seluruh pengumpulan yang ADA DI DALAM salinan cloud → terkonfirmasi terkirim.
+// Dipanggil setiap kali data cloud server diadopsi (snapshot realtime / tarik manual).
+function stampSubsDeliveredFromCloud(data) {
+  try {
+    if (!data || !Array.isArray(data.submissions)) return;
+    let maxTs = 0;
+    data.submissions.forEach(function(s) {
+      if (!s || !s.id) return;
+      _subDeliveredIds[s.id] = true;
+      const ts = Date.parse(s.createdAt || s.submittedAt) || 0;
+      if (ts > maxTs) maxTs = ts;
+    });
+    if (maxTs > _subDeliveredUntil) _subDeliveredUntil = maxTs;
+  } catch (e) { /* abaikan */ }
+}
+
+// Status kirim satu pengumpulan: 'TERKIRIM' | 'MENGIRIM' | 'BELUM' | 'LOKAL'
+function submissionSendState(sub) {
+  try {
+    if (!sub) return 'TERKIRIM';
+    if (typeof isCloudDisabled === 'function' && isCloudDisabled()) return 'LOKAL'; // mode lokal: sinkron dimatikan pengguna
+    if (sub.status === 'DINILAI') return 'TERKIRIM'; // sudah dinilai guru = pasti sudah sampai
+    const ts = Date.parse(sub.createdAt || sub.submittedAt) || 0;
+    if (!ts) return 'TERKIRIM'; // data lama tanpa jejak waktu — jangan beri alarm palsu
+    if (_subDeliveredIds[sub.id] || (ts && ts <= (_subDeliveredUntil || 0))) return 'TERKIRIM';
+    if (_cloudPushInFlight && ts && ts <= (_cloudPushSentMs || 0)) return 'MENGIRIM';
+    return 'BELUM';
+  } catch (e) { return 'TERKIRIM'; } // gagal hitung → jangan beri alarm palsu
+}
+
+// Jumlah pengumpulan milik siswa yang aktif yang belum terkonfirmasi terkirim
+function countUndeliveredSubs() {
+  try {
+    if (!db || !Array.isArray(db.submissions)) return 0;
+    const u = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+    if (!u) return 0;
+    const st = (db.students || []).find(function(s) { return s.userId === u.id; });
+    if (!st) return 0;
+    return db.submissions.filter(function(s) { return s.studentId === st.id && submissionSendState(s) === 'BELUM'; }).length;
+  } catch (e) { return 0; }
+}
+
+// Setelah push sukses: bila siswa sedang membuka halaman Tugas/Dashboard → segarkan badge status kirim
+function _notifyStudentDeliveryUpdate() {
+  try {
+    if (typeof uiState === 'undefined' || !uiState) return;
+    const u = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+    if (!u || u.role !== 'SISWA') return;
+    if (uiState.currentPage !== 'tugas' && uiState.currentPage !== 'dashboard') return;
+    if (typeof refreshMainContent === 'function') refreshMainContent();
+  } catch (e) { /* abaikan */ }
+}
+
+// Tombol "KIRIM ULANG" — kirim paksa sekarang + sinyal ke akun guru + catat log
+function resendSubmission(subId) {
+  const user = getCurrentUser();
+  const sub = db.submissions.find(function(s) { return s.id === subId; });
+  if (!sub) { showToast('Tidak ditemukan', 'Pengumpulan tugas tidak ditemukan', 'error'); return; }
+  const a = db.assignments.find(function(x) { return x.id === sub.assignmentId; });
+  const st = db.students.find(function(s) { return s.id === sub.studentId; });
+  try { saveToCloud(true); } catch (e) { /* antre otomatis */ }
+  try { saveToRTDB(true); } catch (e) { /* antre otomatis */ }
+  try { writeSignal('submission', { title: (a && a.title) || sub.assignmentTitle || '-', assignmentId: sub.assignmentId, studentName: (st && st.name) || (user && user.name) || 'Siswa' }); } catch (e) { /* abaikan */ }
+  try {
+    db.logs.push({ id: uid('log'), userId: user.id, action: 'KIRIM ULANG TUGAS', detail: 'Mengirim ulang tugas "' + ((a && a.title) || sub.assignmentTitle || '-') + '" yang belum terkirim', createdAt: now() });
+    saveDB();
+  } catch (e) { /* abaikan */ }
+  if (submissionSendState(sub) === 'MENGIRIM') {
+    showToast('Mengirim ulang...', 'Jawaban Anda sedang dikirim ke server — status akan berubah menjadi Terkirim dalam beberapa detik', 'info');
+  } else {
+    showToast('Antrean pengiriman dibuat', 'Jawaban otomatis terkirim begitu internet/server tersambung. Pantau status di halaman Tugas.', 'info');
+  }
+  refreshMainContent();
+}
+
+// Badge kecil status kirim (baris badge kartu tugas di halaman Tugas siswa)
+function subDeliveryBadgeHTML(sub) {
+  const st = submissionSendState(sub);
+  if (st === 'TERKIRIM') return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-emerald-50 text-emerald-700 border border-emerald-200" title="Jawaban sudah sampai ke server &amp; akun guru"><i data-lucide="check-circle-2" style="font-size: 12px;"></i> Terkirim ke Guru</span>';
+  if (st === 'MENGIRIM') return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-amber-50 text-amber-700 border border-amber-200" title="Sedang dikirim ke server"><i data-lucide="cloud-upload" style="font-size: 12px;"></i> Sedang Mengirim...</span>';
+  if (st === 'BELUM') return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-red-100 text-red-700 border border-red-300 font-semibold" title="Jawaban belum sampai ke server/akun guru"><i data-lucide="cloud-off" style="font-size: 12px;"></i> BELUM TERKIRIM</span>';
+  return '';
+}
+
+// Banner peringatan "TUGAS BELUM TERKIRIM" + tombol Kirim Ulang (kartu tugas siswa)
+function subDeliveryBannerHTML(sub) {
+  if (submissionSendState(sub) !== 'BELUM') return '';
+  return '<div class="mt-2 p-3 rounded-lg bg-red-50 border border-red-200 flex items-start justify-between gap-3">' +
+    '<div class="text-xs text-red-700 min-w-0">' +
+      '<p class="font-bold flex items-center gap-1"><i data-lucide="alert-triangle" style="font-size: 14px; flex-shrink:0;"></i> TUGAS BELUM TERKIRIM ke akun guru</p>' +
+      '<p class="mt-0.5">Jawaban masih tersimpan di perangkat ini saja. Klik <b>Kirim Ulang</b> sekarang, atau biarkan — otomatis terkirim begitu internet/server tersambung.</p>' +
+    '</div>' +
+    '<button onclick="resendSubmission(\'' + sub.id + '\')" class="flex-shrink-0 px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white text-xs rounded-md font-semibold flex items-center gap-1"><i data-lucide="send" style="font-size: 12px;"></i> Kirim Ulang</button>' +
+  '</div>';
 }
 
 function loadFromCloud(callback) {
@@ -1965,7 +2074,9 @@ function loadFromCloud(callback) {
         }
         if (ok) {
           try {
-            adoptCloudData(JSON.parse(json));
+            const parsedCloud = JSON.parse(json);
+            adoptCloudData(parsedCloud);
+            stampSubsDeliveredFromCloud(parsedCloud); // STATUS KIRIM: data server terbaca = terkonfirmasi
             callback(true);
             return;
           } catch (e) { console.warn('[Firebase] Data cloud tidak dapat dibaca:', e.message); }
@@ -10471,6 +10582,7 @@ window.SISWA_PAGES = {
     const assignments = db.assignments.filter(a => courseIds.includes(a.courseId) && a.status === 'AKTIF');
     const mySubs = db.submissions.filter(s => s.studentId === student?.id);
     const myGrades = db.grades.filter(g => g.studentId === student?.id);
+    const belumKirim = countUndeliveredSubs();
     const avg = myGrades.length ? Math.round(myGrades.reduce((s, g) => s + g.score, 0) / myGrades.length) : 0;
     const urgent = assignments.filter(a => {
       const sub = mySubs.find(s => s.assignmentId === a.id);
@@ -10481,7 +10593,7 @@ window.SISWA_PAGES = {
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         ${statCard('Mata Pelajaran', courses.length, 'book-open', 'emerald')}
         ${statCard('Tugas Aktif', assignments.length, 'list-checks', 'amber')}
-        ${statCard('Sudah Dikumpulkan', mySubs.length, 'check-circle', 'teal')}
+        ${statCard('Sudah Dikumpulkan', mySubs.length, 'check-circle', 'teal', belumKirim > 0 ? belumKirim + ' BELUM TERKIRIM' : '')}
         ${statCard('Rata-rata Nilai', avg, 'award', 'violet')}
       </div>
       <div class="grid lg:grid-cols-2 gap-6">
@@ -10627,6 +10739,7 @@ window.SISWA_PAGES = {
                   ${isGraded ? '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-emerald-500 text-white"><i data-lucide="check-circle" style="font-size: 12px;"></i> DINILAI</span>' : ''}
                   ${gr ? '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-emerald-50 text-emerald-700 border border-emerald-200">Nilai: ' + gr.score + ' (' + gr.grade + ')</span>' : ''}
                   ${attCountBadge(a.attachments)}
+                  ${sub && !isGraded ? subDeliveryBadgeHTML(sub) : ''}
                 </div>
                 <h3 class="font-semibold mb-1">${a.title}</h3>
                 <p class="text-sm text-gray-500 line-clamp-2 mb-2">${a.description}</p>
@@ -10635,6 +10748,7 @@ window.SISWA_PAGES = {
                   <span class="flex items-center gap-1" title="Bentuk jawaban yang diizinkan guru"><i data-lucide="upload" style="font-size: 12px;"></i>${(a.submissionTypes || ['TEXT']).map(t => (_SUB_KIND_META[t] || { label: t }).label).join(' · ')}</span>
                   <span class="flex items-center gap-1"><i data-lucide="award" style="font-size: 12px;"></i>Max: ${a.maxScore}</span>
                 </div>
+                ${sub ? subDeliveryBannerHTML(sub) : ''}
               </div>
               <div class="flex-shrink-0">
                 ${isGraded ?
@@ -11165,7 +11279,15 @@ function submitAssignment(assignmentId) {
   try { saveToRTDB(true); } catch (e) { /* antre otomatis */ }
   try { writeSignal('submission', { title: (a?.title || '-'), assignmentId: assignmentId, studentName: (student && student.name) || user.name || 'Siswa' }); } catch (e) { /* abaikan */ }
   closeModal();
-  showToast('Tugas berhasil dikumpulkan!', items.length + ' bentuk jawaban terkirim: ' + items.map(it => (_SUB_KIND_META[it.kind] || { label: it.kind }).label).join(', '), 'success');
+  // STATUS KIRIM JUJUR: bila internet/server terputus saat menekan kirim, jangan bilang "berhasil
+  // terkirim" — tampilkan peringatan BELUM TERKIRIM + arahkan ke tombol Kirim Ulang di halaman Tugas.
+  const _sentSub = db.submissions.find(s => s.assignmentId === assignmentId && s.studentId === student.id);
+  const _sendSt = submissionSendState(_sentSub);
+  if (_sendSt === 'BELUM') {
+    showToast('Tugas tersimpan — BELUM TERKIRIM', 'Jawaban aman di perangkat ini tetapi belum sampai ke akun guru (internet/server terputus). Buka menu Tugas lalu klik "Kirim Ulang", atau biarkan — otomatis terkirim saat tersambung.', 'warning');
+  } else {
+    showToast('Tugas berhasil dikumpulkan!', items.length + ' bentuk jawaban terkirim: ' + items.map(it => (_SUB_KIND_META[it.kind] || { label: it.kind }).label).join(', '), 'success');
+  }
   refreshMainContent();
 }
 
@@ -11180,7 +11302,12 @@ function viewSubmission(subId) {
     + '<p class="text-xs font-medium text-gray-500 mb-1.5 mt-1 flex items-center gap-1"><i data-lucide="upload" style="font-size:12px;"></i> Jawaban Anda:</p>'
     + renderSubmissionItemsView(sub);
 
+  const _sendStV = submissionSendState(sub);
+  const sendWarn = _sendStV === 'BELUM'
+    ? '<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 flex items-start gap-1"><i data-lucide="alert-triangle" style="font-size:14px;margin-top:1px;flex-shrink:0;"></i><span><b>TUGAS BELUM TERKIRIM</b> ke akun guru — jawaban masih tersimpan di perangkat ini. Klik <b>Kirim Ulang</b> di bawah, atau biarkan otomatis terkirim saat internet tersambung.</span></div>' : '';
+
   const body = `
+    ${sendWarn}
     <div class="space-y-4">
       <div class="p-4 rounded-lg bg-gray-50 border">
         <p class="text-sm font-medium mb-2">Instruksi:</p>
@@ -11190,7 +11317,7 @@ function viewSubmission(subId) {
       ${submissionDisplay}
     </div>
   `;
-  showModal(a.title, body, btn('Tutup', 'closeModal()'), 'max-w-2xl');
+  showModal(a.title, body, btn('Tutup', 'closeModal()') + (_sendStV === 'BELUM' ? ' ' + btn('Kirim Ulang', "resendSubmission('" + sub.id + "')", { icon: 'send' }) : ''), 'max-w-2xl');
 }
 
 /* ============================================================
