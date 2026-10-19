@@ -441,14 +441,17 @@
         </button>
       </div>
       <div class="relative">
-        <button onclick="toggleNotifications(event)" class="p-2 hover:bg-gray-100 rounded-md relative">
+        <button onclick="toggleNotifications(event)" class="p-2 hover:bg-gray-100 rounded-md relative" title="Notifikasi">
           <i data-lucide="bell" style="font-size: 20px;"></i>
-          <span id="notif-badge" class="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full hidden"></span>
+          <span id="notif-badge" class="absolute top-0.5 right-0.5 min-w-[17px] h-[17px] px-1 bg-red-500 text-white text-[10px] font-bold rounded-full items-center justify-center leading-none" style="display:none;">0</span>
         </button>
         <div id="notif-dropdown" class="hidden absolute right-0 mt-2 w-80 max-w-[calc(100vw-1.5rem)] bg-white rounded-lg shadow-lg border z-50">
           <div class="p-3 border-b flex items-center justify-between">
             <p class="font-semibold text-sm">Notifikasi</p>
-            <span id="notif-count" class="text-xs px-2 py-1 bg-gray-100 rounded">0</span>
+            <div class="flex items-center gap-2">
+              <button onclick="markAllNotifsRead(event)" class="text-xs text-emerald-600 hover:text-emerald-700 font-medium flex items-center gap-1" title="Tandai semua sudah dibaca"><i data-lucide="check-check" style="font-size: 13px;"></i> Tandai dibaca</button>
+              <span id="notif-count" class="text-xs px-2 py-1 bg-gray-100 rounded">0</span>
+            </div>
           </div>
           <div id="notif-list" class="max-h-80 overflow-y-auto"></div>
         </div>
@@ -602,9 +605,26 @@ function saveDB() {
   // ===== FULL ONLINE (Task 16): perubahan langsung ke CLOUD, bukan browser =====
   if (!db || !isValidDatabase(db)) return;
   _dbLocalDirtyAt = Date.now(); // catat: data baru saja berubah (anti-revert cloud)
-  saveToCloud(); // kirim ke cloud (otomatis antre bila koneksi sedang terputus)
-  saveToRTDB();  // backup ke Realtime Database — salinan cadangan online kedua
+  // ===== REALTIME INSTAN — perbaikan "data langsung disimpan ke database" =====
+  // Dulu SEMUA perubahan menunggu debounce 900ms/1400ms dulu; aksi tunggal
+  // (simpan absensi, tambah materi, buat pengumuman, dsb.) baru benar-benar
+  // sampai ke database cloud ±1 detik kemudian dan bisa tertinggal bila tab
+  // langsung ditutup. Kini bila koneksi cloud sehat dan tidak ada push yang
+  // sedang berjalan, data dikirim SEGERA tanpa menunggu. Bila push sedang
+  // berjalan / koneksi terputus → jalur debounce + antre otomatis dipakai,
+  // sehingga perubahan beruntun tetap digabung dan tidak ada yang hilang.
+  if (isCloudConnected() && !_cloudPushInFlight && !cloudPushTimer) {
+    try { saveToCloud(true); } catch (e) { try { saveToCloud(); } catch (e2) { /* abaikan */ } }
+  } else {
+    saveToCloud(); // kirim ke cloud (otomatis antre bila koneksi sedang terputus)
+  }
+  if (isRtdbActive() && !rtdbPushTimer) {
+    try { saveToRTDB(true); } catch (e) { try { saveToRTDB(); } catch (e2) { /* abaikan */ } }
+  } else {
+    saveToRTDB();  // backup ke Realtime Database — salinan cadangan online kedua
+  }
   rsNoteLocalWrite(); // tandai isi database terakhir yang diketahui tab ini (realtime sync)
+  try { if (typeof cdbMaybeAutoBackup === 'function') cdbMaybeAutoBackup(); } catch (e) { /* abaikan */ } // DATABASE BESAR: cadangan harian otomatis ke penyimpanan awan 25 GB
   // CATATAN: tampilan TIDAK di-refresh otomatis lagi. Setiap aksi pengguna (tambah/edit/hapus)
   // memperbarui halamannya masing-masing lewat refresh eksplisit di handler-nya, dan perubahan
   // dari luar ditampilkan lewat tombol "Sinkron" di bilah atas — agar halaman tidak ter-reset
@@ -767,6 +787,7 @@ function rsPageWantsLiveRefresh() {
 function rsNotifyNewData(source) {
   _rsNewDataAvail = true;
   updateSyncIndicator();
+  try { if (typeof updateStaffNotifBadge === 'function') updateStaffNotifBadge(); } catch (e) { /* abaikan */ } // data baru masuk → segarkan badge lonceng guru
   if (!session) return;
   // ===== REALTIME: halaman live di-refresh otomatis (rsApplyUI melindungi isian form
   // & menunda bila modal terbuka/user sedang mengetik, jadi aman) =====
@@ -1698,6 +1719,7 @@ function handlePeerSignal(sig) {
       if (!ok && cloudSnapshotBuffer) { try { handleCloudSnapshot(); } catch (e) { /* abaikan */ } }
       if (!document.getElementById('live-room-overlay')) rsScheduleUI(150);
       updateSyncIndicator();
+      try { if (typeof updateStaffNotifBadge === 'function') updateStaffNotifBadge(); } catch (e) { /* abaikan */ } // sinyal "siswa mengumpulkan tugas" → badge lonceng guru bertambah segera
     });
     // 2) Notifikasi sesuai jenis sinyal
     if (sig.type === 'submission' && isStaff) {
@@ -3105,6 +3127,239 @@ function toggleRtdbStatus(e) {
 }
 
 /* ============================================================
+   DATABASE BESAR — PENYIMPANAN AWAN 25 GB (CLOUDINARY)
+   Tujuan: penyimpanan database TAMBAHAN berkapasitas PALING BESAR
+   yang berjalan TANPA KENDALA — TANPA OAuth, TANPA verifikasi
+   Google, TANPA kartu kredit. Konfigurasi akun Cloudinary sekolah
+   (SMAN JAYALOKA) sudah TERTANAM di aplikasi — diadopsi otomatis
+   di setiap perangkat baru tanpa perlu mengisi apa pun.
+   - Backup: manual (tombol) + OTOMATIS harian mengikuti perubahan
+     database (maks 1x per 20 jam, nama file sija_db_harian_[tanggal])
+   - Snapshot manual bernama sija_db_snapshot_[tanggal_jam]
+   - Bila nama harian sudah terpakai → otomatis pindah ke nama
+     ber-stempel waktu (tidak pernah gagal karena tabrakan nama)
+   - Pulihkan: ambil backup terbaru yang dikenal perangkat ini, atau
+     periksa nama harian 14 hari ke belakang; digabung anti-hilang
+   ============================================================ */
+const CDB_CONFIG_KEY = 'sija_cdb_config_v1'; // { cloudName, preset }
+const CDB_META_KEY   = 'sija_cdb_meta_v1';   // { lastName, lastAt }
+const CDB_AUTO_KEY   = 'sija_cdb_auto_v1';   // '0' = backup otomatis mati
+const CDB_PREFIX     = 'sija_db';
+const CDB_MAX_CAPACITY_BYTES = 25 * 1073741824; // 25 GB — kuota gratis Cloudinary
+const CDB_AUTO_MIN_MS = 20 * 60 * 60 * 1000;    // jeda minimal backup otomatis (harian)
+const CDB_PROBE_DAYS  = 14;                     // rentang pencarian backup saat pulihkan
+// Konfigurasi bawaan akun Cloudinary sekolah — disiapkan sekolah, tertanam di aplikasi
+const CDB_DEFAULT_CLOUD_NAME = 'sman-jayaloka';
+const CDB_DEFAULT_PRESET     = 'sistem-informasi-sekolah-smanja';
+const CDB_ADOPT_KEY = 'sija_cdb_adopted_v1';    // penanda: bawaan sudah pernah diadopsi di perangkat ini
+
+let cdbAuto = true;           // backup otomatis harian (default AKTIF setelah dikonfigurasi)
+let cdbError = '';
+let cdbLastPushAt = '';       // waktu backup terakhir (ISO)
+let cdbLastFileId = '';       // public_id backup terakhir yang diketahui
+let _cdbLastAutoAt = 0;
+
+// Rapikan isian identitas Cloudinary: buang spasi di tepi, spasi di tengah → tanda minus.
+// Cloud Name dikecilkan semua (aturan Cloudinary); ejaan nama preset dipertahankan.
+function _cdbCleanId(v, lower) {
+  let s = String(v == null ? '' : v).trim().replace(/\s+/g, '-');
+  return lower ? s.toLowerCase() : s;
+}
+
+function loadCdbConfig() {
+  try { const c = JSON.parse(localStorage.getItem(CDB_CONFIG_KEY) || 'null'); return (c && c.cloudName && c.preset) ? c : null; } catch (e) { return null; }
+}
+function saveCdbConfig(cloudName, preset) {
+  try { localStorage.setItem(CDB_CONFIG_KEY, JSON.stringify({ cloudName: _cdbCleanId(cloudName, true), preset: _cdbCleanId(preset, false) })); } catch (e) { /* abaikan */ }
+}
+function isCdbConfigured() { return !!loadCdbConfig(); }
+function saveCdbMeta(meta) { try { localStorage.setItem(CDB_META_KEY, JSON.stringify(meta || {})); } catch (e) { /* abaikan */ } }
+function loadCdbMeta() { try { return JSON.parse(localStorage.getItem(CDB_META_KEY) || 'null') || null; } catch (e) { return null; } }
+(function _cdbInitMeta() { const m = loadCdbMeta(); if (m) { cdbLastPushAt = m.lastAt || ''; cdbLastFileId = m.lastName || ''; } })();
+(function _cdbInitAuto() { try { cdbAuto = localStorage.getItem(CDB_AUTO_KEY) !== '0'; } catch (e) { cdbAuto = true; } })();
+
+// Konfigurasi bawaan SMAN JAYALOKA — diadopsi otomatis SEKALI di setiap perangkat
+// baru (tanpa klik apa pun), lalu backup pertama dikirim ±8 detik setelah aplikasi
+// terbuka. Setelah "Hapus Pengaturan", bawaan TIDAK diadopsi ulang (hormati keputusan).
+(function _cdbAdoptDefault() {
+  try {
+    if (loadCdbConfig() || localStorage.getItem(CDB_ADOPT_KEY) === '1') return;
+    saveCdbConfig(CDB_DEFAULT_CLOUD_NAME, CDB_DEFAULT_PRESET);
+    try { localStorage.setItem(CDB_ADOPT_KEY, '1'); } catch (e) { /* abaikan */ }
+    setTimeout(function() {
+      try {
+        if (!isCdbConfigured() || Date.now() - _cdbLastAutoAt < CDB_AUTO_MIN_MS) return;
+        _cdbLastAutoAt = Date.now();
+        cdbBackupNow(true); // backup pertama = snapshot + notifikasi, agar pengguna langsung yakin
+      } catch (e) { /* abaikan */ }
+    }, 8000);
+  } catch (e) { /* abaikan */ }
+})();
+
+// Stempel waktu "YYYY-MM-DD_HHmmss" untuk nama file backup
+function _cdbStamp() {
+  const d = new Date(), p = function(n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+// Simpan konfigurasi dari formulir halaman Database & Cloud + backup pertama langsung jalan
+function saveCdbConfigFromForm() {
+  const cn = document.getElementById('cdb-cloud-name');
+  const pr = document.getElementById('cdb-preset');
+  const cloudName = _cdbCleanId(cn && cn.value, true);
+  const preset = _cdbCleanId(pr && pr.value, false);
+  if (!cloudName || !/^[a-z0-9-]{3,32}$/.test(cloudName) || !preset) {
+    showToast('Pengaturan belum lengkap', 'Isi Cloud Name (huruf kecil/angka/tanda minus, contoh: sman-jayaloka) dan Nama Upload Preset. Spasi otomatis diubah menjadi tanda minus.', 'warning');
+    return;
+  }
+  saveCdbConfig(cloudName, preset);
+  cdbError = '';
+  showToast('Database Besar siap!', 'Penyimpanan awan 25 GB aktif — backup pertama sedang dikirim. Backup otomatis harian juga berjalan.', 'success');
+  if (typeof refreshMainContent === 'function') refreshMainContent();
+  try { cdbBackupNow(true); } catch (e) { /* abaikan */ }
+}
+
+// Hapus pengaturan Database Besar dari perangkat ini
+function cdbResetConfig() {
+  try { localStorage.removeItem(CDB_CONFIG_KEY); localStorage.removeItem(CDB_META_KEY); } catch (e) { /* abaikan */ }
+  cdbError = ''; cdbLastPushAt = ''; cdbLastFileId = ''; _cdbLastAutoAt = 0;
+  showToast('Pengaturan Database Besar dihapus', 'Konfigurasi penyimpanan awan dihapus dari perangkat ini. Firestore & RTDB tetap berjalan normal.', 'info');
+  if (typeof refreshMainContent === 'function') refreshMainContent();
+}
+
+// URL unduh (delivery) file backup di penyimpanan awan
+function cdbDeliveryUrl(publicId) {
+  const cfg = loadCdbConfig(); if (!cfg) return '';
+  return 'https://res.cloudinary.com/' + encodeURIComponent(cfg.cloudName) + '/raw/upload/' + encodeURIComponent(publicId);
+}
+
+// Unggah 1 file backup ke penyimpanan awan (multipart, tanpa auth — preset Unsigned)
+function cdbUpload(publicId, json, manual, isRetry) {
+  const cfg = loadCdbConfig(); if (!cfg) return;
+  try {
+    const fd = new FormData();
+    fd.append('upload_preset', cfg.preset);
+    fd.append('public_id', publicId);
+    fd.append('file', (typeof Blob !== 'undefined') ? new Blob([json], { type: 'application/json' }) : json);
+    fetch('https://api.cloudinary.com/v1_1/' + encodeURIComponent(cfg.cloudName) + '/raw/upload', { method: 'POST', body: fd })
+      .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, body: j }; }); })
+      .then(function(res) {
+        if (res.ok && res.body && res.body.public_id) { _cdbUploadDone(res.body, json.length, manual); return; }
+        const msg = (res.body && res.body.error && res.body.error.message) || ('Server menolak (HTTP ' + (res.ok ? '200-tanpa-data' : '?') + ')');
+        if (!isRetry && /already exists/i.test(msg)) {
+          // Nama harian sudah terpakai hari ini → ulangi dengan nama ber-stempel waktu
+          cdbUpload(CDB_PREFIX + '_harian_' + _cdbStamp(), json, manual, true);
+          return;
+        }
+        _cdbUploadFail(new Error(msg), manual);
+      })
+      .catch(function(err) { _cdbUploadFail(err, manual); });
+  } catch (e) { _cdbUploadFail(e, manual); }
+}
+function _cdbUploadDone(info, len, manual) {
+  cdbLastPushAt = new Date().toISOString();
+  cdbLastFileId = (info && info.public_id) || cdbLastFileId;
+  cdbError = '';
+  saveCdbMeta({ lastName: cdbLastFileId, lastAt: cdbLastPushAt });
+  if (manual) showToast('Backup Database Besar selesai', 'Database (' + Math.round(len / 1024) + ' KB) tersimpan ke penyimpanan awan 25 GB sebagai "' + cdbLastFileId + '".', 'success');
+  console.log('[CDB] Backup database tersimpan ke penyimpanan awan 25 GB (' + Math.round(len / 1024) + ' KB)');
+  updateCdbStatusUI();
+}
+function _cdbUploadFail(err, manual) {
+  cdbError = (err && err.message) || 'jaringan bermasalah';
+  if (manual) showToast('Backup Database Besar gagal', cdbError + ' — periksa Cloud Name & Upload Preset sesuai panduan, lalu coba lagi.', 'error');
+  updateCdbStatusUI();
+}
+
+// Backup sekarang — manual = snapshot ber-stempel waktu; otomatis = 1 file harian
+function cdbBackupNow(manual) {
+  if (!db || !isValidDatabase(db)) return;
+  const cfg = loadCdbConfig();
+  if (!cfg) {
+    if (manual) showToast('Database Besar belum diatur', 'Isi Cloud Name & Upload Preset pada formulir Database Besar di bawah (lihat panduannya).', 'warning');
+    return;
+  }
+  cdbError = '';
+  const publicId = manual ? (CDB_PREFIX + '_snapshot_' + _cdbStamp()) : (CDB_PREFIX + '_harian_' + _cdbStamp().slice(0, 10));
+  cdbUpload(publicId, JSON.stringify(db), manual, false);
+}
+
+// Cari nama backup terbaru: meta lokal dulu, bila tidak ada periksa nama harian 14 hari ke belakang
+function cdbLatestName(cb) {
+  const m = loadCdbMeta();
+  if (m && m.lastName) { cb(m.lastName, m.lastAt || ''); return; }
+  let i = 0;
+  (function next() {
+    if (i >= CDB_PROBE_DAYS) { cb('', ''); return; }
+    const d = new Date(Date.now() - i * 86400000), p = function(n) { return (n < 10 ? '0' : '') + n; };
+    const name = CDB_PREFIX + '_harian_' + d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+    i++;
+    fetch(cdbDeliveryUrl(name)).then(function(r) {
+      if (!r.ok) { next(); return null; }
+      cb(name, new Date().toISOString()); return null;
+    }).catch(function() { next(); });
+  })();
+}
+
+// Pulihkan database dari backup terbaru di penyimpanan awan (gabung anti-hilang)
+function cdbRestoreNow() {
+  if (!isCdbConfigured()) { showToast('Database Besar belum diatur', 'Isi Cloud Name & Upload Preset pada formulir di bawah terlebih dahulu.', 'warning'); return; }
+  confirmDialog('Pulihkan dari Database Besar', 'Backup terbaru di penyimpanan awan 25 GB akan DIGABUNGKAN dengan data saat ini — record yang hilang ditambahkan kembali, data saat ini tidak terhapus. Melanjutkan?', function() {
+    cdbLatestName(function(name) {
+      if (!name) { showToast('Backup tidak ditemukan', 'Belum ada backup "sija_db_*" di penyimpanan awan. Lakukan backup terlebih dahulu.', 'warning'); return; }
+      fetch(cdbDeliveryUrl(name))
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+        .then(function(txt) {
+          const data = JSON.parse(txt);
+          if (!isValidDatabase(data)) throw new Error('Isi backup bukan database sekolah yang sah');
+          adoptCloudData(data);
+          saveDB();
+          if (typeof renderApp === 'function') renderApp();
+          if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
+          showToast('Pemulihan Berhasil', 'Database dipulihkan dari penyimpanan awan 25 GB ("' + name + '") dan digabung anti-hilang.', 'success');
+        })
+        .catch(function(err) { showToast('Pemulihan gagal', (err && err.message) || 'Backup tidak dapat dibaca', 'error'); });
+    });
+  }, 'Ya, Pulihkan', 'emerald');
+}
+
+// Backup OTOMATIS harian — dipanggil dari saveDB setiap ada perubahan (maks 1x per 20 jam)
+function cdbMaybeAutoBackup() {
+  try {
+    if (!cdbAuto || !db || !isValidDatabase(db)) return;
+    if (!isCdbConfigured()) return;
+    if (Date.now() - _cdbLastAutoAt < CDB_AUTO_MIN_MS) return;
+    _cdbLastAutoAt = Date.now();
+    cdbBackupNow(false);
+  } catch (e) { /* abaikan */ }
+}
+
+// Toggle backup otomatis (checkbox di halaman Database & Cloud)
+function cdbToggleAuto(on) {
+  cdbAuto = !!on;
+  try { localStorage.setItem(CDB_AUTO_KEY, cdbAuto ? '1' : '0'); } catch (e) { /* abaikan */ }
+  showToast(cdbAuto ? 'Backup otomatis Database Besar AKTIF' : 'Backup otomatis Database Besar MATI',
+    cdbAuto ? 'Database otomatis dicadangkan ke penyimpanan awan 25 GB setiap hari (maks 1x per 20 jam).' : 'Database tidak lagi dicadangkan otomatis ke penyimpanan awan.',
+    cdbAuto ? 'success' : 'info');
+}
+
+// Teks & pembaruan status inline (tanpa render ulang agar isian form tidak hilang)
+function cdbStatusText() {
+  if (cdbError) {
+    if (/preset not found/i.test(cdbError)) return 'Butuh perhatian — nama Upload preset tidak dikenal akun Cloudinary. Cek Settings → Upload → Upload presets untuk nama yang PERSIS (huruf kecil, tanpa spasi), lalu perbaiki di formulir.';
+    if (/cloud/i.test(cdbError)) return 'Butuh perhatian — Cloud name tidak dikenal. Cek kotak "Cloud name" di Dashboard Cloudinary, lalu perbaiki di formulir.';
+    return 'Butuh perhatian — ' + cdbError;
+  }
+  if (cdbLastPushAt) return 'Aktif — backup terakhir ' + formatDateTime(cdbLastPushAt);
+  if (isCdbConfigured()) return 'Siap — backup pertama berjalan otomatis begitu aplikasi dibuka / data tersimpan (atau klik "Backup ke Awan Sekarang")';
+  return 'Belum diatur';
+}
+function updateCdbStatusUI() {
+  const el = document.getElementById('cdb-status-text');
+  if (el) el.textContent = cdbStatusText();
+}
+
+/* ============================================================
    KESEHATAN KONEKSI DATABASE & SAMBUNG-ULANG OTOMATIS
    - markCloudConnected/markCloudDisconnected: sumber tunggal status
    - Banner peringatan global + pill "Offline" di header (semua role)
@@ -3900,6 +4155,7 @@ function renderTopBar() {
   // Update cloud status indicator
   updateCloudStatusUI();
   updateSyncIndicator(); // status titik "data baru tersedia" pada tombol Sinkron
+  updateStaffNotifBadge(); // badge merah lonceng notifikasi (jumlah tugas baru yang dikumpulkan siswa dll.)
 }
 
 function toggleCloudStatus(e) {
@@ -4087,23 +4343,171 @@ function toggleSidebar() {
   }
 }
 
+/* ============================================================
+   PUSAT NOTIFIKASI REALTIME AKUN GURU (juga Super Admin/Tendik/Kepsek)
+   Sebelumnya lonceng hanya menampilkan pengumuman. Kini akun staf
+   mendapat notifikasi LANGSUNG saat:
+   - Siswa selesai mengerjakan & mengumpulkan tugas (baru / revisi)
+   - Siswa mengirim ulang tugas yang sebelumnya belum terkirim
+   - Pengumuman sekolah (semua role — perilaku lama tetap ada)
+   Feed diturunkan otomatis dari database (tanpa skema baru) sehingga
+   tetap akurat meski perangkat guru sempat mati — begitu data masuk
+   ke akun guru, badge merah di lonceng bertambah dan daftar terisi.
+   Status "sudah dibaca" disimpan per-akun di localStorage.
+   ============================================================ */
+const STAFF_NOTIF_SEEN_KEY = 'sija_staff_notif_seen_v1';
+const STAFF_NOTIF_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // notifikasi ditampilkan maksimal 7 hari terakhir
+const STAFF_NOTIF_MAX = 30;                            // maksimal 30 notifikasi terbaru
+
+function _staffNotifSeenMap() {
+  try { return JSON.parse(localStorage.getItem(STAFF_NOTIF_SEEN_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function _staffNotifSeenAt(userId) { const m = _staffNotifSeenMap(); return Number(m[userId] || 0); }
+
+function notifTimeAgo(ts) {
+  const d = Date.now() - ts;
+  if (d < 60000) return 'baru saja';
+  if (d < 3600000) return Math.floor(d / 60000) + ' menit lalu';
+  if (d < 86400000) return Math.floor(d / 3600000) + ' jam lalu';
+  if (d < 604800000) return Math.floor(d / 86400000) + ' hari lalu';
+  return formatDate(new Date(ts).toISOString(), { day: '2-digit', month: 'short' });
+}
+
+// Susun daftar notifikasi untuk pengguna yang sedang login
+function collectNotifications() {
+  const items = [];
+  const u = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+  if (!u || !db) return items;
+  try {
+    const isStaff = u.role === 'GURU' || u.role === 'SUPER_ADMIN' || u.role === 'TENDIK' || u.role === 'KEPSEK';
+    const minTs = Date.now() - STAFF_NOTIF_WINDOW_MS;
+    // Guru hanya melihat pengumpulan pada mapel yang DIAJARKANNYA sendiri;
+    // Super Admin/Tendik/Kepsek melihat seluruh sekolah.
+    let myCourseIds = null;
+    if (u.role === 'GURU') {
+      const tMe = db.teachers.find(t => t.userId === u.id);
+      myCourseIds = tMe ? db.courses.filter(c => c.teacherId === tMe.id).map(c => c.id) : [];
+    }
+    if (isStaff) {
+      // 1) Siswa selesai mengerjakan & mengumpulkan tugas
+      (db.submissions || []).forEach(s => {
+        const ts = Date.parse(s.createdAt || s.submittedAt) || 0;
+        if (!ts || ts < minTs) return;
+        const a = db.assignments.find(x => x.id === s.assignmentId);
+        if (!a) return;
+        if (myCourseIds && !myCourseIds.includes(a.courseId)) return;
+        const st = db.students.find(x => x.id === s.studentId);
+        const cr = db.courses.find(c => c.id === a.courseId);
+        items.push({ kind: 'submission', at: ts, id: 'sbm-' + s.id,
+          title: (st ? st.name : (s.studentName || 'Siswa')) + ' mengumpulkan tugas',
+          desc: '"' + (a.title || s.assignmentTitle || '-') + '"' + (cr ? ' • ' + cr.name : '') + (s.status === 'DINILAI' ? ' • sudah dinilai' : ''),
+          icon: 'clipboard-check', color: 'emerald', page: u.role === 'GURU' ? 'tugas' : 'penilaian' });
+      });
+      // 2) Siswa mengirim ulang tugas yang sebelumnya BELUM TERKIRIM
+      (db.logs || []).forEach(l => {
+        if (l.action !== 'KIRIM ULANG TUGAS') return;
+        const ts = Date.parse(l.createdAt) || 0;
+        if (!ts || ts < minTs) return;
+        const st = db.students.find(x => x.userId === l.userId);
+        items.push({ kind: 'resend', at: ts, id: 'log-' + l.id,
+          title: (st ? st.name : 'Siswa') + ' mengirim ulang tugas',
+          desc: l.detail || 'Tugas yang sebelumnya belum terkirim telah dikirim ulang',
+          icon: 'refresh-cw', color: 'amber', page: u.role === 'GURU' ? 'tugas' : 'penilaian' });
+      });
+    }
+    // 3) Pengumuman sekolah — semua role (perilaku lama dipertahankan)
+    (db.announcements || []).forEach(n => {
+      const ts = Date.parse(n.createdAt) || 0;
+      if (!ts || ts < minTs) return;
+      if (n.targetRole && n.targetRole !== 'ALL' && n.targetRole !== u.role) return;
+      items.push({ kind: 'announcement', at: ts, id: 'ann-' + n.id,
+        title: n.title || 'Pengumuman', desc: (n.content || '').slice(0, 120),
+        icon: 'megaphone', color: 'blue', page: 'pengumuman' });
+    });
+  } catch (e) { /* abaikan */ }
+  items.sort((x, y) => y.at - x.at);
+  const seen = _staffNotifSeenAt(u.id);
+  return items.slice(0, STAFF_NOTIF_MAX).map(it => Object.assign({}, it, { unread: it.at > seen }));
+}
+
+// Perbarui badge merah di lonceng — dipanggil saat login, saat data baru
+// dari perangkat lain diterima (sinyal realtime / snapshot cloud), dan
+// setelah notifikasi ditandai dibaca.
+function updateStaffNotifBadge() {
+  try {
+    const b = document.getElementById('notif-badge');
+    if (!b) return;
+    const u = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+    const n = u ? collectNotifications().filter(it => it.unread).length : 0;
+    b.textContent = n > 9 ? '9+' : String(n);
+    b.style.display = n > 0 ? 'flex' : 'none';
+  } catch (e) { /* abaikan */ }
+}
+
+// Tombol "Tandai dibaca" — seluruh notifikasi yang tampil sekarang dianggap dibaca
+function markAllNotifsRead(e) {
+  if (e) { try { e.stopPropagation(); } catch (er) { /* abaikan */ } }
+  try {
+    const u = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+    if (!u) return;
+    const m = _staffNotifSeenMap();
+    m[u.id] = Date.now();
+    localStorage.setItem(STAFF_NOTIF_SEEN_KEY, JSON.stringify(m));
+    updateStaffNotifBadge();
+    renderNotifList(); // segarkan daftar bila panel sedang terbuka
+  } catch (e) { /* abaikan */ }
+}
+
+// Klik satu notifikasi → tandai dibaca + buka halaman terkait
+function openNotifItem(kind, page) {
+  try {
+    const u = (typeof getCurrentUser === 'function') ? getCurrentUser() : null;
+    if (u) {
+      const m = _staffNotifSeenMap();
+      m[u.id] = Date.now();
+      try { localStorage.setItem(STAFF_NOTIF_SEEN_KEY, JSON.stringify(m)); } catch (er) { /* abaikan */ }
+    }
+  } catch (e) { /* abaikan */ }
+  const dd = document.getElementById('notif-dropdown');
+  if (dd) dd.classList.add('hidden');
+  updateStaffNotifBadge();
+  if (typeof navigateTo === 'function' && page) navigateTo(page);
+}
+
+function renderNotifList() {
+  const list = document.getElementById('notif-list');
+  if (!list) return;
+  const items = collectNotifications();
+  const unread = items.filter(it => it.unread).length;
+  const cnt = document.getElementById('notif-count');
+  if (cnt) cnt.textContent = items.length === 0 ? '0' : unread + ' baru';
+  if (items.length === 0) { list.innerHTML = '<div class="p-4 text-center text-sm text-gray-500">Tidak ada notifikasi</div>'; return; }
+  const colorMap = { emerald: 'bg-emerald-50 text-emerald-600', amber: 'bg-amber-50 text-amber-600', blue: 'bg-blue-50 text-blue-600' };
+  const kindLabel = { submission: 'Pengumpulan tugas', resend: 'Kirim ulang tugas', announcement: 'Pengumuman' };
+  list.innerHTML = items.map(it => `
+    <div onclick="openNotifItem('${it.kind}', '${it.page}')" class="p-3 border-b last:border-0 hover:bg-gray-50 cursor-pointer ${it.unread ? 'bg-emerald-50/40' : ''}">
+      <div class="flex items-start gap-2.5">
+        <div class="w-8 h-8 rounded-full ${colorMap[it.color] || colorMap.blue} flex items-center justify-center flex-shrink-0"><i data-lucide="${it.icon}" style="font-size: 15px;"></i></div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-1.5">
+            <p class="text-sm font-medium flex-1 line-clamp-1">${_printEsc(it.title)}</p>
+            ${it.unread ? '<span class="w-2 h-2 bg-red-500 rounded-full flex-shrink-0"></span>' : ''}
+          </div>
+          <p class="text-xs text-gray-500 line-clamp-2">${_printEsc(it.desc || '')}</p>
+          <p class="text-[10px] text-gray-400 mt-0.5">${notifTimeAgo(it.at)} • ${kindLabel[it.kind] || ''}</p>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
 function toggleNotifications(e) {
   e.stopPropagation();
   const dd = document.getElementById('notif-dropdown');
   if (dd.classList.contains('hidden')) {
-    const anns = db.announcements.filter(a => !a.targetRole || a.targetRole === 'ALL' || a.targetRole === session.role).slice(0, 5);
-    document.getElementById('notif-count').textContent = anns.length;
-    document.getElementById('notif-badge').classList.toggle('hidden', anns.length === 0);
-    document.getElementById('notif-list').innerHTML = anns.length === 0 ? '<div class="p-4 text-center text-sm text-gray-500">Tidak ada notifikasi</div>' : anns.map(n => `
-      <div class="p-3 border-b last:border-0 hover:bg-gray-50 cursor-pointer">
-        <div class="flex items-center gap-2 w-full mb-1">
-          ${n.isPinned ? '<span class="w-2 h-2 bg-amber-500 rounded-full"></span>' : ''}
-          <p class="text-sm font-medium flex-1 line-clamp-1">${n.title}</p>
-        </div>
-        <p class="text-xs text-gray-500 line-clamp-2">${n.content}</p>
-      </div>
-    `).join('');
+    renderNotifList();
     dd.classList.remove('hidden');
+    updateStaffNotifBadge();
   } else {
     dd.classList.add('hidden');
   }
@@ -5813,6 +6217,114 @@ function selectField(id, options, val = '') {
 }
 
 /* ============ SUPER ADMIN DASHBOARD ============ */
+/* ============================================================
+   KAPASITAS PENYIMPANAN DATABASE (Dashboard Super Admin)
+   Database sekolah disimpan FULL ONLINE sebagai JSON di Cloud
+   Firestore (collection "sija_cloud": doc meta + chunk maks 700KB
+   per dokumen — batas 1 dokumen Firestore = 1 MiB) + salinan
+   cadangan di Realtime Database. Panel ini menampilkan:
+   - BERAPA yang sudah tersimpan (ukuran JSON database + rincian
+     per koleksi terbesar)
+   - KAPASITAS MAKSIMAL penyimpanan = kuota Cloud Firestore paket
+     gratis (Spark) sebesar 1 GiB; bila mendekati penuh, bilah
+     berubah warna (hijau → kuning → merah).
+   Angka = perkiraan ukuran byte JSON data yang tersimpan di cloud.
+   ============================================================ */
+const DB_MAX_CAPACITY_BYTES = 1073741824; // 1 GiB — kuota penyimpanan data Cloud Firestore paket gratis (Spark)
+
+function fmtDbBytes(b) {
+  if (!b || b < 0 || !isFinite(b)) b = 0;
+  if (b < 1024) return Math.round(b) + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b / 1048576).toFixed(2) + ' MB';
+  return (b / 1073741824).toFixed(2) + ' GB';
+}
+
+function computeDbStorageStats() {
+  const stats = { total: 0, rows: [], pct: 0, free: DB_MAX_CAPACITY_BYTES, chunks: 0, recordCount: 0, cloudUpdatedAt: '' };
+  try {
+    if (!db) return stats;
+    let total = 0; const rows = [];
+    Object.keys(db).forEach(k => {
+      let n = 0;
+      try { n = JSON.stringify(db[k] || null).length; } catch (e) { n = 0; }
+      if (n <= 2) return; // koleksi kosong (null/[]/{}) — lewati
+      const v = db[k];
+      const count = Array.isArray(v) ? v.length : (v && typeof v === 'object' ? Object.keys(v).length : 1);
+      total += n;
+      rows.push({ name: k, bytes: n, count });
+    });
+    rows.sort((a, b) => b.bytes - a.bytes);
+    stats.total = total;
+    stats.rows = rows;
+    stats.recordCount = rows.reduce((a, r) => a + r.count, 0);
+    stats.pct = Math.min(100, (total / DB_MAX_CAPACITY_BYTES) * 100);
+    stats.free = Math.max(0, DB_MAX_CAPACITY_BYTES - total);
+    stats.chunks = Math.max(1, Math.ceil(total / CLOUD_FS_CHUNK));
+    stats.cloudUpdatedAt = (typeof _lastCloudMetaMs !== 'undefined' && _lastCloudMetaMs) ? new Date(_lastCloudMetaMs).toISOString() : '';
+  } catch (e) { /* abaikan */ }
+  return stats;
+}
+
+function storageCapacityCardHTML() {
+  const s = computeDbStorageStats();
+  const barColor = s.pct >= 85 ? 'bg-red-500' : s.pct >= 60 ? 'bg-amber-500' : 'bg-emerald-500';
+  const txtColor = s.pct >= 85 ? 'text-red-600' : s.pct >= 60 ? 'text-amber-600' : 'text-emerald-600';
+  const top = s.rows.slice(0, 6);
+  const maxRow = top.length ? top[0].bytes : 1;
+  const barWidth = Math.max(s.pct, s.total > 0 ? 1.5 : 0).toFixed(1);
+  // DATABASE BESAR (Penyimpanan Awan / Cloudinary 25 GB) — pemakaian = ukuran file backup database
+  const cdbCfg = (typeof isCdbConfigured === 'function') && isCdbConfigured();
+  const cdbErr = (typeof cdbError !== 'undefined') && !!cdbError;
+  const cdbActive = (typeof cdbLastPushAt !== 'undefined') && !!cdbLastPushAt;
+  const cdbMax = (typeof CDB_MAX_CAPACITY_BYTES !== 'undefined') ? CDB_MAX_CAPACITY_BYTES : 25 * 1073741824;
+  const cdbUsedPct = ((s.total / cdbMax) * 100).toFixed(4);
+  const cdbStatus = cdbErr ? 'Butuh perhatian' : (cdbActive ? 'Aktif — backup terakhir ' + formatDateTime(cdbLastPushAt) : (cdbCfg ? 'Siap — belum ada backup' : 'Belum diatur'));
+  return dataCard('Kapasitas Penyimpanan Database', 'Cloud Firestore (data utama) + Realtime Database (backup) + Penyimpanan Awan 25 GB (database besar) — tersinkron realtime', 'database',
+    `<div class="space-y-4">
+      <div class="flex items-end justify-between gap-3 flex-wrap">
+        <div>
+          <p class="text-3xl font-bold tracking-tight">${fmtDbBytes(s.total)}</p>
+          <p class="text-xs text-gray-500 mt-0.5">terpakai dari kapasitas maksimal ${fmtDbBytes(DB_MAX_CAPACITY_BYTES)} (kuota Cloud Firestore 1 GiB)</p>
+        </div>
+        <div class="text-right">
+          <p class="text-2xl font-bold ${txtColor}">${s.pct.toFixed(1)}%</p>
+          <p class="text-xs text-gray-500">sisa ${fmtDbBytes(s.free)}</p>
+        </div>
+      </div>
+      <div class="w-full h-3 bg-gray-100 rounded-full overflow-hidden">
+        <div class="h-full ${barColor} rounded-full transition-all" style="width: ${barWidth}%"></div>
+      </div>
+      <div class="p-3 rounded-lg bg-violet-50 border border-violet-200 flex items-center justify-between gap-2 flex-wrap">
+        <div class="flex items-center gap-2">
+          <i data-lucide="database" class="text-violet-600" style="font-size: 20px;"></i>
+          <div>
+            <p class="text-xs font-bold text-violet-800">DATABASE BESAR — Penyimpanan Awan (kapasitas paling besar): ${fmtDbBytes(cdbMax)}</p>
+            <p class="text-[11px] text-violet-700">Terpakai ${fmtDbBytes(s.total)} dari 25 GB (${cdbUsedPct}%) • ${cdbStatus} • tanpa verifikasi Google</p>
+          </div>
+        </div>
+        ${cdbActive ? '<span class="text-[10px] font-bold px-2 py-1 rounded-full bg-violet-600 text-white">AKTIF</span>' : (cdbCfg ? '<span class="text-[10px] font-bold px-2 py-1 rounded-full bg-violet-100 text-violet-700">SIAP</span>' : '<span class="text-[10px] font-bold px-2 py-1 rounded-full bg-gray-200 text-gray-600">BELUM DIATUR</span>')}
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="p-3 rounded-lg bg-blue-50"><p class="text-[11px] text-gray-500">Dokumen Cloud</p><p class="text-lg font-bold text-blue-700">${s.chunks + 1}<span class="text-xs font-normal text-gray-500"> (chunk + meta)</span></p></div>
+        <div class="p-3 rounded-lg bg-violet-50"><p class="text-[11px] text-gray-500">Backup RTDB</p><p class="text-lg font-bold text-violet-700">${fmtDbBytes(s.total)}</p></div>
+        <div class="p-3 rounded-lg bg-emerald-50"><p class="text-[11px] text-gray-500">Sinkron Terakhir</p><p class="text-sm font-bold text-emerald-700 mt-1">${s.cloudUpdatedAt ? formatDateTime(s.cloudUpdatedAt) : 'Belum ada'}</p></div>
+        <div class="p-3 rounded-lg bg-amber-50"><p class="text-[11px] text-gray-500">Total Record</p><p class="text-lg font-bold text-amber-700">${s.recordCount}</p></div>
+      </div>
+      ${top.length === 0 ? '' : `<div>
+        <p class="text-xs font-semibold text-gray-600 mb-2">Data terbesar yang tersimpan</p>
+        <div class="space-y-1.5">${top.map(r => `
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-gray-600 w-28 truncate" title="${r.name}">${r.name}</span>
+            <div class="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden"><div class="h-full bg-emerald-400 rounded-full" style="width: ${(r.bytes / maxRow * 100).toFixed(1)}%"></div></div>
+            <span class="text-xs text-gray-500 w-20 text-right">${fmtDbBytes(r.bytes)}</span>
+            <span class="text-[10px] text-gray-400 w-16 text-right">${r.count} data</span>
+          </div>`).join('')}</div>
+      </div>`}
+      <p class="text-[11px] text-gray-400">Angka adalah perkiraan ukuran JSON database yang tersimpan di cloud. Kapasitas total = Firestore 1 GiB (utama) + Realtime Database (backup) + Penyimpanan Awan 25 GB (database besar — tanpa verifikasi Google). Bila kuota Firestore mendekati penuh, pastikan Database Besar aktif — data tidak akan hilang, hanya berhenti bertambah di kuota Firestore.</p>
+    </div>`);
+}
+
 window.ADMIN_PAGES = {
   dashboard() {
     const totalUsers = db.users.length;
@@ -5840,7 +6352,8 @@ window.ADMIN_PAGES = {
         ${statCard('Materi LMS', materials, 'file-text', 'violet')}
         ${statCard('Total Tugas', assignments, 'clipboard-check', 'red')}
       </div>
-      <div class="grid lg:grid-cols-2 gap-6">
+      ${storageCapacityCardHTML()}
+      <div class="grid lg:grid-cols-2 gap-6 mt-6">
         ${dataCard('Aktivitas Terkini', 'Log aktivitas pengguna', 'activity',
           logs.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Belum ada aktivitas</p>' :
           '<div class="space-y-3 max-h-96 overflow-y-auto">' + logs.map(l => {
@@ -6591,6 +7104,52 @@ window.ADMIN_PAGES = {
           </div>`
         )}
       </div>
+
+      ${dataCard('Database Besar — Penyimpanan Awan 25 GB', 'Kapasitas paling BESAR (25 GB gratis) — TANPA OAuth, TANPA verifikasi Google, TANPA kartu kredit. Konfigurasi akun sekolah sudah tertanam — otomatis aktif.', 'database',
+        `<div class="space-y-4">
+          <div class="p-4 rounded-lg bg-violet-50 border border-violet-200">
+            <p class="text-xs text-violet-800"><i data-lucide="zap" style="font-size: 14px; display: inline;"></i> <strong>Cocok untuk Anda yang terkendala verifikasi Google:</strong> penyimpanan ini TIDAK memakai akun Google sama sekali — tidak ada jendela izin, tidak ada "Access blocked", tidak ada token kadaluarsa. Seluruh database sekolah disalin sebagai file JSON ke penyimpanan awan Cloudinary <strong>kapasitas 25 GB gratis</strong> (backup harian otomatis + snapshot manual = tersedia riwayat pemulihan). <strong>Konfigurasi sekolah sudah tertanam di aplikasi</strong> — Cloud name <strong>sman-jayaloka</strong> + Upload preset <strong>sistem-informasi-sekolah-smanja</strong> — diadopsi otomatis di setiap perangkat, backup pertama berjalan sendiri begitu aplikasi terbuka.</p>
+          </div>
+
+          <div class="p-3 rounded-lg ${cdbLastPushAt ? 'bg-emerald-50 border border-emerald-200' : (cdbError ? 'bg-amber-50 border border-amber-200' : 'bg-gray-50 border border-gray-200')} flex items-center justify-between gap-2 flex-wrap">
+            <div class="flex items-center gap-2">
+              <i data-lucide="${cdbLastPushAt ? 'check-circle' : (cdbError ? 'alert-triangle' : 'database')}" class="${cdbLastPushAt ? 'text-emerald-600' : (cdbError ? 'text-amber-500' : 'text-gray-400')}" style="font-size: 20px;"></i>
+              <div>
+                <p class="text-sm font-medium">Status: <span id="cdb-status-text">${cdbStatusText()}</span></p>
+                <p class="text-xs text-gray-500">Kapasitas: 25 GB • Backup harian otomatis (maks 1x per 20 jam) • File: sija_db_harian_[tanggal] / sija_db_snapshot_[jam]${cdbLastFileId ? ' • Backup terakhir: ' + cdbLastFileId : ''}</p>
+              </div>
+            </div>
+            <label class="flex items-center gap-2 text-xs font-medium text-gray-700 cursor-pointer select-none">
+              <input type="checkbox" ${cdbAuto ? 'checked' : ''} onchange="cdbToggleAuto(this.checked)" class="w-4 h-4 accent-violet-600"> Backup otomatis
+            </label>
+          </div>
+
+          <div class="grid sm:grid-cols-3 gap-2">
+            <button onclick="cdbBackupNow(true)" class="px-4 py-3 bg-violet-600 hover:bg-violet-700 text-white rounded-md text-sm font-medium flex items-center justify-center gap-2"><i data-lucide="upload-cloud" style="font-size: 16px;"></i> Backup ke Awan Sekarang</button>
+            <button onclick="cdbRestoreNow()" class="px-4 py-3 border border-violet-500 text-violet-700 hover:bg-violet-50 rounded-md text-sm font-medium flex items-center justify-center gap-2"><i data-lucide="download-cloud" style="font-size: 16px;"></i> Pulihkan Terbaru dari Awan</button>
+            <button onclick="cdbResetConfig()" class="px-4 py-3 border border-gray-300 text-gray-600 hover:bg-gray-50 rounded-md text-sm font-medium flex items-center justify-center gap-2"><i data-lucide="trash-2" style="font-size: 16px;"></i> Hapus Pengaturan</button>
+          </div>
+
+          <div class="p-3 rounded-lg border border-gray-200 bg-gray-50">
+            <label class="text-xs font-semibold text-gray-700 block mb-1">Cloud Name — sudah terisi untuk akun sekolah (verifikasi: langkah 2 di bawah)</label>
+            <div class="flex flex-col sm:flex-row gap-2 mb-2">
+              <input id="cdb-cloud-name" placeholder="misal: sman-jayaloka" class="flex-1 px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-violet-500" value="${(loadCdbConfig() || {}).cloudName || CDB_DEFAULT_CLOUD_NAME}">
+            </div>
+            <label class="text-xs font-semibold text-gray-700 block mb-1">Nama Upload Preset — Unsigned — sudah terisi (verifikasi: langkah 3 di bawah)</label>
+            <div class="flex flex-col sm:flex-row gap-2">
+              <input id="cdb-preset" placeholder="misal: sistem-informasi-sekolah-smanja" class="flex-1 px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-violet-500" value="${(loadCdbConfig() || {}).preset || CDB_DEFAULT_PRESET}">
+              <button onclick="saveCdbConfigFromForm()" class="px-4 py-2 bg-gray-800 hover:bg-gray-900 text-white rounded-md text-sm font-medium flex items-center justify-center gap-1 flex-shrink-0"><i data-lucide="save" style="font-size: 15px;"></i> Simpan & Backup Pertama</button>
+            </div>
+            <ol class="text-xs text-gray-600 space-y-1 list-decimal list-inside mt-3">
+              <li><strong>Umumnya tidak perlu apa-apa:</strong> Cloud Name & Upload preset sekolah sudah tertanam — backup pertama berjalan sendiri ±8 detik setelah aplikasi dibuka, dan backup harian otomatis mengikuti setiap perubahan data</li>
+              <li>Belum punya akun Cloudinary? Buat gratis di <a href="https://cloudinary.com/users/register_free" target="_blank" class="underline font-medium">cloudinary.com/users/register_free</a> — daftarkan Cloud name <strong>sman-jayaloka</strong> (huruf kecil, tanpa spasi), tanpa kartu kredit. Sudah punya? Pastikan kotak <strong>"Cloud name"</strong> di Dashboard = sman-jayaloka; kalau berbeda, koreksi di kolom Cloud Name di atas</li>
+              <li>Buat Upload preset yang PERSIS bernama <strong>sistem-informasi-sekolah-smanja</strong>: ikon <strong>Settings (roda gigi)</strong> → <strong>Upload</strong> → <strong>Upload presets</strong> → <strong>Add upload preset</strong> → tulis nama itu (huruf kecil, TANPA spasi — nama preset tidak boleh mengandung spasi) → Signing mode: Unsigned → <strong>Save</strong></li>
+              <li>Bila nama asli di Cloudinary ternyata berbeda (mis. dibuat otomatis), salin nama persisnya → tempel/koreksi di kolom di atas → klik <strong>Simpan & Backup Pertama</strong> — SELESAI! Status berubah hijau "Aktif" setelah backup berhasil</li>
+            </ol>
+            <p class="text-[11px] text-gray-400 mt-2">Catatan: penyimpanan ini TAMBAHAN — Firestore & RTDB tetap penyimpanan utama sinkron realtime. Aplikasi hanya dapat menulis file backup bernama "sija_db_*" miliknya sendiri. Tombol "Pulihkan Terbaru" mengambil backup terbaru yang dikenal perangkat ini, atau memeriksa backup harian 14 hari terakhir. Selama status "Aktif", isian formulir tidak perlu diubah apa pun.</p>
+          </div>
+        </div>`
+      )}
 
       <div class="bg-white rounded-2xl border-0 shadow-md p-6">
         <div class="flex items-center justify-between gap-2 mb-4 flex-wrap">
