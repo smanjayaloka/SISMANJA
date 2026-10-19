@@ -543,6 +543,7 @@ function sweepLegacyLocalDb() {
     const had = localStorage.getItem(DB_KEY) || localStorage.getItem(DB_BAK_KEY);
     localStorage.removeItem(DB_KEY);
     localStorage.removeItem(DB_BAK_KEY);
+    localStorage.removeItem('sija_cloud_disabled_v1'); // mode "cloud dimatikan" DIHAPUS TOTAL — aplikasi selalu terhubung database
     if (had) console.log('[FULL-ONLINE] Sisa database lokal lama dihapus — aplikasi kini 100% online (data hanya di cloud)');
   } catch (e) { /* abaikan */ }
 }
@@ -711,11 +712,14 @@ function checkEmergencyRecovery(cloudMetaMs) {
 }
 // Bidikan terakhir sebelum halaman ditutup/disembunyikan: simpan kotak hitam
 // (sinkron & instan) + dorong segera perubahan yang masih mengantre bila server tersambung.
+// 100% ONLINE: kotak hitam HANYA ditulis bila ada perubahan yang belum aman di database
+// (koneksi terputus / antrean / push sedang berjalan). Bila semua sudah terkirim ke cloud,
+// browser TIDAK menyimpan salinan database sama sekali.
 function flushPendingBeforeExit() {
   try {
     if (!db || !isValidDatabase(db)) return;
-    const hasQueue = !!(cloudPendingPush || rtdbPendingPush || cloudPushTimer || rtdbPushTimer);
-    if (!isCloudConnected() || hasQueue || (Date.now() - _dbLocalDirtyAt < 3000)) {
+    const hasQueue = !!(cloudPendingPush || rtdbPendingPush || cloudPushTimer || rtdbPushTimer || _cloudPushInFlight);
+    if (!isCloudConnected() || hasQueue) {
       saveEmergencySnapshot('exit');
     }
     if (hasQueue) {
@@ -1181,12 +1185,16 @@ function saveCloudConfig(config) {
   localStorage.removeItem(CLOUD_DISABLED_KEY); // memasang config = mengaktifkan kembali cloud
 }
 
-function isCloudDisabled() { return localStorage.getItem(CLOUD_DISABLED_KEY) === '1'; }
+// PERMANEN TERHUBUNG DATABASE: mode "cloud dimatikan" (data hanya di browser) DIHAPUS.
+// Aplikasi selalu FULL ONLINE — semua perubahan wajib dikirim ke Cloud Firestore.
+function isCloudDisabled() { return false; }
 
-function disableCloud() { localStorage.setItem(CLOUD_DISABLED_KEY, '1'); }
+function disableCloud() {
+  // Tidak ada lagi mode penyimpanan browser: panggilan ini hanya memastikan flag lama terhapus.
+  try { localStorage.removeItem(CLOUD_DISABLED_KEY); } catch (e) { /* abaikan */ }
+}
 
 function resolveCloudConfig() {
-  if (isCloudDisabled()) return null;
   let config = loadCloudConfig();
   if (!config && typeof window.firebaseAutoConfig !== 'undefined' && window.firebaseAutoConfig && window.firebaseAutoConfig.apiKey) {
     config = window.firebaseAutoConfig;
@@ -3070,7 +3078,7 @@ function handleRtdbError(err) {
   } else if (code.indexOf('not_found') >= 0 || code.indexOf('invalid') >= 0) {
     rtdbError = 'Realtime Database belum dibuat atau URL salah. Buka Firebase Console → Build → Realtime Database → Create Database (region asia-southeast1), lalu muat ulang halaman.';
   } else if (code.indexOf('network') >= 0 || code.indexOf('unavailable') >= 0) {
-    rtdbError = 'Server Realtime Database tidak dapat dihubungi (periksa koneksi internet). Data tetap aman di browser ini.';
+    rtdbError = 'Server Realtime Database tidak dapat dihubungi (periksa koneksi internet). Data utama tetap aman di Cloud Firestore; sambung ulang otomatis berjalan.';
   } else {
     rtdbError = (err && (err.message || err.code)) || 'Koneksi ke Realtime Database gagal';
   }
@@ -3122,7 +3130,7 @@ function toggleRtdbStatus(e) {
   } else if (rtdbError) {
     showToast('Backup RTDB: Butuh Perhatian', rtdbError, 'warning');
   } else {
-    showToast('Backup RTDB: Tidak aktif', 'Realtime Database belum tersambung — data tersimpan di browser & Cloud Firestore.', 'info');
+    showToast('Backup RTDB: Tidak aktif', 'Realtime Database belum tersambung — data utama tetap aman di Cloud Firestore; koneksi dicoba ulang otomatis.', 'info');
   }
 }
 
@@ -3575,7 +3583,7 @@ function startDbWatchdog() {
   setInterval(function() {
     // FULL ONLINE: tidak ada lagi penulisan ulang localStorage — database hanya di cloud
 
-    if (isCloudDisabled() || !navigator.onLine) { updateOnlineGate(); return; }
+    if (!navigator.onLine) { updateOnlineGate(); return; }
 
     // 2) SDK belum termuat → coba muat ulang
     if (typeof firebase === 'undefined') {
@@ -4163,8 +4171,6 @@ function toggleCloudStatus(e) {
   const cfg = activeCloudConfig || EMBEDDED_FIREBASE_CONFIG;
   if (isCloudConnected()) {
     showToast('Cloud Database: Aktif', 'Data tersinkron real-time via Cloud Firestore (project ' + (cfg.projectId || '-') + ') — tampil di semua browser online', 'success');
-  } else if (isCloudDisabled()) {
-    showToast('Cloud: Dimatikan', 'Aplikasi berjalan FULL ONLINE — aktifkan kembali cloud lewat halaman Database & Cloud.', 'info');
   } else if (cloudConnectError) {
     showToast('Cloud: Butuh Perhatian', cloudConnectError, 'warning');
   } else {
@@ -4819,14 +4825,10 @@ window.bootSkipNow = bootSkipNow;
     if (db && isValidDatabase(db)) _bootStep(1, 'ok');
     else _bootStep(1, 'active');
 
-    // LANGKAH 2 — koneksi Database Cloud (WAJIB — tidak ada lagi fallback lokal)
+    // LANGKAH 2 — koneksi Database Cloud (WAJIB — tidak ada lagi fallback lokal / cloud mati)
     if (_bootS2 === null) {
-      var cloudDisabled = false;
-      try { cloudDisabled = isCloudDisabled(); } catch (e) { /* abaikan */ }
       if (!navigator.onLine) {
         _bootStatus('Tidak ada koneksi internet', 'Aplikasi FULL ONLINE menunggu internet aktif — menyambung otomatis...');
-      } else if (cloudDisabled) {
-        _bootStatus('Cloud dimatikan', 'Aplikasi berjalan FULL ONLINE — aktifkan cloud untuk melanjutkan');
       } else if (typeof isCloudConnected === 'function' && isCloudConnected()) {
         // Server cloud benar-benar merespons — tunggu data sekolah terbaca dari server
         if (_bootConnectedAt === null) {
@@ -7021,28 +7023,35 @@ window.ADMIN_PAGES = {
     const dbSizeKB = (dbSize / 1024).toFixed(1);
 
     return pageHeader('Database & Cloud Sync', 'Kelola penyimpanan data antar-browser dan perangkat') + `
+      <div class="mb-6 p-4 rounded-lg bg-emerald-50 border border-emerald-200 flex items-start gap-3">
+        <i data-lucide="shield-check" class="text-emerald-600 flex-shrink-0" style="font-size: 22px; margin-top: 2px;"></i>
+        <div>
+          <p class="text-sm font-bold text-emerald-800">100% ONLINE — Semua Data Langsung di Database Cloud</p>
+          <p class="text-xs text-emerald-700 mt-1 leading-relaxed">Aplikasi <strong>tidak menyimpan data sekolah di browser</strong>. Setiap perubahan (absensi, nilai, tugas, pengumuman, dll.) langsung dikirim ke database awan <strong>Cloud Firestore</strong> dan otomatis tampil di semua perangkat yang online. Salinan cadangan otomatis dibuat ke <strong>Realtime Database</strong> dan <strong>Database Besar 25 GB</strong>. Browser hanya menyimpan sesi login &amp; preferensi kecil — bila koneksi terputus sejenak, aplikasi menyambung ulang otomatis dan mengirim perubahan yang sempat mengantre.</p>
+        </div>
+      </div>
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         ${statCard('Status Cloud', connected ? 'Terhubung' : 'Offline', connected ? 'cloud' : 'cloud-off', connected ? 'emerald' : 'gray')}
         ${statCard('Total Pengguna', db.users.length, 'users', 'blue')}
         ${statCard('Ukuran Database', dbSizeKB + ' KB', 'database', 'violet')}
-        ${statCard('Mode', connected ? 'Cloud Sync' : 'Lokal', connected ? 'wifi' : 'hard-drive', connected ? 'emerald' : 'amber')}
+        ${statCard('Mode', connected ? 'Cloud Sync' : 'Menyambung Ulang', connected ? 'wifi' : 'refresh-cw', connected ? 'emerald' : 'amber')}
       </div>
 
       <div class="grid lg:grid-cols-2 gap-6 mb-6">
         ${dataCard('Status Penyimpanan', 'Mode penyimpanan data saat ini', 'database',
           `<div class="space-y-3 text-sm">
-            <div class="flex items-center justify-between p-3 rounded-lg ${connected ? 'bg-emerald-50' : 'bg-gray-50'}">
+            <div class="flex items-center justify-between p-3 rounded-lg ${connected ? 'bg-emerald-50' : 'bg-amber-50'}">
               <div class="flex items-center gap-2">
-                <i data-lucide="${connected ? 'cloud' : 'hard-drive'}" class="${connected ? 'text-emerald-600' : 'text-gray-500'}" style="font-size: 20px;"></i>
+                <i data-lucide="${connected ? 'cloud' : 'refresh-cw'}" class="${connected ? 'text-emerald-600' : 'text-amber-600'}" style="font-size: 20px;"></i>
                 <div>
-                  <p class="font-medium">${connected ? 'Cloud Database Aktif' : 'Mode Lokal (Browser)'}</p>
-                  <p class="text-xs text-gray-500">${connected ? 'Data tersinkron real-time antar browser & perangkat' : 'Data hanya tersimpan di browser ini'}</p>
+                  <p class="font-medium">${connected ? 'Cloud Database Aktif' : 'Menyambung Ulang ke Database'}</p>
+                  <p class="text-xs text-gray-500">${connected ? 'Data tersinkron real-time antar browser & perangkat' : 'Aplikasi menyambung otomatis — perubahan dikirim begitu koneksi pulih'}</p>
                 </div>
               </div>
-              ${badge(connected ? 'Online' : 'Offline', connected ? 'default' : 'secondary')}
+              ${badge(connected ? 'Online' : 'Menyambung...', connected ? 'default' : 'secondary')}
             </div>
             <div class="p-3 rounded-lg bg-blue-50 border border-blue-200">
-              <p class="text-xs text-blue-700"><i data-lucide="info" style="font-size: 14px; display: inline;"></i> <strong>Penjelasan:</strong> Dengan cloud sync, data tersimpan di server Firebase dan bisa diakses dari browser/perangkat manapun. Tanpa cloud, data hanya tersimpan di browser ini (localStorage).</p>
+              <p class="text-xs text-blue-700"><i data-lucide="info" style="font-size: 14px; display: inline;"></i> <strong>Penjelasan:</strong> Aplikasi berjalan 100% ONLINE — data sekolah HANYA tersimpan di database awan (Cloud Firestore + backup Realtime Database + Database Besar 25 GB). Browser TIDAK menyimpan data sekolah — hanya sesi login &amp; preferensi kecil. Bila koneksi terputus sejenak, aplikasi menyambung ulang otomatis dan mengirim perubahan yang mengantre begitu koneksi pulih.</p>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <div class="p-3 rounded-lg border text-center"><p class="text-xs text-gray-500">Total Data</p><p class="text-lg font-bold">${db.users.length}</p><p class="text-[10px] text-gray-400">pengguna</p></div>
@@ -7203,12 +7212,6 @@ service cloud.firestore {
           </div>
           <p class="text-[11px] text-gray-500 mt-1">Rules ini membuka akses seluruh dokumen Firestore. Untuk keamanan lebih tinggi, batasi hanya pada collection <code>sija_cloud</code> atau aktifkan App Check di project Firebase.</p>
         </div>
-
-        ${isCloudDisabled() ? `
-        <div class="p-4 rounded-lg bg-red-50 border border-red-200 mb-4 flex items-center justify-between gap-3 flex-wrap">
-          <p class="text-xs text-red-600"><i data-lucide="cloud-off" style="font-size: 14px; display: inline;"></i> Cloud sync sedang <strong>dimatikan</strong> — data hanya tersimpan di browser ini.</p>
-          <button type="button" onclick="enableDefaultCloud()" class="px-3 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-md text-xs font-medium flex items-center gap-1"><i data-lucide="refresh-cw" style="font-size: 14px;"></i> Gunakan Cloud Bawaan</button>
-        </div>` : ''}
 
         ${connected ? `
           <div class="p-4 rounded-lg bg-emerald-50 border border-emerald-200 mb-4">
@@ -9817,7 +9820,9 @@ window.GURU_PAGES = {
     const classIds = Array.from(new Set(courses.map(c => c.classId).filter(Boolean)));
     const selClass = window._guruSelClass || classIds[0] || '';
     const students = db.students.filter(s => s.classId === selClass);
-    return pageHeader('Data Siswa', 'Siswa di kelas yang Anda ampu') + `
+    return pageHeader('Data Siswa', 'Siswa di kelas yang Anda ampu',
+      btn('Cetak PDF', 'openPrintSiswaGuru()', { variant: 'outline', icon: 'printer' })
+    ) + `
       <div class="mb-4">
         <select onchange="window._guruSelClass=this.value; refreshMainContent()" class="px-3 py-2 border rounded-md text-sm w-full sm:w-[200px]">
           ${classIds.map(id => { const c = courses.find(x => x.classId === id); return `<option value="${id}" ${selClass === id ? 'selected' : ''}>${c ? db.classes.find(cl => cl.id === c.classId)?.name : ''}</option>`; }).join('')}
@@ -10347,6 +10352,91 @@ function saveAttendance() {
 
 /* ============ CETAK PDF ABSENSI (Guru) ============ */
 /* Modal pilihan cetak absensi kelas: daftar hadir harian / rekap kehadiran per siswa */
+/* ============ CETAK PDF DATA SISWA (Guru) ============ */
+function openPrintSiswaGuru() {
+  const user = getCurrentUser();
+  const teacher = db.teachers.find(t => t.userId === user.id);
+  const courses = db.courses.filter(c => c.teacherId === teacher?.id);
+  if (!teacher || courses.length === 0) { showToast('Belum ada kelas diampu', 'Anda belum mengampu mata pelajaran sehingga belum ada daftar siswa untuk dicetak', 'warning'); return; }
+  const classIds = Array.from(new Set(courses.map(c => c.classId).filter(Boolean)));
+  const selClass = (window._guruSelClass && classIds.includes(window._guruSelClass)) ? window._guruSelClass : classIds[0];
+  const selCls = db.classes.find(c => c.id === selClass);
+  const totalStudents = classIds.reduce((t, id) => t + db.students.filter(s => s.classId === id).length, 0);
+  if (totalStudents === 0) { showToast('Belum ada siswa', 'Belum ada siswa di kelas yang Anda ampu untuk dicetak', 'warning'); return; }
+  window._siswaPrintScope = selClass; // kunci konteks kelas saat modal dibuka
+  const mapelList = Array.from(new Set(courses.filter(c => c.classId === selClass).map(c => c.name))).filter(Boolean);
+  const body = `
+    <div class="space-y-4">
+      <div class="p-3 rounded-lg bg-gray-50 border text-xs text-gray-600">Anda mengampu <b>${classIds.length}</b> kelas dengan total <b>${totalStudents}</b> siswa. Kelas terpilih di layar: <b>${_printEsc(selCls ? selCls.name : '-')}</b>${mapelList.length ? ' • Mapel: ' + _printEsc(mapelList.join(', ')) : ''}.</div>
+      <div class="space-y-2">
+        <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-emerald-50/50">
+          <input type="radio" name="siswa-print-scope" value="KELAS" checked class="mt-1 flex-shrink-0">
+          <span class="text-sm"><b>Kelas yang Sedang Dipilih</b><br><span class="text-xs text-gray-500">Daftar siswa kelas ${_printEsc(selCls ? selCls.name : '-')} sesuai tampilan layar: NIS, nama, gender, telepon, dan orang tua.</span></span>
+        </label>
+        ${classIds.length > 1 ? `
+        <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-emerald-50/50">
+          <input type="radio" name="siswa-print-scope" value="SEMUA" class="mt-1 flex-shrink-0">
+          <span class="text-sm"><b>Semua Kelas yang Diampu</b><br><span class="text-xs text-gray-500">Daftar siswa ${classIds.length} kelas sekaligus, dikelompokkan per kelas dengan ringkasan jumlah siswa.</span></span>
+        </label>` : ''}
+      </div>
+      <p class="text-xs text-gray-500 flex items-start gap-1"><i data-lucide="info" style="font-size:14px; margin-top:1px; flex-shrink:0;"></i> <span>PDF memakai kop sekolah, ringkasan, dan tanda tangan otomatis (Kepala Sekolah &amp; Guru). Dokumen terbuka di tab baru — klik "Cetak / Save PDF".</span></p>
+    </div>`;
+  showModal('Cetak PDF Data Siswa', body,
+    btn('Batal', 'closeModal()', { variant: 'outline' }) + ' ' +
+    btn('Cetak PDF', 'printSiswaGuru()', { icon: 'printer' })
+  , 'max-w-lg');
+}
+
+/* Cetak PDF data siswa versi guru: KELAS (kelas terpilih di layar) / SEMUA (seluruh kelas yang diampu) */
+function printSiswaGuru() {
+  const scopeEl = document.querySelector('input[name="siswa-print-scope"]:checked');
+  const scope = scopeEl ? scopeEl.value : 'KELAS';
+  closeModal();
+  const user = getCurrentUser();
+  const teacher = db.teachers.find(t => t.userId === user.id);
+  const courses = db.courses.filter(c => c.teacherId === teacher?.id);
+  const classIds = Array.from(new Set(courses.map(c => c.classId).filter(Boolean)));
+  if (!teacher || classIds.length === 0) { showToast('Belum ada kelas diampu', 'Tidak ada kelas untuk dicetak', 'warning'); return; }
+  const targets = scope === 'SEMUA' ? classIds : [classIds.includes(window._siswaPrintScope) ? window._siswaPrintScope : classIds[0]];
+  window._siswaPrintScope = '';
+  const groups = targets.map(cid => {
+    const cls = db.classes.find(c => c.id === cid);
+    const students = db.students.filter(s => s.classId === cid).slice()
+      .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'id', { numeric: true }));
+    const mapels = Array.from(new Set(courses.filter(c => c.classId === cid).map(c => c.name))).filter(Boolean);
+    return { cls, students, mapels };
+  }).filter(g => g.students.length > 0);
+  if (groups.length === 0) { showToast('Belum ada siswa', 'Belum ada siswa di kelas yang dipilih untuk dicetak', 'warning'); return; }
+  const tot = groups.reduce((t, g) => t + g.students.length, 0);
+  const sections = groups.map(g => {
+    const lk = g.students.filter(s => (s.gender || '') === 'L').length;
+    const pr = g.students.filter(s => (s.gender || '') === 'P').length;
+    const rows = g.students.map((s, i) =>
+      '<tr><td class="center">' + (i + 1) + '</td><td class="center">' + _printEsc(s.nis || '-') + '</td><td>' + _printEsc(s.name) +
+      '</td><td class="center">' + _printEsc(s.gender || '-') + '</td><td>' + _printEsc(s.phone || '-') +
+      '</td><td>' + _printEsc(s.parentName || '-') + '</td><td>' + _printEsc(s.parentPhone || '-') + '</td></tr>'
+    ).join('');
+    return '<p style="font-size:12pt; font-weight:bold; margin:16px 0 0 0;">Kelas ' + _printEsc(g.cls ? g.cls.name : '-') + (g.mapels.length ? ' <span style="font-weight:normal; font-size:10pt;">(Mapel: ' + _printEsc(g.mapels.join(', ')) + ')</span>' : '') + '</p>' +
+      `<table>
+        <thead><tr><th style="width:28px;">No</th><th style="width:65px;">NIS</th><th>Nama Siswa</th><th style="width:40px;">L/P</th><th style="width:110px;">Telepon</th><th>Nama Orang Tua</th><th style="width:110px;">Telepon Ortu</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p style="font-size:10pt; color:#555; margin:4px 0 0 0;">Jumlah: <b>${g.students.length}</b> siswa (L: ${lk}, P: ${pr})</p>`;
+  }).join('');
+  const body = sections + `
+    <div class="report-summary">
+      <h3>Ringkasan</h3>
+      <div class="report-summary-grid" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="report-summary-item"><div class="label">Kelas Dicetak</div><div class="value">${groups.length}</div></div>
+        <div class="report-summary-item"><div class="label">Total Siswa</div><div class="value">${tot}</div></div>
+        <div class="report-summary-item"><div class="label">Guru Pengampu</div><div class="value" style="font-size:11pt;">${_printEsc(teacher?.name || user.name)}</div></div>
+      </div>
+    </div>`;
+  printReport('Data Siswa' + (groups.length === 1 ? ' — Kelas ' + _printEsc(groups[0].cls ? groups[0].cls.name : '-') : ' — ' + groups.length + ' Kelas'), body, {
+    metaInfo: 'Guru Pengampu: ' + _printEsc(teacher?.name || user.name) + ' | Kelas: ' + _printEsc(groups.map(g => g.cls ? g.cls.name : '-').join(', ')) + (groups.length === 1 && groups[0].mapels.length ? ' | Mata Pelajaran: ' + _printEsc(groups[0].mapels.join(', ')) : '')
+  });
+}
+
 function openPrintAbsensiGuru() {
   const user = getCurrentUser();
   const teacher = db.teachers.find(t => t.userId === user.id);
