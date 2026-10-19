@@ -11,10 +11,13 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
   <!-- Firebase SDK for cloud database sync -->
-  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-analytics-compat.js"></script>
+  <!-- PERCEPAT LOADING: SDK dimuat DEFER — layar "Menghubungkan ke Server" tampil
+       SEKETIKA saat halaman dibuka, SDK Firebase dimuat paralel di belakangnya.
+       Dulu 4 file SDK memblokir seluruh halaman (layar putih/lambat saat internet lambat). -->
+  <script defer src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script defer src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+  <script defer src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  <script defer src="https://www.gstatic.com/firebasejs/9.23.0/firebase-analytics-compat.js"></script>
   <style>
     * { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
     body { background: #f9fafb; }
@@ -71,7 +74,7 @@
     .db-spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.45); border-top-color: #fff; border-radius: 9999px; animation: dbSpin 0.8s linear infinite; }
     @keyframes dbSpin { to { transform: rotate(360deg); } }
     /* ===== BOOT LOADER — layar pemuatan awal s.d. database benar-benar terhubung & data terbaca ===== */
-    #boot-loader { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #064e3b 0%, #065f46 45%, #0e7490 100%); transition: opacity 0.55s ease; }
+    #boot-loader { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #064e3b 0%, #065f46 45%, #0e7490 100%); transition: opacity 0.4s ease; }
     #boot-loader.boot-hide { opacity: 0; pointer-events: none; }
     .boot-card { width: min(92vw, 430px); text-align: center; color: #fff; padding: 24px 16px; }
     .boot-logo { width: 78px; height: 78px; margin: 0 auto 14px; border-radius: 20px; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.28); display: flex; align-items: center; justify-content: center; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
@@ -98,7 +101,11 @@
     @keyframes bootPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(110,231,183,0.45); } 50% { box-shadow: 0 0 0 6px rgba(110,231,183,0); } }
     .boot-bar { height: 4px; border-radius: 9999px; background: rgba(255,255,255,0.18); margin-top: 18px; overflow: hidden; }
     .boot-bar-inner { height: 100%; width: 6%; border-radius: 9999px; background: linear-gradient(90deg, #6ee7b7, #22d3ee); transition: width 0.45s ease; }
-    .boot-skip { margin-top: 14px; font-size: 12px; color: rgba(255,255,255,0.6); background: transparent; border: none; cursor: pointer; text-decoration: underline; display: none; }
+    .boot-actions { margin-top: 14px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+    .boot-retry { display: none; align-items: center; justify-content: center; gap: 7px; padding: 9px 18px; border-radius: 12px; background: #10b981; color: #fff; font-size: 13px; font-weight: 600; border: none; cursor: pointer; }
+    .boot-retry:hover { background: #059669; }
+    .boot-retry[disabled], #online-gate .gate-retry[disabled] { opacity: 0.72; cursor: wait; }
+    .boot-skip { margin-top: 2px; font-size: 12px; color: rgba(255,255,255,0.6); background: transparent; border: none; cursor: pointer; text-decoration: underline; display: none; }
     .boot-skip:hover { color: #ffffff; }
     .boot-foot { margin-top: 16px; font-size: 11px; color: rgba(255,255,255,0.45); }
     body.booting { overflow: hidden; }
@@ -152,7 +159,13 @@
       <div class="boot-step" id="boot-step-4"><span class="boot-dot"></span><span>Menyiapkan tampilan</span></div>
     </div>
     <div class="boot-bar"><div class="boot-bar-inner" id="boot-bar"></div></div>
-    <button type="button" class="boot-skip" id="boot-skip-btn" onclick="bootSkipNow()">Muat Ulang Halaman &rarr;</button>
+    <div class="boot-actions">
+      <button type="button" class="boot-retry" id="boot-retry-btn" onclick="reconnectDatabaseNow()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+        Sambung Ulang Sekarang
+      </button>
+      <button type="button" class="boot-skip" id="boot-skip-btn" onclick="bootSkipNow()">Muat Ulang Halaman &rarr;</button>
+    </div>
     <div class="boot-foot">Halaman terbuka otomatis setelah database cloud terbaca — aplikasi berjalan FULL ONLINE</div>
   </div>
 </div>
@@ -1857,6 +1870,7 @@ function updateCloudStatusUI() {
     if (old.parentElement) old.parentElement.replaceChild(el, old); else old.replaceWith(el);
     if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
   }
+  try { setGateRetrying(!!cloudReconnecting && !isCloudConnected()); } catch (e) {} // umpan balik tombol Sambung Ulang
   updateDbIndicator();
 }
 
@@ -1866,7 +1880,7 @@ function updateCloudStatusUI() {
    koneksi ke server cloud belum siap:
    - Saat aplikasi baru dibuka : "Menghubungkan ke server..." sampai
      data sekolah benar-benar dibaca dari Cloud Firestore.
-   - Saat koneksi terputus     : setelah 6 detik terputus, layar
+   - Saat koneksi terputus     : setelah 15 detik terputus, layar
      menutup aplikasi (FULL ONLINE = tidak ada mode offline lokal).
    - Saat server terkonfirmasi : gerbang terbuka otomatis.
    ============================================================ */
@@ -1895,6 +1909,22 @@ function hideOnlineGate() {
   gate.classList.remove('gate-show');
   _gateVisible = false;
 }
+// SAMBUNG ULANG — umpan balik tombol (gerbang & layar boot): saat proses menyambung
+// berjalan, tombol dinonaktifkan dan teksnya berubah agar pengguna tahu sistem sedang
+// menghubungi server (tidak perlu menekan berulang-ulang).
+function setGateRetrying(retrying) {
+  var want = retrying ? '1' : '0';
+  [['online-gate-retry', 'Sambungkan Ulang Sekarang'], ['boot-retry-btn', 'Sambung Ulang Sekarang']].forEach(function(pair) {
+    var btn = document.getElementById(pair[0]);
+    if (!btn || btn.dataset == null) return;
+    if (btn.dataset.retryState === want) return; // tidak berubah — jangan sentuh DOM
+    btn.dataset.retryState = want;
+    btn.disabled = !!retrying;
+    try { btn.classList.toggle('gate-retrying', !!retrying); } catch (e) {}
+    var tn = btn.lastChild; // node teks setelah ikon svg
+    if (tn && tn.nodeType === 3) tn.textContent = retrying ? ' Menyambung ke Server...' : ' ' + pair[1];
+  });
+}
 // Keputusan tampil/tidaknya gerbang — dipanggil dari semua titik perubahan koneksi
 function updateOnlineGate() {
   try {
@@ -1904,8 +1934,9 @@ function updateOnlineGate() {
     // Sudah melewati boot (layar boot tidak ada lagi) & cloud terputus lama → tahan aplikasi
     // PERBAIKAN KONEKSI: 6 detik terlalu agresif — guncangan jaringan sesaat (pindah WiFi/kuota,
     // tulisan besar sedang diproses) sempat menutup aplikasi dan pengguna harus menyambung ulang.
-    // Kini 25 detik: sambung-ulang otomatis diberi kesempatan bekerja dulu.
-    if (_bootDone && cloudDownSince !== null && (Date.now() - cloudDownSince > 25000)) {
+    // PERCEPAT (Task Percepat): 25 → 15 detik — watchdog kini menyambung ulang jauh lebih
+    // cepat (interval 8 dtk, percobaan mulai 5 dtk terputus), jadi gerbang boleh lebih awal.
+    if (_bootDone && cloudDownSince !== null && (Date.now() - cloudDownSince > 15000)) {
       showOnlineGate('connect');
       const d = document.getElementById('online-gate-detail');
       if (d) d.textContent = navigator.onLine
@@ -3441,12 +3472,28 @@ function ensureFirebaseSdk(cb) {
   };
   FIREBASE_SDK_URLS.forEach(function(u) {
     try {
-      if (document.querySelector('script[src="' + u + '"]')) { done(); return; }
+      const exist = document.querySelector('script[src="' + u + '"]');
+      if (exist) {
+        // PERCEPAT LOADING: SDK kini dimuat DEFER — tag sudah ada di <head> sejak
+        // halaman dibuka tetapi MUNGKIN BELUM selesai dimuat. Jangan anggap selesai
+        // prematur: ikuti event load/error-nya. Tag yang GAGAL (internet putus)
+        // dilepas dari DOM agar percobaan berikutnya (watchdog) memuat ulang.
+        if (exist.dataset && exist.dataset.sdkLoaded === '1') { done(); return; }
+        exist.addEventListener('load', function() { try { exist.dataset.sdkLoaded = '1'; } catch (e) {} done(); });
+        exist.addEventListener('error', function() {
+          try { if (exist.parentNode) exist.parentNode.removeChild(exist); } catch (e) {}
+          done();
+        });
+        return;
+      }
       const s = document.createElement('script');
       s.src = u;
       s.async = true;
-      s.onload = done;
-      s.onerror = done;
+      s.onload = function() { try { s.dataset.sdkLoaded = '1'; } catch (e) {} done(); };
+      s.onerror = function() {
+        try { if (s.parentNode) s.parentNode.removeChild(s); } catch (e) {}
+        done();
+      };
       document.head.appendChild(s);
     } catch (e) { done(); }
   });
@@ -3466,10 +3513,10 @@ function reconnectCloud(silent) {
   if (isRtdbActive() && !isRtdbConnected()) { resetRtdbState(); initRTDB(activeCloudConfig || EMBEDDED_FIREBASE_CONFIG); }
   if (!silent) showToast('Menyambungkan ulang...', 'Menghubungi Cloud Database sekolah', 'info');
   updateCloudStatusUI();
-  // Lepas bendera "menyambung" bila dalam 15 detik belum berhasil juga
+  // Lepas bendera "menyambung" bila dalam 9 detik belum berhasil juga (dulu 15 dtk — terasa lama)
   setTimeout(function() {
     if (cloudReconnecting) { cloudReconnecting = false; updateCloudStatusUI(); }
-  }, 15000);
+  }, 9000);
 }
 
 // Tombol "Sambungkan Ulang" pada banner / pill offline
@@ -3579,7 +3626,8 @@ function startDbWatchdog() {
     markCloudDisconnected('Perangkat tidak terhubung ke internet (mode offline).');
   });
 
-  // Pemeriksaan rutin setiap 20 detik
+  // Pemeriksaan rutin setiap 8 detik (PERCEPAT: dulu 20 detik — terlalu lama menunggu
+  // sambung-ulang otomatis; kini gangguan koneksi pulih dalam hitungan detik)
   setInterval(function() {
     // FULL ONLINE: tidak ada lagi penulisan ulang localStorage — database hanya di cloud
 
@@ -3593,13 +3641,13 @@ function startDbWatchdog() {
 
     // 3) Cloud terputus → sambung ulang
     //    - listener mati → langsung coba
-    //    - listener hidup tapi server tak pernah konfirmasi > 30 detik → coba juga
-    //    - PERBAIKAN KONEKSI: status "terputus" berjalan > 12 detik → coba juga tanpa
-    //      menunggu pengguna menekan tombol "Sambungkan Ulang" berulang-ulang
+    //    - listener hidup tapi server tak pernah konfirmasi > 18 detik → coba juga
+    //    - status "terputus" berjalan > 5 detik → coba juga (PERCEPAT: dulu 12 dtk)
+    //      tanpa menunggu pengguna menekan tombol "Sambung Ulang" berulang-ulang
     if (!isCloudConnected()) {
       const listenerDead = !cloudListening;
-      const noConfirmLong = (Date.now() - (cloudLastServerConfirmAt || 0) > 30000);
-      const downLong = (cloudDownSince !== null && (Date.now() - cloudDownSince > 12000));
+      const noConfirmLong = (Date.now() - (cloudLastServerConfirmAt || 0) > 18000);
+      const downLong = (cloudDownSince !== null && (Date.now() - cloudDownSince > 5000));
       if (listenerDead || noConfirmLong || downLong) reconnectCloud(true);
     }
 
@@ -4792,13 +4840,14 @@ function _bootFinish(reason) {
     document.body.classList.remove('booting');
     if (loader) {
       loader.classList.add('boot-hide');
-      setTimeout(function() { if (loader.parentNode) loader.parentNode.removeChild(loader); }, 650);
+      setTimeout(function() { if (loader.parentNode) loader.parentNode.removeChild(loader); }, 450);
     }
-  }, 600);
+  }, 250);
 }
 
-// Tombol "Muat Ulang Halaman" (muncul bila server cloud belum terjangkau 10 detik)
-// FULL ONLINE: aplikasi tidak dibuka tanpa data cloud — muat ulang untuk mencoba lagi.
+// Tombol "Sambung Ulang" & "Muat Ulang Halaman" (muncul bila server cloud belum terjangkau
+// 6 detik — PERCEPAT: dulu 10 detik hanya muat-ulang). FULL ONLINE: aplikasi tidak dibuka
+// tanpa data cloud — sambung-ulang tanpa reload, atau muat ulang halaman untuk mencoba lagi.
 function bootSkipNow() {
   if (_bootDone) return;
   console.log('[BOOT] Muat ulang diminta pengguna (server cloud belum terjangkau)');
@@ -4811,11 +4860,15 @@ window.bootSkipNow = bootSkipNow;
   _bootStatus('Membaca database...', 'Memeriksa penyimpanan database');
   _bootBar(12);
 
-  // Tombol lanjut manual tampil bila koneksi lebih dari 10 detik
+  // Tombol "Sambung Ulang" + "Muat Ulang" tampil bila koneksi lebih dari 6 detik
+  // (PERCEPAT: dulu 10 detik hanya tombol muat-ulang; kini tombol sambung-ulang
+  // langsung menghubungi server TANPA memuat ulang halaman)
   setTimeout(function() {
     var s = _bootEl('boot-skip-btn');
     if (s && !_bootDone) s.style.display = 'inline-block';
-  }, 10000);
+    var r = _bootEl('boot-retry-btn');
+    if (r && !_bootDone) r.style.display = 'inline-flex';
+  }, 6000);
 
   var tick = function() {
     if (_bootDone) return;
@@ -4837,8 +4890,10 @@ window.bootSkipNow = bootSkipNow;
         }
         var snapshotIdle = !cloudSnapshotBuffer && !cloudSnapshotTimer && !_cloudPushInFlight;
         if (_bootSnapshotWaitT0 === null) _bootSnapshotWaitT0 = now;
-        var dataRead = snapshotIdle && (now - _bootConnectedAt) >= 1400;
-        var dataWaitCap = (now - _bootSnapshotWaitT0) > 6000; // jangan menunggu data terlalu lama
+        // PERCEPAT: tunggu stabilisasi 650ms (dulu 1400ms) — cukup untuk satu siklus
+        // buffer snapshot (700ms) + jeda aman; batas tunggu maksimum juga dipangkas
+        var dataRead = snapshotIdle && (now - _bootConnectedAt) >= 650;
+        var dataWaitCap = (now - _bootSnapshotWaitT0) > 3500; // jangan menunggu data terlalu lama
         if (dataRead || dataWaitCap) {
           _bootS2 = 'ok';
           _bootStep(2, 'ok');
@@ -4852,23 +4907,30 @@ window.bootSkipNow = bootSkipNow;
         _bootStatus('Database cloud kosong', 'Hubungi Super Admin — pemulihan data tersedia di halaman Database & Cloud');
         var btnE = _bootEl('boot-skip-btn');
         if (btnE) btnE.style.display = 'inline-block';
+        var btnER = _bootEl('boot-retry-btn');
+        if (btnER) btnER.style.display = 'inline-flex';
         setTimeout(tick, 600);
         return;
       } else if (cloudConnectError && !cloudConnected && !cloudListening && !cloudReconnecting) {
         // Error definitif — tetap MENUNGGU sambung-ulang otomatis (watchdog aktif), tampilkan status
         _bootStep(2, 'fail');
-        _bootStatus('Server cloud belum dapat dihubungi', 'Aplikasi FULL ONLINE menunggu koneksi — cek internet Anda. Menyambung ulang otomatis...');
+        _bootStatus('Server cloud belum dapat dihubungi', 'Tekan "Sambung Ulang" atau cek internet Anda. Menyambung ulang otomatis...');
         var btnE2 = _bootEl('boot-skip-btn');
         if (btnE2) btnE2.style.display = 'inline-block';
+        var btnE2R = _bootEl('boot-retry-btn');
+        if (btnE2R) btnE2R.style.display = 'inline-flex';
         setTimeout(tick, 800);
         return;
-      } else if (now - _bootT0 > 9000) {
-        // Batas tunggu 9 detik — TANPA fallback lokal: tampilkan status gagal + tombol muat ulang,
-        // watchdog tetap mencoba menyambung; begitu tersambung langkah 2 menjadi 'ok' otomatis.
+      } else if (now - _bootT0 > 6000) {
+        // Batas tunggu 6 detik (PERCEPAT: dulu 9 dtk) — TANPA fallback lokal: tampilkan
+        // status gagal + tombol Sambung Ulang, watchdog tetap mencoba menyambung;
+        // begitu tersambung langkah 2 menjadi 'ok' otomatis.
         _bootStep(2, 'fail');
-        _bootStatus('Koneksi server lambat', 'Aplikasi FULL ONLINE menunggu server — pastikan internet aktif. Menyambung ulang otomatis...');
+        _bootStatus('Koneksi server lambat', 'Tekan "Sambung Ulang" atau pastikan internet aktif. Menyambung ulang otomatis...');
         var btnE3 = _bootEl('boot-skip-btn');
         if (btnE3) btnE3.style.display = 'inline-block';
+        var btnE3R = _bootEl('boot-retry-btn');
+        if (btnE3R) btnE3R.style.display = 'inline-flex';
         setTimeout(tick, 800);
         return;
       } else {
@@ -4894,14 +4956,15 @@ window.bootSkipNow = bootSkipNow;
     if (step2Done && dataValid) {
       _bootStep(4, 'active');
       _bootBar(92);
-      if (now - _bootT0 >= 1800) { _bootFinish(); return; } // tampil minimal 1,8 dtk agar status terbaca
+      // PERCEPAT: tampil minimal 1 dtk (dulu 1,8 dtk) — status terbaca, halaman terbuka lebih cepat
+      if (now - _bootT0 >= 1000) { _bootFinish(); return; }
     }
 
     // FULL ONLINE: TIDAK ada lagi buka-paksa tanpa data — halaman menunggu data cloud;
-    // watchdog menyambung ulang otomatis dan tombol "Muat Ulang" selalu tersedia.
+    // watchdog menyambung ulang otomatis dan tombol "Sambung Ulang" selalu tersedia.
 
-    setTimeout(tick, 120);  };
-  setTimeout(tick, 250);
+    setTimeout(tick, 80);  };
+  setTimeout(tick, 200);
 })();
 </script>
 
